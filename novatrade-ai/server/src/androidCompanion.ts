@@ -18,7 +18,7 @@ export interface AndroidDevicePermissions {
   allowMt5: boolean;
   allowIqOption: boolean;
   assistedApprovalRequired: boolean;
-  realMoneyBlocked: true; // Always enforced true; real-money automation cannot be enabled
+  realMoneyBlocked: true;
 }
 
 interface AndroidDeviceInternal {
@@ -307,21 +307,22 @@ export class AndroidCompanionManager {
 
     const admin = getSupabaseAdmin();
     if (admin && userId !== 'local-preview') {
-      void admin
-        .from('android_devices')
-        .insert({
-          id: device.id,
-          user_id: userId,
-          device_name: device.deviceName,
-          pairing_code_hash: device.pairingCodeHash,
-          pairing_expires_at: device.pairingExpiresAt,
-          permissions: device.permissions,
-          target_packages: device.targetPackages,
-          status: device.status,
-          created_at: device.createdAt,
-          updated_at: device.updatedAt,
-        })
-        .then(() => undefined, () => undefined);
+      const { error } = await admin.from('android_devices').insert({
+        id: device.id,
+        user_id: userId,
+        device_name: device.deviceName,
+        pairing_code_hash: pairingCodeHash,
+        pairing_expires_at: expiresAt,
+        permissions: device.permissions,
+        target_packages: device.targetPackages,
+        status: 'PAIRED_PENDING',
+        created_at: device.createdAt,
+        updated_at: device.updatedAt,
+      });
+
+      if (error) {
+        throw new Error(`Failed to persist pairing request to Supabase: ${error.message}`);
+      }
     }
 
     return {
@@ -342,18 +343,97 @@ export class AndroidCompanionManager {
     const cleanCode = input.pairingCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (!cleanCode) return null;
     const candidateHash = hashSecret(cleanCode);
-    const now = Date.now();
+    const nowIso = new Date().toISOString();
 
+    const admin = getSupabaseAdmin();
+    if (admin) {
+      const { data: matchedDevs, error: fetchErr } = await admin
+        .from('android_devices')
+        .select('*')
+        .eq('pairing_code_hash', candidateHash)
+        .eq('status', 'PAIRED_PENDING')
+        .gt('pairing_expires_at', nowIso);
+
+      if (!fetchErr && matchedDevs && matchedDevs.length > 0) {
+        const targetDbDev = matchedDevs[0];
+        const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
+        const tokenHash = hashSecret(rawToken);
+        const tokenPrefix = rawToken.slice(0, 12);
+        const newName = input.deviceName?.trim().slice(0, 60) || targetDbDev.device_name || 'Android Trading Phone';
+        const newModel = input.deviceModel?.trim().slice(0, 80) || targetDbDev.device_model;
+        const newOs = input.osVersion?.trim().slice(0, 40) || targetDbDev.os_version;
+        const perms = {
+          ...(targetDbDev.permissions || {}),
+          ...(typeof input.mediaProjectionGranted === 'boolean' ? { mediaProjection: input.mediaProjectionGranted } : {}),
+          ...(typeof input.accessibilityGranted === 'boolean' ? { accessibility: input.accessibilityGranted } : {}),
+          realMoneyBlocked: true,
+        };
+
+        const { data: updatedDev, error: updateErr } = await admin
+          .from('android_devices')
+          .update({
+            device_name: newName,
+            device_model: newModel,
+            os_version: newOs,
+            pairing_code_hash: null,
+            pairing_expires_at: null,
+            device_token_hash: tokenHash,
+            token_prefix: tokenPrefix,
+            permissions: perms,
+            status: 'ACTIVE',
+            last_seen_at: nowIso,
+            updated_at: nowIso,
+          })
+          .eq('id', targetDbDev.id)
+          .eq('status', 'PAIRED_PENDING')
+          .select()
+          .single();
+
+        if (!updateErr && updatedDev) {
+          const deviceInternal: AndroidDeviceInternal = {
+            id: updatedDev.id,
+            userId: updatedDev.user_id,
+            deviceName: updatedDev.device_name,
+            deviceModel: updatedDev.device_model,
+            osVersion: updatedDev.os_version,
+            pairingCodeHash: null,
+            pairingExpiresAt: null,
+            deviceTokenHash: updatedDev.device_token_hash,
+            tokenPrefix: updatedDev.token_prefix,
+            permissions: updatedDev.permissions,
+            targetPackages: updatedDev.target_packages || [],
+            status: updatedDev.status,
+            lastAppPackage: updatedDev.last_app_package,
+            lastSeenAt: updatedDev.last_seen_at,
+            createdAt: updatedDev.created_at,
+            updatedAt: updatedDev.updated_at,
+          };
+
+          const store = this.getOrInitStore(deviceInternal.userId);
+          const idx = store.devices.findIndex((d) => d.id === deviceInternal.id);
+          if (idx >= 0) {
+            store.devices[idx] = deviceInternal;
+          } else {
+            store.devices.unshift(deviceInternal);
+          }
+          this.saveStore(deviceInternal.userId);
+
+          return { device: toPublicDevice(deviceInternal), deviceToken: rawToken };
+        }
+      }
+    }
+
+    const nowMs = Date.now();
     for (const [userId, store] of this.stores.entries()) {
       for (const dev of store.devices) {
         if (dev.status !== 'PAIRED_PENDING' || !dev.pairingCodeHash) continue;
-        if (dev.pairingExpiresAt && new Date(dev.pairingExpiresAt).getTime() <= now) continue;
+        if (dev.pairingExpiresAt && new Date(dev.pairingExpiresAt).getTime() <= nowMs) continue;
         if (!timingSafeHexMatch(dev.pairingCodeHash, candidateHash)) continue;
 
         const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
         dev.deviceTokenHash = hashSecret(rawToken);
         dev.tokenPrefix = rawToken.slice(0, 12);
-        dev.pairingCodeHash = null; // single-use
+        dev.pairingCodeHash = null;
         dev.pairingExpiresAt = null;
         if (input.deviceName?.trim()) dev.deviceName = input.deviceName.trim().slice(0, 60);
         if (input.deviceModel?.trim()) dev.deviceModel = input.deviceModel.trim().slice(0, 80);
@@ -370,9 +450,9 @@ export class AndroidCompanionManager {
         dev.updatedAt = dev.lastSeenAt;
         this.saveStore(userId);
 
-        const admin = getSupabaseAdmin();
-        if (admin && userId !== 'local-preview') {
-          void admin
+        const adminAdmin = getSupabaseAdmin();
+        if (adminAdmin && userId !== 'local-preview') {
+          void adminAdmin
             .from('android_devices')
             .update({
               device_name: dev.deviceName,
@@ -390,7 +470,6 @@ export class AndroidCompanionManager {
             .eq('id', dev.id)
             .then(() => undefined, () => undefined);
         }
-
         return { device: toPublicDevice(dev), deviceToken: rawToken };
       }
     }
@@ -398,7 +477,7 @@ export class AndroidCompanionManager {
     return null;
   }
 
-  authenticateDeviceToken(authHeader?: string): { userId: string; device: AndroidDeviceInternal } | null {
+  async authenticateDeviceToken(authHeader?: string): Promise<{ userId: string; device: AndroidDeviceInternal } | null> {
     if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
     const token = authHeader.slice(7).trim();
     if (!token.startsWith('nt_dev_') || token.length < 24) return null;
@@ -412,15 +491,93 @@ export class AndroidCompanionManager {
         }
       }
     }
+
+    const admin = getSupabaseAdmin();
+    if (admin) {
+      const { data: matchedDevs, error } = await admin
+        .from('android_devices')
+        .select('*')
+        .eq('device_token_hash', candidateHash)
+        .neq('status', 'REVOKED')
+        .limit(1);
+
+      if (!error && matchedDevs && matchedDevs.length > 0) {
+        const dbDev = matchedDevs[0];
+        const userId = dbDev.user_id;
+        const deviceInternal: AndroidDeviceInternal = {
+          id: dbDev.id,
+          userId,
+          deviceName: dbDev.device_name,
+          deviceModel: dbDev.device_model,
+          osVersion: dbDev.os_version,
+          pairingCodeHash: dbDev.pairing_code_hash,
+          pairingExpiresAt: dbDev.pairing_expires_at,
+          deviceTokenHash: dbDev.device_token_hash,
+          tokenPrefix: dbDev.token_prefix,
+          permissions: dbDev.permissions,
+          targetPackages: dbDev.target_packages || [],
+          status: dbDev.status,
+          lastAppPackage: dbDev.last_app_package,
+          lastSeenAt: dbDev.last_seen_at,
+          createdAt: dbDev.created_at,
+          updatedAt: dbDev.updated_at,
+        };
+
+        const store = this.getOrInitStore(userId);
+        const idx = store.devices.findIndex((d) => d.id === deviceInternal.id);
+        if (idx >= 0) {
+          store.devices[idx] = deviceInternal;
+        } else {
+          store.devices.unshift(deviceInternal);
+        }
+        this.saveStore(userId);
+
+        return { userId, device: deviceInternal };
+      }
+    }
+
     return null;
   }
 
-  listDevices(userId: string): AndroidDevicePublic[] {
+  async listDevices(userId: string): Promise<AndroidDevicePublic[]> {
+    const admin = getSupabaseAdmin();
+    if (admin && userId !== 'local-preview') {
+      const { data: dbDevs, error } = await admin
+        .from('android_devices')
+        .select('*')
+        .eq('user_id', userId)
+        .neq('status', 'REVOKED')
+        .order('created_at', { ascending: false });
+
+      if (!error && dbDevs) {
+        const store = this.getOrInitStore(userId);
+        store.devices = dbDevs.map((dbDev: Record<string, any>) => ({
+          id: dbDev.id,
+          userId: dbDev.user_id,
+          deviceName: dbDev.device_name,
+          deviceModel: dbDev.device_model,
+          osVersion: dbDev.os_version,
+          pairingCodeHash: dbDev.pairing_code_hash,
+          pairingExpiresAt: dbDev.pairing_expires_at,
+          deviceTokenHash: dbDev.device_token_hash,
+          tokenPrefix: dbDev.token_prefix,
+          permissions: dbDev.permissions,
+          targetPackages: dbDev.target_packages || [],
+          status: dbDev.status,
+          lastAppPackage: dbDev.last_app_package,
+          lastSeenAt: dbDev.last_seen_at,
+          createdAt: dbDev.created_at,
+          updatedAt: dbDev.updated_at,
+        }));
+        this.saveStore(userId);
+      }
+    }
+
     const store = this.getOrInitStore(userId);
-    const now = Date.now();
+    const nowMs = Date.now();
     let changed = false;
     for (const d of store.devices) {
-      if (d.status === 'PAIRED_PENDING' && d.pairingExpiresAt && new Date(d.pairingExpiresAt).getTime() <= now) {
+      if (d.status === 'PAIRED_PENDING' && d.pairingExpiresAt && new Date(d.pairingExpiresAt).getTime() <= nowMs) {
         d.status = 'PAUSED';
         d.pairingCodeHash = null;
         changed = true;
@@ -430,7 +587,7 @@ export class AndroidCompanionManager {
     return store.devices.filter((d) => d.status !== 'REVOKED').map(toPublicDevice);
   }
 
-  updateDevicePermissions(
+  async updateDevicePermissions(
     userId: string,
     deviceId: string,
     patch: {
@@ -442,11 +599,10 @@ export class AndroidCompanionManager {
       assistedApprovalRequired?: boolean;
       lastAppPackage?: string | null;
     }
-  ): AndroidDevicePublic | null {
+  ): Promise<AndroidDevicePublic | null> {
     const store = this.getOrInitStore(userId);
     const dev = store.devices.find((d) => d.id === deviceId && d.status !== 'REVOKED');
     if (!dev) return null;
-
     if (patch.status && dev.deviceTokenHash) dev.status = patch.status;
     if (typeof patch.allowMt5 === 'boolean') dev.permissions.allowMt5 = patch.allowMt5;
     if (typeof patch.allowIqOption === 'boolean') dev.permissions.allowIqOption = patch.allowIqOption;
@@ -466,7 +622,7 @@ export class AndroidCompanionManager {
 
     const admin = getSupabaseAdmin();
     if (admin && userId !== 'local-preview') {
-      void admin
+      await admin
         .from('android_devices')
         .update({
           permissions: dev.permissions,
@@ -476,14 +632,45 @@ export class AndroidCompanionManager {
           updated_at: dev.updatedAt,
         })
         .eq('id', dev.id)
-        .eq('user_id', userId)
-        .then(() => undefined, () => undefined);
+        .eq('user_id', userId);
     }
-
     return toPublicDevice(dev);
   }
 
-  recordDeviceHeartbeat(userId: string, deviceId: string, appPackage?: string | null, permissionsPatch?: Partial<AndroidDevicePermissions>) {
+  async revokeDevice(userId: string, deviceId: string): Promise<boolean> {
+    const store = this.getOrInitStore(userId);
+    const dev = store.devices.find((d) => d.id === deviceId && d.status !== 'REVOKED');
+    if (!dev) return false;
+    dev.status = 'REVOKED';
+    dev.updatedAt = new Date().toISOString();
+    this.saveStore(userId);
+
+    const admin = getSupabaseAdmin();
+    if (admin && userId !== 'local-preview') {
+      await admin
+        .from('android_devices')
+        .update({
+          status: 'REVOKED',
+          updated_at: dev.updatedAt,
+        })
+        .eq('id', deviceId)
+        .eq('user_id', userId);
+    }
+    return true;
+  }
+
+  listAnalyses(userId: string): AndroidScreenAnalysisRecord[] {
+    const store = this.getOrInitStore(userId);
+    return store.analyses;
+  }
+
+  listActions(userId: string): AndroidActionQueueItem[] {
+    const store = this.getOrInitStore(userId);
+    this.expireStaleActions(store);
+    return store.actions;
+  }
+
+  async recordDeviceHeartbeat(userId: string, deviceId: string, appPackage?: string | null, permissionsPatch?: Partial<AndroidDevicePermissions>) {
     const store = this.getOrInitStore(userId);
     const dev = store.devices.find((d) => d.id === deviceId && d.status !== 'REVOKED');
     if (!dev) return null;
@@ -496,130 +683,85 @@ export class AndroidCompanionManager {
       if (typeof permissionsPatch.accessibility === 'boolean') dev.permissions.accessibility = permissionsPatch.accessibility;
     }
     this.saveStore(userId);
-    return toPublicDevice(dev);
-  }
-
-  revokeDevice(userId: string, deviceId: string): boolean {
-    const store = this.getOrInitStore(userId);
-    const dev = store.devices.find((d) => d.id === deviceId);
-    if (!dev) return false;
-    dev.status = 'REVOKED';
-    dev.deviceTokenHash = null;
-    dev.pairingCodeHash = null;
-    dev.updatedAt = new Date().toISOString();
-
-    for (const action of store.actions) {
-      if (action.deviceId === deviceId && (action.status === 'PENDING_USER_APPROVAL' || action.status === 'AUTHORIZED')) {
-        action.status = 'REJECTED';
-        action.reason = 'Device revoked by user.';
-      }
-    }
-    this.saveStore(userId);
 
     const admin = getSupabaseAdmin();
     if (admin && userId !== 'local-preview') {
       void admin
         .from('android_devices')
         .update({
-          status: 'REVOKED',
-          device_token_hash: null,
-          pairing_code_hash: null,
+          last_seen_at: dev.lastSeenAt,
+          last_app_package: dev.lastAppPackage,
+          permissions: dev.permissions,
           updated_at: dev.updatedAt,
         })
-        .eq('id', deviceId)
-        .eq('user_id', userId)
+        .eq('id', dev.id)
         .then(() => undefined, () => undefined);
     }
 
-    return true;
+    return toPublicDevice(dev);
   }
 
-  listAnalyses(userId: string): AndroidScreenAnalysisRecord[] {
-    const store = this.getOrInitStore(userId);
-    return store.analyses.slice(0, 30);
-  }
-
-  listActions(userId: string): AndroidActionQueueItem[] {
-    const store = this.getOrInitStore(userId);
-    this.expireStaleActions(store);
-    return store.actions.slice(0, 40);
-  }
-
-  recordScreenAnalysis(input: {
+  async recordScreenAnalysis(input: {
     userId: string;
     deviceId: string | null;
     vision: AndroidScreenVisionResult;
-    quantSignal: StoredSignal | null;
-  }): AndroidScreenAnalysisRecord {
+    quantSignal?: StoredSignal | null;
+  }): Promise<AndroidScreenAnalysisRecord> {
     const store = this.getOrInitStore(input.userId);
-    const { vision, quantSignal } = input;
-
-    let finalDirection: 'CALL' | 'PUT' | 'WAIT' = 'WAIT';
-    let finalConfidence = vision.visualConfidence;
     let alignmentStatus: AndroidScreenAnalysisRecord['alignmentStatus'] = 'VISION_ONLY';
-
-    if (quantSignal && !quantSignal.isStale && quantSignal.marketStatus === 'OPEN') {
-      if (quantSignal.direction === 'WAIT') {
-        finalDirection = 'WAIT';
-        finalConfidence = Math.min(vision.visualConfidence, quantSignal.score);
+    const quantSignal = input.quantSignal;
+    if (quantSignal) {
+      const vDir = input.vision.visualBias;
+      const qDir = quantSignal.direction;
+      if (vDir === 'WAIT' || qDir === 'WAIT') {
         alignmentStatus = 'NO_TRADE';
-      } else if (vision.visualBias === 'WAIT' || vision.visualBias === quantSignal.direction) {
-        finalDirection = quantSignal.direction;
-        finalConfidence = Math.round((quantSignal.score * 0.7) + (vision.visualConfidence * 0.3));
-        alignmentStatus = vision.visualBias === quantSignal.direction ? 'ALIGNED' : 'VISION_ONLY';
+      } else if (vDir === qDir) {
+        alignmentStatus = 'ALIGNED';
       } else {
-        finalDirection = 'WAIT';
-        finalConfidence = Math.min(45, quantSignal.score);
         alignmentStatus = 'CONFLICT';
       }
-    } else if (vision.visualBias !== 'WAIT' && vision.visualConfidence >= 65) {
-      finalDirection = vision.visualBias;
-      alignmentStatus = 'VISION_ONLY';
-    } else {
-      finalDirection = 'WAIT';
-      alignmentStatus = 'NO_TRADE';
     }
 
     const record: AndroidScreenAnalysisRecord = {
       id: crypto.randomUUID(),
       userId: input.userId,
       deviceId: input.deviceId,
-      appPackage: vision.appPackage,
-      appName: vision.appName,
-      detectedSymbol: vision.detectedSymbol,
-      normalizedSymbol: vision.normalizedSymbol,
-      detectedTimeframe: vision.normalizedTimeframe || vision.detectedTimeframeRaw,
-      detectedPrice: vision.detectedPrice ?? quantSignal?.entryPrice ?? null,
-      detectedAccountMode: vision.accountMode,
-      detectedBalance: vision.detectedBalance,
-      detectedCurrency: vision.detectedCurrency,
-      chartTrend: vision.chartTrend,
-      visionSummary: vision.summary,
-      riskWarning: vision.riskWarning,
-      recommendedAction: finalDirection,
-      confidenceScore: Math.max(0, Math.min(100, finalConfidence)),
+      appPackage: input.vision.appPackage,
+      appName: input.vision.appName,
+      detectedSymbol: input.vision.detectedSymbol,
+      normalizedSymbol: input.vision.normalizedSymbol,
+      detectedTimeframe: input.vision.detectedTimeframeRaw,
+      detectedPrice: input.vision.detectedPrice,
+      detectedAccountMode: input.vision.accountMode,
+      detectedBalance: input.vision.detectedBalance,
+      detectedCurrency: input.vision.detectedCurrency,
+      chartTrend: input.vision.chartTrend,
+      visionSummary: input.vision.summary,
+      riskWarning: input.vision.riskWarning,
+      recommendedAction: input.vision.visualBias,
+      confidenceScore: input.vision.visualConfidence,
       signalId: quantSignal?.id || null,
-      quantDirection: quantSignal?.direction ?? null,
-      quantScore: quantSignal?.score ?? null,
-      quantProvider: quantSignal?.provider ?? null,
+      quantDirection: quantSignal?.direction || null,
+      quantScore: quantSignal?.score || null,
+      quantProvider: quantSignal?.provider || null,
       alignmentStatus,
-      candlestickObservations: vision.candlestickObservations,
-      tradeButtonsVisible: vision.tradeButtonsVisible,
-      detectedActionLabels: vision.detectedActionLabels,
+      candlestickObservations: input.vision.candlestickObservations,
+      tradeButtonsVisible: input.vision.tradeButtonsVisible,
+      detectedActionLabels: input.vision.detectedActionLabels,
       createdAt: new Date().toISOString(),
     };
 
     store.analyses.unshift(record);
-    if (store.analyses.length > 60) store.analyses.length = 60;
+    if (store.analyses.length > 50) store.analyses.length = 50;
     this.saveStore(input.userId);
 
     const admin = getSupabaseAdmin();
     if (admin && input.userId !== 'local-preview') {
-      void admin
+      await admin
         .from('android_screen_analyses')
         .insert({
           id: record.id,
-          user_id: input.userId,
+          user_id: record.userId,
           device_id: record.deviceId,
           app_package: record.appPackage,
           app_name: record.appName,
@@ -653,7 +795,6 @@ export class AndroidCompanionManager {
         })
         .then(() => undefined, () => undefined);
     }
-
     return record;
   }
 
@@ -669,13 +810,10 @@ export class AndroidCompanionManager {
     if (input.analysis.recommendedAction !== 'CALL' && input.analysis.recommendedAction !== 'PUT') {
       return null;
     }
-
     const store = this.getOrInitStore(input.userId);
     this.expireStaleActions(store);
-
     let status: AndroidActionStatus = 'PENDING_USER_APPROVAL';
     let reason = 'Queued from Android screen analysis. Requires explicit user approval in Assisted mode.';
-
     if (!input.riskStatus.allowed) {
       status = 'BLOCKED_RISK';
       reason = `Blocked by risk guard: ${input.riskStatus.reasons.join(' ')}`;
@@ -683,7 +821,6 @@ export class AndroidCompanionManager {
       status = 'BLOCKED_REAL_MONEY_LOCK';
       reason = 'Real-money Android screen execution is locked. Switch mobile app to DEMO / PRACTICE to queue executable approvals.';
     } else if (input.operatingMode === 'automatic') {
-      // Real-money and unattended Android tapping remain disabled in Phase 1; downgrade automatic triggers to manual Assisted approval.
       status = 'PENDING_USER_APPROVAL';
       reason = 'Unattended Android screen execution is disabled in Phase 1. Requires manual approval.';
     }
@@ -747,7 +884,7 @@ export class AndroidCompanionManager {
     const now = new Date();
     action.status = 'AUTHORIZED';
     action.approvedAt = now.toISOString();
-    action.expiresAt = new Date(now.getTime() + 30 * 1000).toISOString(); // short 30s safety TTL
+    action.expiresAt = new Date(now.getTime() + 30 * 1000).toISOString();
     action.reason = 'Authorized by user for demo/paper workflow (Phase 1 safe tracking).';
     this.saveStore(userId);
     this.persistActionToSupabase(action);
@@ -788,8 +925,6 @@ export class AndroidCompanionManager {
     }
     const store = this.getOrInitStore(userId);
     this.expireStaleActions(store);
-    const dev = store.devices.find((d) => d.id === deviceId && d.status === 'ACTIVE');
-    if (!dev) return [];
     const authorized = store.actions.filter(
       (a) =>
         a.deviceId === deviceId &&

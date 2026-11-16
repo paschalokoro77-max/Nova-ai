@@ -1915,7 +1915,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     return res.json({
-      devices: androidManager.listDevices(userId),
+      devices: await androidManager.listDevices(userId),
       realMoneyAutomationBlocked: true,
     });
   });
@@ -1996,7 +1996,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       });
     }
     const userId = ws.userId || 'local-preview';
-    const updated = androidManager.updateDevicePermissions(userId, req.params.deviceId, parsed.data);
+    const updated = await androidManager.updateDevicePermissions(userId, req.params.deviceId, parsed.data);
     if (!updated) return res.status(404).json({ error: 'Paired Android device not found.' });
     ws.engine.logActivity(
       'BROKER',
@@ -2011,7 +2011,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    const removed = androidManager.revokeDevice(userId, req.params.deviceId);
+    const removed = await androidManager.revokeDevice(userId, req.params.deviceId);
     if (!removed) return res.status(404).json({ error: 'Paired Android device not found.' });
     ws.engine.logActivity('BROKER', 'ANDROID_DEVICE_REVOKED', `Revoked Android device ${req.params.deviceId}.`, ws.userId);
     return res.json({ ok: true });
@@ -2071,7 +2071,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     express.json({ limit: '4mb' }),
     async (req, res) => {
       // Authenticate either via paired Android device Bearer token (nt_dev_...) OR dashboard Supabase session
-      const deviceAuth = androidManager.authenticateDeviceToken(req.headers.authorization);
+      const deviceAuth = await androidManager.authenticateDeviceToken(req.headers.authorization);
       let userId: string;
       let engine: NovaTradeEngine;
       let deviceId: string | null = null;
@@ -2115,9 +2115,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         if (hintLower.includes('iqoption') && !deviceAuth.device.permissions.allowIqOption) {
           return res.status(423).json({ error: 'IQ Option screen capture is disabled in device permissions.' });
         }
-        androidManager.recordDeviceHeartbeat(userId, deviceId, parsed.data.appPackageHint ?? null);
+        await androidManager.recordDeviceHeartbeat(userId, deviceId, parsed.data.appPackageHint ?? null);
       } else if (parsed.data.deviceId) {
-        const ownDevice = androidManager.listDevices(userId).find((d) => d.id === parsed.data.deviceId);
+        const ownDevice = (await androidManager.listDevices(userId)).find((d) => d.id === parsed.data.deviceId);
         if (ownDevice) deviceId = ownDevice.id;
       }
 
@@ -2160,7 +2160,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         userId: activityUid,
       });
 
-      const analysisRecord = androidManager.recordScreenAnalysis({
+      const analysisRecord = await androidManager.recordScreenAnalysis({
         userId,
         deviceId,
         vision,
@@ -2212,7 +2212,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   );
 
   router.post('/android/device/heartbeat', async (req, res) => {
-    const auth = androidManager.authenticateDeviceToken(req.headers.authorization);
+    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
     if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
     const schema = z.object({
       appPackage: z.string().max(120).nullable().optional(),
@@ -2221,7 +2221,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid heartbeat payload.' });
-    const updated = androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id, parsed.data.appPackage, {
+    const updated = await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id, parsed.data.appPackage, {
       mediaProjection: parsed.data.mediaProjection,
       accessibility: parsed.data.accessibility,
     });
@@ -2235,10 +2235,10 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.get('/android/device/poll', async (req, res) => {
-    const auth = androidManager.authenticateDeviceToken(req.headers.authorization);
+    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
     if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
     const engine = getEngineForUser(auth.userId);
-    androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id);
+    await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id);
     const actions = androidManager.pollAuthorizedActionsForDevice(
       auth.userId,
       auth.device.id,
@@ -2252,7 +2252,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/android/device/ack', async (req, res) => {
-    const auth = androidManager.authenticateDeviceToken(req.headers.authorization);
+    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
     if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
     const schema = z.object({
       actionId: z.string().min(1),
@@ -2261,7 +2261,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid action acknowledgement payload.' });
-    const updated = androidManager.acknowledgeDeviceAction(
+    const updated = await androidManager.acknowledgeDeviceAction(
       auth.userId,
       auth.device.id,
       parsed.data.actionId,
@@ -2280,7 +2280,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/android/device/emergency-stop', async (req, res) => {
-    const auth = androidManager.authenticateDeviceToken(req.headers.authorization);
+    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
     if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
     const schema = z.object({ engaged: z.boolean().default(true) });
     const parsed = schema.safeParse(req.body ?? {});
@@ -2301,9 +2301,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/android/device/disconnect', async (req, res) => {
-    const auth = androidManager.authenticateDeviceToken(req.headers.authorization);
+    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
     if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-    const revoked = androidManager.revokeDevice(auth.userId, auth.device.id);
+    const revoked = await androidManager.revokeDevice(auth.userId, auth.device.id);
     if (!revoked) return res.status(404).json({ error: 'Paired Android device not found.' });
     const engine = getEngineForUser(auth.userId);
     const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
