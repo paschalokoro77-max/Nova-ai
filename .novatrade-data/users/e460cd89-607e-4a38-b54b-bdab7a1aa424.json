@@ -57,101 +57,6 @@
   ],
   "signals": [
     {
-      "symbol": "EURUSD",
-      "timeframe": "5m",
-      "direction": "WAIT",
-      "score": 0,
-      "confidenceScore": 0,
-      "rawDirectionalConfidence": 54,
-      "actionableConfidence": 0,
-      "confidenceState": "STALE_OR_UNAVAILABLE",
-      "zeroConfidenceReason": "Market status is LIVE (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
-      "feedLastUpdateAt": "2026-11-16T14:01:47.000Z",
-      "bullishScore": 54,
-      "bearishScore": 16,
-      "entryPrice": 1.1016855239868164,
-      "suggestedExpirySeconds": 900,
-      "provider": "Yahoo Finance FX (Currency Feed)",
-      "marketStatus": "LIVE",
-      "isStale": true,
-      "timestamp": "2026-11-16T14:01:52.647Z",
-      "indicators": {
-        "ema9": 1.101533,
-        "ema21": 1.101489,
-        "ema50": 1.101484,
-        "ema200": 1.101809,
-        "rsi14": 55,
-        "macdLine": 0.00005,
-        "macdSignal": 0.000053,
-        "macdHistogram": -0.000003,
-        "bbUpper": 1.101876,
-        "bbMiddle": 1.101504,
-        "bbLower": 1.101132,
-        "bbBandwidthPct": 0.0675,
-        "bbPercentB": 0.745,
-        "atr14": 0.000234,
-        "atrPct": 0.0212,
-        "nearestSupport": 1.101686,
-        "nearestResistance": 1.101686,
-        "supportDistancePct": 0,
-        "resistanceDistancePct": 0,
-        "trend": "RANGING",
-        "volatilityRegime": "NORMAL",
-        "patterns": [
-          "Doji Indecision"
-        ],
-        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
-      },
-      "supportingIndicators": {
-        "emaAlignment": "Bullish (9 > 21 > 50)",
-        "rsiState": "55.0 (Bullish zone)",
-        "macdState": "Negative (-0.000003)",
-        "bollingerState": "%B 0.745 · Width 0.0675%",
-        "supportResistanceState": "Support 1.101686 (-0%) / Resistance 1.101686 (+0%)",
-        "candlestickPattern": "Doji Indecision",
-        "trendDirection": "RANGING",
-        "volatilityState": "NORMAL (ATR 0.0212%)",
-        "multiTimeframe": "15m RANGING (NEUTRAL)"
-      },
-      "riskAssessment": {
-        "level": "EXTREME",
-        "volatilityRegime": "NORMAL",
-        "atrPct": 0.0212,
-        "suggestedStakePct": 0,
-        "summary": "Market closed or stale feed; actionable entries blocked until live OPEN bars resume."
-      },
-      "mtf": {
-        "primaryTimeframe": "5m",
-        "higherTimeframe": "15m",
-        "higherTrend": "RANGING",
-        "higherRsi": 51.12,
-        "alignment": "NEUTRAL"
-      },
-      "backtest": {
-        "sampleSize": 26,
-        "wins": 6,
-        "losses": 20,
-        "winRatePct": 23.1,
-        "expectancyPerUnit": -0.585,
-        "horizonBars": 3,
-        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
-      },
-      "reasons": [
-        "Market status is LIVE (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
-        "Confluence below threshold (Bull 54/100 vs Bear 16/100; required >= 65 with >= 16 pt margin).",
-        "Bullish factor: EMA 9 > EMA 21 > EMA 50 stacked bullish trend.",
-        "Bearish factor: MACD below signal line."
-      ],
-      "warning": "MARKET CLOSED OR STALE — Actionable CALL/PUT signals suppressed until live OPEN candles resume.",
-      "id": "7f3c0e23-25e5-48f8-9595-45a42d99551f",
-      "aiExplanation": {
-        "available": true,
-        "model": "gemini-4-hydrogen",
-        "summary": "EURUSD (5m) holds a quantitative WAIT decision (score 0/100, Bull 54 / Bear 16) at 1.101686 within a ranging regime and normal volatility (ATR% 0.0212), aligned with a neutral ranging 15m timeframe. Technical indicators show mixed readings—RSI(14) at 55, BB %B at 0.745, and MACD histogram at -0.000003—alongside a Doji Indecision pattern directly on the converged 1.101686 support and resistance level.",
-        "riskNote": "This neutral posture is invalidated by a high-momentum breakout away from the 1.101686 level with expanding volatility, particularly given the fragile historical sample showing a 23.1% win rate across 26 trades."
-      }
-    },
-    {
       "id": "eaf4e2e1-7b32-486e-b2ad-f4907d388dd2",
       "symbol": "EURGBP",
       "timeframe": "5m",
@@ -1767,5 +1672,5 @@
   "simulatedDailyLoss": 0,
   "simulatedDailyProfit": 0,
   "dailyTradesCount": 0,
-  "dailyKey": "2026-11-16"
+  "dailyKey": "2026-11-15"
 }

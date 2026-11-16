@@ -343,138 +343,65 @@ export class AndroidCompanionManager {
     const cleanCode = input.pairingCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
     if (!cleanCode) return null;
     const candidateHash = hashSecret(cleanCode);
-    const nowIso = new Date().toISOString();
 
     const admin = getSupabaseAdmin();
-    if (admin) {
-      const { data: matchedDevs, error: fetchErr } = await admin
-        .from('android_devices')
-        .select('*')
-        .eq('pairing_code_hash', candidateHash)
-        .eq('status', 'PAIRED_PENDING')
-        .gt('pairing_expires_at', nowIso);
-
-      if (!fetchErr && matchedDevs && matchedDevs.length > 0) {
-        const targetDbDev = matchedDevs[0];
-        const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
-        const tokenHash = hashSecret(rawToken);
-        const tokenPrefix = rawToken.slice(0, 12);
-        const newName = input.deviceName?.trim().slice(0, 60) || targetDbDev.device_name || 'Android Trading Phone';
-        const newModel = input.deviceModel?.trim().slice(0, 80) || targetDbDev.device_model;
-        const newOs = input.osVersion?.trim().slice(0, 40) || targetDbDev.os_version;
-        const perms = {
-          ...(targetDbDev.permissions || {}),
-          ...(typeof input.mediaProjectionGranted === 'boolean' ? { mediaProjection: input.mediaProjectionGranted } : {}),
-          ...(typeof input.accessibilityGranted === 'boolean' ? { accessibility: input.accessibilityGranted } : {}),
-          realMoneyBlocked: true,
-        };
-
-        const { data: updatedDev, error: updateErr } = await admin
-          .from('android_devices')
-          .update({
-            device_name: newName,
-            device_model: newModel,
-            os_version: newOs,
-            pairing_code_hash: null,
-            pairing_expires_at: null,
-            device_token_hash: tokenHash,
-            token_prefix: tokenPrefix,
-            permissions: perms,
-            status: 'ACTIVE',
-            last_seen_at: nowIso,
-            updated_at: nowIso,
-          })
-          .eq('id', targetDbDev.id)
-          .eq('status', 'PAIRED_PENDING')
-          .select()
-          .single();
-
-        if (!updateErr && updatedDev) {
-          const deviceInternal: AndroidDeviceInternal = {
-            id: updatedDev.id,
-            userId: updatedDev.user_id,
-            deviceName: updatedDev.device_name,
-            deviceModel: updatedDev.device_model,
-            osVersion: updatedDev.os_version,
-            pairingCodeHash: null,
-            pairingExpiresAt: null,
-            deviceTokenHash: updatedDev.device_token_hash,
-            tokenPrefix: updatedDev.token_prefix,
-            permissions: updatedDev.permissions,
-            targetPackages: updatedDev.target_packages || [],
-            status: updatedDev.status,
-            lastAppPackage: updatedDev.last_app_package,
-            lastSeenAt: updatedDev.last_seen_at,
-            createdAt: updatedDev.created_at,
-            updatedAt: updatedDev.updated_at,
-          };
-
-          const store = this.getOrInitStore(deviceInternal.userId);
-          const idx = store.devices.findIndex((d) => d.id === deviceInternal.id);
-          if (idx >= 0) {
-            store.devices[idx] = deviceInternal;
-          } else {
-            store.devices.unshift(deviceInternal);
-          }
-          this.saveStore(deviceInternal.userId);
-
-          return { device: toPublicDevice(deviceInternal), deviceToken: rawToken };
-        }
-      }
+    if (!admin) {
+      throw new Error('Supabase admin service role is required for secure device pairing.');
     }
 
-    const nowMs = Date.now();
-    for (const [userId, store] of this.stores.entries()) {
-      for (const dev of store.devices) {
-        if (dev.status !== 'PAIRED_PENDING' || !dev.pairingCodeHash) continue;
-        if (dev.pairingExpiresAt && new Date(dev.pairingExpiresAt).getTime() <= nowMs) continue;
-        if (!timingSafeHexMatch(dev.pairingCodeHash, candidateHash)) continue;
+    const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
+    const tokenHash = hashSecret(rawToken);
+    const tokenPrefix = rawToken.slice(0, 12);
 
-        const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
-        dev.deviceTokenHash = hashSecret(rawToken);
-        dev.tokenPrefix = rawToken.slice(0, 12);
-        dev.pairingCodeHash = null;
-        dev.pairingExpiresAt = null;
-        if (input.deviceName?.trim()) dev.deviceName = input.deviceName.trim().slice(0, 60);
-        if (input.deviceModel?.trim()) dev.deviceModel = input.deviceModel.trim().slice(0, 80);
-        if (input.osVersion?.trim()) dev.osVersion = input.osVersion.trim().slice(0, 40);
-        if (typeof input.mediaProjectionGranted === 'boolean') {
-          dev.permissions.mediaProjection = input.mediaProjectionGranted;
-        }
-        if (typeof input.accessibilityGranted === 'boolean') {
-          dev.permissions.accessibility = input.accessibilityGranted;
-        }
-        dev.permissions.realMoneyBlocked = true;
-        dev.status = 'ACTIVE';
-        dev.lastSeenAt = new Date().toISOString();
-        dev.updatedAt = dev.lastSeenAt;
-        this.saveStore(userId);
+    const { data: updatedDev, error } = await admin.rpc('redeem_android_pairing_code', {
+      p_pairing_code_hash: candidateHash,
+      p_device_name: input.deviceName || 'Android Trading Phone',
+      p_device_model: input.deviceModel || null,
+      p_os_version: input.osVersion || null,
+      p_media_projection: input.mediaProjectionGranted ?? false,
+      p_accessibility: input.accessibilityGranted ?? false,
+      p_token_hash: tokenHash,
+      p_token_prefix: tokenPrefix,
+    });
 
-        const adminAdmin = getSupabaseAdmin();
-        if (adminAdmin && userId !== 'local-preview') {
-          void adminAdmin
-            .from('android_devices')
-            .update({
-              device_name: dev.deviceName,
-              device_model: dev.deviceModel,
-              os_version: dev.osVersion,
-              pairing_code_hash: null,
-              pairing_expires_at: null,
-              device_token_hash: dev.deviceTokenHash,
-              token_prefix: dev.tokenPrefix,
-              permissions: dev.permissions,
-              status: dev.status,
-              last_seen_at: dev.lastSeenAt,
-              updated_at: dev.updatedAt,
-            })
-            .eq('id', dev.id)
-            .then(() => undefined, () => undefined);
-        }
-        return { device: toPublicDevice(dev), deviceToken: rawToken };
-      }
+    if (error) {
+      throw new Error(`Database error during pairing redemption: ${error.message}`);
     }
 
-    return null;
+    if (!updatedDev) {
+      return null; // Invalid or expired pairing code, or already redeemed
+    }
+
+    const dbDev = typeof updatedDev === 'string' ? JSON.parse(updatedDev) : updatedDev;
+    const deviceInternal: AndroidDeviceInternal = {
+      id: dbDev.id,
+      userId: dbDev.user_id,
+      deviceName: dbDev.device_name,
+      deviceModel: dbDev.device_model,
+      osVersion: dbDev.os_version,
+      pairingCodeHash: null,
+      pairingExpiresAt: null,
+      deviceTokenHash: dbDev.device_token_hash,
+      tokenPrefix: dbDev.token_prefix,
+      permissions: dbDev.permissions,
+      targetPackages: dbDev.target_packages || [],
+      status: dbDev.status,
+      lastAppPackage: dbDev.last_app_package,
+      lastSeenAt: dbDev.last_seen_at,
+      createdAt: dbDev.created_at,
+      updatedAt: dbDev.updated_at,
+    };
+
+    const store = this.getOrInitStore(deviceInternal.userId);
+    const idx = store.devices.findIndex((d) => d.id === deviceInternal.id);
+    if (idx >= 0) {
+      store.devices[idx] = deviceInternal;
+    } else {
+      store.devices.unshift(deviceInternal);
+    }
+    this.saveStore(deviceInternal.userId);
+
+    return { device: toPublicDevice(deviceInternal), deviceToken: rawToken };
   }
 
   async authenticateDeviceToken(authHeader?: string): Promise<{ userId: string; device: AndroidDeviceInternal } | null> {
