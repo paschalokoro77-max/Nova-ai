@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NovaTrade AI Companion</string>
+    <string name="accessibility_service_label">NovaTrade AI Chart Assist</string>
+    <string name="accessibility_service_description">With your explicit permission, reads visible symbol, timeframe, price, and account mode labels inside MetaTrader 5 and IQ Option to provide accurate context to your paired NovaTrade AI workspace.</string>
+    <string name="capture_notification_channel">NovaTrade Screen Capture</string>
+    <string name="capture_notification_title">NovaTrade Screen Bridge Active</string>
+    <string name="capture_notification_text">Sharing user-authorized screen frames with your paired NovaTrade AI workspace. Tap to manage or stop.</string>
+</resources>

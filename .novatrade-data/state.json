@@ -1,0 +1,1588 @@
+{
+  "mode": "signals",
+  "autoPaperArmed": false,
+  "autoPausedReason": "Emergency stop engaged by user.",
+  "startingVirtualBalance": 10000,
+  "riskSettings": {
+    "maxTradeAmount": 100,
+    "dailyLossLimit": 500,
+    "dailyProfitTarget": 500,
+    "maxConsecutiveLosses": 3,
+    "maxDailyTrades": 25,
+    "maxSimultaneousTrades": 3,
+    "tradingScheduleEnabled": false,
+    "tradingStartHourUtc": 7,
+    "tradingEndHourUtc": 20,
+    "emergencyStop": true
+  },
+  "aiSettings": {
+    "strategyProfile": "balanced",
+    "minSignalScore": 65,
+    "requireMtfAlignment": true,
+    "enabledAssets": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "BTCUSD",
+      "ETHUSD"
+    ],
+    "defaultTimeframe": "1m",
+    "expirySeconds": 180,
+    "scanIntervalSeconds": 60,
+    "useGeminiCommentary": true
+  },
+  "paperTrades": [
+    {
+      "id": "f16cfc50-bc91-460a-b4e4-26dcc7b42138",
+      "symbol": "EURUSD",
+      "timeframe": "1m",
+      "direction": "CALL",
+      "mode": "manual",
+      "amount": 50,
+      "payoutRate": 0.8,
+      "entryPrice": 1.1027790307998657,
+      "exitPrice": null,
+      "expirySeconds": 60,
+      "expiresAt": "2026-11-14T00:54:30.090Z",
+      "status": "SIMULATED_WIN",
+      "pnl": 40,
+      "signalScore": null,
+      "provider": "market-feed",
+      "settledBy": "manual",
+      "createdAt": "2026-11-14T00:53:30.090Z",
+      "closedAt": "2026-11-14T00:53:30.096Z"
+    },
+    {
+      "id": "7c8dae64-aef9-4db2-8d0b-774622cdfe93",
+      "symbol": "EURUSD",
+      "timeframe": "1m",
+      "direction": "CALL",
+      "mode": "manual",
+      "amount": 50,
+      "payoutRate": 0.8,
+      "entryPrice": 1.1027790307998657,
+      "exitPrice": null,
+      "expirySeconds": 60,
+      "expiresAt": "2026-11-14T00:54:16.348Z",
+      "status": "SIMULATED_WIN",
+      "pnl": 40,
+      "signalScore": null,
+      "provider": "market-feed",
+      "settledBy": "manual",
+      "createdAt": "2026-11-14T00:53:16.348Z",
+      "closedAt": "2026-11-14T00:53:16.353Z"
+    },
+    {
+      "id": "b931e265-0fe2-4c22-9bb2-6ce4ee41e094",
+      "userId": "e460cd89-607e-4a38-b54b-bdab7a1aa424",
+      "symbol": "EURUSD",
+      "timeframe": "1m",
+      "direction": "CALL",
+      "mode": "automatic",
+      "amount": 50,
+      "payoutRate": 0.8,
+      "entryPrice": 1.1012,
+      "exitPrice": 1.10119,
+      "expirySeconds": 180,
+      "expiresAt": "2026-11-14T00:41:03.127Z",
+      "status": "SIMULATED_LOSS",
+      "pnl": -50,
+      "signalScore": null,
+      "provider": "market-feed",
+      "settledBy": "auto-expiry-monitor",
+      "createdAt": "2026-11-14T00:38:03.127Z",
+      "closedAt": "2026-11-14T00:41:06.628Z"
+    }
+  ],
+  "signals": [
+    {
+      "symbol": "BTCUSD",
+      "timeframe": "1m",
+      "direction": "WAIT",
+      "score": 34,
+      "confidenceScore": 34,
+      "bullishScore": 34,
+      "bearishScore": 24,
+      "entryPrice": 68284.44,
+      "suggestedExpirySeconds": 180,
+      "provider": "Binance Spot Klines (Crypto)",
+      "marketStatus": "OPEN",
+      "isStale": false,
+      "timestamp": "2026-11-14T01:19:01.432Z",
+      "indicators": {
+        "ema9": 68262.109235,
+        "ema21": 68268.488325,
+        "ema50": 68281.897272,
+        "ema200": 68283.298261,
+        "rsi14": 51.92,
+        "macdLine": -9.986991,
+        "macdSignal": -14.390441,
+        "macdHistogram": 4.403449,
+        "bbUpper": 68308.289556,
+        "bbMiddle": 68259.101,
+        "bbLower": 68209.912444,
+        "bbBandwidthPct": 0.1441,
+        "bbPercentB": 0.758,
+        "atr14": 31.291429,
+        "atrPct": 0.0458,
+        "nearestSupport": 68284,
+        "nearestResistance": 68320.87,
+        "supportDistancePct": 0.001,
+        "resistanceDistancePct": 0.053,
+        "trend": "RANGING",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bearish (9 < 21 < 50)",
+        "rsiState": "51.9 (Bullish zone)",
+        "macdState": "Positive (4.403449)",
+        "bollingerState": "%B 0.758 · Width 0.1441%",
+        "supportResistanceState": "Support 68284 (-0.001%) / Resistance 68320.87 (+0.053%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "RANGING",
+        "volatilityState": "NORMAL (ATR 0.0458%)",
+        "multiTimeframe": "5m DOWNTREND (CONFLICT)"
+      },
+      "riskAssessment": {
+        "level": "HIGH",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0458,
+        "suggestedStakePct": 0.4,
+        "summary": "Elevated volatility or higher-timeframe conflict; reduce size or wait."
+      },
+      "mtf": {
+        "primaryTimeframe": "1m",
+        "higherTimeframe": "5m",
+        "higherTrend": "DOWNTREND",
+        "higherRsi": 49.43,
+        "alignment": "CONFLICT"
+      },
+      "backtest": {
+        "sampleSize": 26,
+        "wins": 14,
+        "losses": 12,
+        "winRatePct": 53.8,
+        "expectancyPerUnit": -0.031,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Confluence below threshold (Bull 34/100 vs Bear 24/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: MACD above signal with expanding positive histogram.",
+        "Bearish factor: EMA 9 < EMA 21 < EMA 50 stacked bearish trend."
+      ],
+      "warning": "Decision is WAIT — quantitative criteria or MTF alignment not satisfied.",
+      "id": "a145f79a-fe31-4e7c-bd00-36f5738f8ea4",
+      "aiExplanation": {
+        "available": true,
+        "model": "gemini-4-hydrogen",
+        "summary": "BTCUSD on the 1m timeframe holds a WAIT decision (score 34/100, Bull 34 / Bear 24) as price trades at 68284.44 in a ranging regime with normal volatility (ATR% 0.0458) and a Doji Indecision pattern. Momentum readings are mildly positive with RSI(14) at 51.92, MACD histogram at 4.403449, and BB %B at 0.758, though a 5m downtrend conflict and a 53.8% backtest win rate over 26 trades temper directional conviction.",
+        "riskNote": "A confirmed breakdown below immediate support at 68284 aligning with the 5m downtrend, or a decisive breakout above resistance at 68320.87, would invalidate the current range-bound WAIT thesis."
+      }
+    },
+    {
+      "symbol": "XAUUSD",
+      "timeframe": "1m",
+      "direction": "WAIT",
+      "score": 0,
+      "confidenceScore": 0,
+      "bullishScore": 70,
+      "bearishScore": 10,
+      "entryPrice": 3887.60009765625,
+      "suggestedExpirySeconds": 180,
+      "provider": "Yahoo Finance Commodity Futures",
+      "marketStatus": "DELAYED_OR_CLOSED",
+      "isStale": true,
+      "timestamp": "2026-11-14T01:10:12.966Z",
+      "indicators": {
+        "ema9": 3885.937242,
+        "ema21": 3883.725231,
+        "ema50": 3881.402764,
+        "ema200": 3880.29745,
+        "rsi14": 67.81,
+        "macdLine": 2.173873,
+        "macdSignal": 1.742882,
+        "macdHistogram": 0.430992,
+        "bbUpper": 3889.252172,
+        "bbMiddle": 3883.345007,
+        "bbLower": 3877.437843,
+        "bbBandwidthPct": 0.3042,
+        "bbPercentB": 0.86,
+        "atr14": 1.692836,
+        "atrPct": 0.0435,
+        "nearestSupport": 3881.600098,
+        "nearestResistance": 3888.899902,
+        "supportDistancePct": 0.154,
+        "resistanceDistancePct": 0.033,
+        "trend": "UPTREND",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bullish (9 > 21 > 50)",
+        "rsiState": "67.8 (Bullish zone)",
+        "macdState": "Positive (0.430992)",
+        "bollingerState": "%B 0.86 · Width 0.3042%",
+        "supportResistanceState": "Support 3881.600098 (-0.154%) / Resistance 3888.899902 (+0.033%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "UPTREND",
+        "volatilityState": "NORMAL (ATR 0.0435%)",
+        "multiTimeframe": "5m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "EXTREME",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0435,
+        "suggestedStakePct": 0,
+        "summary": "Market closed or stale feed; actionable entries blocked until live OPEN bars resume."
+      },
+      "mtf": {
+        "primaryTimeframe": "1m",
+        "higherTimeframe": "5m",
+        "higherTrend": "RANGING",
+        "higherRsi": 63.48,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 29,
+        "wins": 15,
+        "losses": 14,
+        "winRatePct": 51.7,
+        "expectancyPerUnit": -0.069,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Market status is DELAYED_OR_CLOSED (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
+        "EMA 9 > EMA 21 > EMA 50 stacked bullish trend.",
+        "MACD above signal line.",
+        "RSI(14) at 67.8 shows healthy bullish momentum.",
+        "Price holding in upper Bollinger expansion corridor."
+      ],
+      "warning": "MARKET CLOSED OR STALE — Actionable CALL/PUT signals suppressed until live OPEN candles resume.",
+      "id": "08e4d068-6ab8-4ea1-b8e5-71467b108a89",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "EURUSD",
+      "timeframe": "15m",
+      "direction": "WAIT",
+      "score": 0,
+      "confidenceScore": 0,
+      "bullishScore": 22,
+      "bearishScore": 64,
+      "entryPrice": 1.1027790307998657,
+      "suggestedExpirySeconds": 1800,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "marketStatus": "DELAYED_OR_CLOSED",
+      "isStale": true,
+      "timestamp": "2026-11-14T01:10:12.850Z",
+      "indicators": {
+        "ema9": 1.102665,
+        "ema21": 1.102983,
+        "ema50": 1.103879,
+        "ema200": 1.105554,
+        "rsi14": 42.56,
+        "macdLine": -0.000436,
+        "macdSignal": -0.000524,
+        "macdHistogram": 0.000088,
+        "bbUpper": 1.103532,
+        "bbMiddle": 1.102846,
+        "bbLower": 1.10216,
+        "bbBandwidthPct": 0.1244,
+        "bbPercentB": 0.451,
+        "atr14": 0.000269,
+        "atrPct": 0.0244,
+        "nearestSupport": 1.102536,
+        "nearestResistance": 1.102901,
+        "supportDistancePct": 0.022,
+        "resistanceDistancePct": 0.011,
+        "trend": "DOWNTREND",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bearish (9 < 21 < 50)",
+        "rsiState": "42.6 (Bearish zone)",
+        "macdState": "Positive (0.000088)",
+        "bollingerState": "%B 0.451 · Width 0.1244%",
+        "supportResistanceState": "Support 1.102536 (-0.022%) / Resistance 1.102901 (+0.011%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "DOWNTREND",
+        "volatilityState": "NORMAL (ATR 0.0244%)",
+        "multiTimeframe": "1h DOWNTREND (ALIGNED_BEARISH)"
+      },
+      "riskAssessment": {
+        "level": "EXTREME",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0244,
+        "suggestedStakePct": 0,
+        "summary": "Market closed or stale feed; actionable entries blocked until live OPEN bars resume."
+      },
+      "mtf": {
+        "primaryTimeframe": "15m",
+        "higherTimeframe": "1h",
+        "higherTrend": "DOWNTREND",
+        "higherRsi": 33.22,
+        "alignment": "ALIGNED_BEARISH"
+      },
+      "backtest": {
+        "sampleSize": 20,
+        "wins": 10,
+        "losses": 10,
+        "winRatePct": 50,
+        "expectancyPerUnit": -0.1,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Market status is DELAYED_OR_CLOSED (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
+        "Confluence below threshold (Bull 22/100 vs Bear 64/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: MACD above signal with expanding positive histogram.",
+        "Bearish factor: EMA 9 < EMA 21 < EMA 50 stacked bearish trend."
+      ],
+      "warning": "MARKET CLOSED OR STALE — Actionable CALL/PUT signals suppressed until live OPEN candles resume.",
+      "id": "f270a097-ed1d-4ce1-a3e4-91477ffea0e0",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "USDJPY",
+      "timeframe": "5m",
+      "direction": "WAIT",
+      "score": 0,
+      "confidenceScore": 0,
+      "bullishScore": 0,
+      "bearishScore": 86,
+      "entryPrice": 159.68600463867188,
+      "suggestedExpirySeconds": 900,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "marketStatus": "DELAYED_OR_CLOSED",
+      "isStale": true,
+      "timestamp": "2026-11-14T01:10:12.753Z",
+      "indicators": {
+        "ema9": 159.716317,
+        "ema21": 159.731955,
+        "ema50": 159.759336,
+        "ema200": 159.828157,
+        "rsi14": 44.23,
+        "macdLine": -0.015491,
+        "macdSignal": -0.012037,
+        "macdHistogram": -0.003454,
+        "bbUpper": 159.848637,
+        "bbMiddle": 159.742352,
+        "bbLower": 159.636066,
+        "bbBandwidthPct": 0.1331,
+        "bbPercentB": 0.235,
+        "atr14": 0.094931,
+        "atrPct": 0.0594,
+        "nearestSupport": 159.667007,
+        "nearestResistance": 159.716003,
+        "supportDistancePct": 0.012,
+        "resistanceDistancePct": 0.019,
+        "trend": "RANGING",
+        "volatilityRegime": "NORMAL",
+        "patterns": [],
+        "priceActionSummary": "Latest bearish bar shows 22% body-to-range without reversal pattern."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bearish (9 < 21 < 50)",
+        "rsiState": "44.2 (Bearish zone)",
+        "macdState": "Negative (-0.003454)",
+        "bollingerState": "%B 0.235 · Width 0.1331%",
+        "supportResistanceState": "Support 159.667007 (-0.012%) / Resistance 159.716003 (+0.019%)",
+        "candlestickPattern": "None detected",
+        "trendDirection": "RANGING",
+        "volatilityState": "NORMAL (ATR 0.0594%)",
+        "multiTimeframe": "15m DOWNTREND (ALIGNED_BEARISH)"
+      },
+      "riskAssessment": {
+        "level": "EXTREME",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0594,
+        "suggestedStakePct": 0,
+        "summary": "Market closed or stale feed; actionable entries blocked until live OPEN bars resume."
+      },
+      "mtf": {
+        "primaryTimeframe": "5m",
+        "higherTimeframe": "15m",
+        "higherTrend": "DOWNTREND",
+        "higherRsi": 40.35,
+        "alignment": "ALIGNED_BEARISH"
+      },
+      "backtest": {
+        "sampleSize": 25,
+        "wins": 10,
+        "losses": 15,
+        "winRatePct": 40,
+        "expectancyPerUnit": -0.28,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Market status is DELAYED_OR_CLOSED (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
+        "EMA 9 < EMA 21 < EMA 50 stacked bearish trend.",
+        "MACD below signal with expanding negative histogram.",
+        "RSI(14) at 44.2 shows healthy bearish momentum.",
+        "Price holding in lower Bollinger expansion corridor.",
+        "Higher timeframe (15m) confirms DOWNTREND."
+      ],
+      "warning": "MARKET CLOSED OR STALE — Actionable CALL/PUT signals suppressed until live OPEN candles resume.",
+      "id": "7c02b6e3-8525-4105-827d-c8799ddfd115",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "GBPUSD",
+      "timeframe": "5m",
+      "direction": "WAIT",
+      "score": 0,
+      "confidenceScore": 0,
+      "bullishScore": 0,
+      "bearishScore": 70,
+      "entryPrice": 1.320899248123169,
+      "suggestedExpirySeconds": 900,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "marketStatus": "DELAYED_OR_CLOSED",
+      "isStale": true,
+      "timestamp": "2026-11-14T01:10:12.641Z",
+      "indicators": {
+        "ema9": 1.320986,
+        "ema21": 1.321105,
+        "ema50": 1.321262,
+        "ema200": 1.322094,
+        "rsi14": 39.5,
+        "macdLine": -0.000102,
+        "macdSignal": -0.000057,
+        "macdHistogram": -0.000045,
+        "bbUpper": 1.321824,
+        "bbMiddle": 1.321223,
+        "bbLower": 1.320622,
+        "bbBandwidthPct": 0.091,
+        "bbPercentB": 0.231,
+        "atr14": 0.00012,
+        "atrPct": 0.0091,
+        "nearestSupport": 1.320899,
+        "nearestResistance": 1.320899,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "DOWNTREND",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bearish (9 < 21 < 50)",
+        "rsiState": "39.5 (Bearish zone)",
+        "macdState": "Negative (-0.000045)",
+        "bollingerState": "%B 0.231 · Width 0.091%",
+        "supportResistanceState": "Support 1.320899 (-0%) / Resistance 1.320899 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "DOWNTREND",
+        "volatilityState": "NORMAL (ATR 0.0091%)",
+        "multiTimeframe": "15m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "EXTREME",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0091,
+        "suggestedStakePct": 0,
+        "summary": "Market closed or stale feed; actionable entries blocked until live OPEN bars resume."
+      },
+      "mtf": {
+        "primaryTimeframe": "5m",
+        "higherTimeframe": "15m",
+        "higherTrend": "RANGING",
+        "higherRsi": 40.56,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 22,
+        "wins": 12,
+        "losses": 10,
+        "winRatePct": 54.5,
+        "expectancyPerUnit": -0.018,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Market status is DELAYED_OR_CLOSED (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
+        "EMA 9 < EMA 21 < EMA 50 stacked bearish trend.",
+        "MACD below signal line.",
+        "RSI(14) at 39.5 shows healthy bearish momentum.",
+        "Price holding in lower Bollinger expansion corridor."
+      ],
+      "warning": "MARKET CLOSED OR STALE — Actionable CALL/PUT signals suppressed until live OPEN candles resume.",
+      "id": "d2cda527-cbf6-49d4-94bc-a4de69d32a80",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "EURUSD",
+      "timeframe": "1m",
+      "direction": "WAIT",
+      "score": 0,
+      "confidenceScore": 0,
+      "bullishScore": 42,
+      "bearishScore": 16,
+      "entryPrice": 1.1027790307998657,
+      "suggestedExpirySeconds": 180,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "marketStatus": "DELAYED_OR_CLOSED",
+      "isStale": true,
+      "timestamp": "2026-11-14T01:10:12.516Z",
+      "indicators": {
+        "ema9": 1.102779,
+        "ema21": 1.102762,
+        "ema50": 1.102701,
+        "ema200": 1.102629,
+        "rsi14": 63.52,
+        "macdLine": 0.000027,
+        "macdSignal": 0.000036,
+        "macdHistogram": -0.000009,
+        "bbUpper": 1.102779,
+        "bbMiddle": 1.102779,
+        "bbLower": 1.102779,
+        "bbBandwidthPct": 0,
+        "bbPercentB": 0.5,
+        "atr14": 0,
+        "atrPct": 0,
+        "nearestSupport": 1.102779,
+        "nearestResistance": 1.102779,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "UPTREND",
+        "volatilityRegime": "LOW",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bullish (9 > 21 > 50)",
+        "rsiState": "63.5 (Bullish zone)",
+        "macdState": "Negative (-0.000009)",
+        "bollingerState": "%B 0.5 · Width 0%",
+        "supportResistanceState": "Support 1.102779 (-0%) / Resistance 1.102779 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "UPTREND",
+        "volatilityState": "LOW (ATR 0%)",
+        "multiTimeframe": "5m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "EXTREME",
+        "volatilityRegime": "LOW",
+        "atrPct": 0,
+        "suggestedStakePct": 0,
+        "summary": "Market closed or stale feed; actionable entries blocked until live OPEN bars resume."
+      },
+      "mtf": {
+        "primaryTimeframe": "1m",
+        "higherTimeframe": "5m",
+        "higherTrend": "RANGING",
+        "higherRsi": 54.27,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 14,
+        "wins": 7,
+        "losses": 7,
+        "winRatePct": 50,
+        "expectancyPerUnit": -0.1,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Market status is DELAYED_OR_CLOSED (candle feed is stale or market closed) — actionable CALL/PUT signals are suppressed to WAIT.",
+        "Confluence below threshold (Bull 42/100 vs Bear 16/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: EMA 9 > EMA 21 > EMA 50 stacked bullish trend.",
+        "Bearish factor: MACD below signal line."
+      ],
+      "warning": "MARKET CLOSED OR STALE — Actionable CALL/PUT signals suppressed until live OPEN candles resume.",
+      "id": "76d80802-9d1e-4d2d-916b-18caa2c4b2fe",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "BTCUSD",
+      "timeframe": "1m",
+      "direction": "WAIT",
+      "score": 42,
+      "confidenceScore": 42,
+      "bullishScore": 0,
+      "bearishScore": 42,
+      "entryPrice": 68318.01,
+      "suggestedExpirySeconds": 180,
+      "provider": "Binance Spot Klines (Crypto)",
+      "timestamp": "2026-11-14T01:06:21.354Z",
+      "indicators": {
+        "ema9": 68294.628497,
+        "ema21": 68302.119296,
+        "ema50": 68301.763915,
+        "ema200": 68285.509881,
+        "rsi14": 51.88,
+        "macdLine": -6.565459,
+        "macdSignal": -4.614074,
+        "macdHistogram": -1.951386,
+        "bbUpper": 68424.449851,
+        "bbMiddle": 68321.484,
+        "bbLower": 68218.518149,
+        "bbBandwidthPct": 0.3014,
+        "bbPercentB": 0.483,
+        "atr14": 45.453571,
+        "atrPct": 0.0665,
+        "nearestSupport": 68298,
+        "nearestResistance": 68346,
+        "supportDistancePct": 0.029,
+        "resistanceDistancePct": 0.041,
+        "trend": "RANGING",
+        "volatilityRegime": "NORMAL",
+        "patterns": [],
+        "priceActionSummary": "Latest bullish bar shows 50% body-to-range without reversal pattern."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Mixed / Crossing",
+        "rsiState": "51.9 (Bullish zone)",
+        "macdState": "Negative (-1.951386)",
+        "bollingerState": "%B 0.483 · Width 0.3014%",
+        "supportResistanceState": "Support 68298 (-0.029%) / Resistance 68346 (+0.041%)",
+        "candlestickPattern": "None detected",
+        "trendDirection": "RANGING",
+        "volatilityState": "NORMAL (ATR 0.0665%)",
+        "multiTimeframe": "5m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "MODERATE",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0665,
+        "suggestedStakePct": 0.75,
+        "summary": "Standard risk conditions; apply configured per-trade cap."
+      },
+      "mtf": {
+        "primaryTimeframe": "1m",
+        "higherTimeframe": "5m",
+        "higherTrend": "RANGING",
+        "higherRsi": 50.94,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 25,
+        "wins": 13,
+        "losses": 12,
+        "winRatePct": 52,
+        "expectancyPerUnit": -0.064,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Confluence below threshold (Bull 0/100 vs Bear 42/100; required >= 65 with >= 16 pt margin).",
+        "Bearish factor: EMA 9 below EMA 21 short-term drift."
+      ],
+      "warning": "Decision is WAIT — quantitative criteria or MTF alignment not satisfied.",
+      "id": "b9467051-d494-47ac-8315-4ad15389706e",
+      "aiExplanation": {
+        "available": true,
+        "model": "gemini-4-hydrogen",
+        "summary": "BTCUSD (1m) at 68318.01 remains in a ranging regime with normal volatility (ATR% 0.0665) and a neutral 5m trend, supporting the quantitative WAIT decision (Score: 42/100; Bull 0 / Bear 42). With no chart patterns detected, RSI(14) at 51.88 and BB %B at 0.483 reflect balanced positioning between 68298 support and 68346 resistance, alongside mild bearish pressure from a -1.951386 MACD histogram.",
+        "riskNote": "The current ranging WAIT thesis is invalidated by a decisive break above 68346 resistance or below 68298 support, and the 52% win rate over a 25-trade backtest sample offers limited statistical confidence."
+      }
+    },
+    {
+      "symbol": "EURUSD",
+      "timeframe": "1m",
+      "direction": "WAIT",
+      "score": 42,
+      "confidenceScore": 42,
+      "bullishScore": 42,
+      "bearishScore": 16,
+      "entryPrice": 1.1027790307998657,
+      "suggestedExpirySeconds": 180,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "timestamp": "2026-11-14T01:05:55.238Z",
+      "indicators": {
+        "ema9": 1.102779,
+        "ema21": 1.102762,
+        "ema50": 1.102701,
+        "ema200": 1.102629,
+        "rsi14": 63.52,
+        "macdLine": 0.000027,
+        "macdSignal": 0.000036,
+        "macdHistogram": -0.000009,
+        "bbUpper": 1.102779,
+        "bbMiddle": 1.102779,
+        "bbLower": 1.102779,
+        "bbBandwidthPct": 0,
+        "bbPercentB": 0.5,
+        "atr14": 0,
+        "atrPct": 0,
+        "nearestSupport": 1.102779,
+        "nearestResistance": 1.102779,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "UPTREND",
+        "volatilityRegime": "LOW",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bullish (9 > 21 > 50)",
+        "rsiState": "63.5 (Bullish zone)",
+        "macdState": "Negative (-0.000009)",
+        "bollingerState": "%B 0.5 · Width 0%",
+        "supportResistanceState": "Support 1.102779 (-0%) / Resistance 1.102779 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "UPTREND",
+        "volatilityState": "LOW (ATR 0%)",
+        "multiTimeframe": "5m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "MODERATE",
+        "volatilityRegime": "LOW",
+        "atrPct": 0,
+        "suggestedStakePct": 0.75,
+        "summary": "Standard risk conditions; apply configured per-trade cap."
+      },
+      "mtf": {
+        "primaryTimeframe": "1m",
+        "higherTimeframe": "5m",
+        "higherTrend": "RANGING",
+        "higherRsi": 54.27,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 14,
+        "wins": 7,
+        "losses": 7,
+        "winRatePct": 50,
+        "expectancyPerUnit": -0.1,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Confluence below threshold (Bull 42/100 vs Bear 16/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: EMA 9 > EMA 21 > EMA 50 stacked bullish trend.",
+        "Bearish factor: MACD below signal line."
+      ],
+      "warning": "Decision is WAIT — quantitative criteria or MTF alignment not satisfied.",
+      "id": "6fc1e5e8-0095-4f06-97b9-0bdd8a2d5d94",
+      "aiExplanation": {
+        "available": true,
+        "model": "gemini-4-hydrogen",
+        "summary": "EURUSD (1m) holds a WAIT decision (score 42/100; Bull 42 / Bear 16) despite an UPTREND classification, as price sits directly at identical support and resistance of 1.102779 amid low volatility (ATR% 0), a Doji Indecision pattern, and a NEUTRAL (RANGING) 5m higher timeframe. Oscillators reflect mixed near-term momentum with RSI(14) at 63.52, BB %B centered at 0.5, and a slightly negative MACD histogram at -0.000009, while the backtest shows a 50% win rate over 14 trades.",
+        "riskNote": "The current low-volatility WAIT posture would be invalidated by a sudden expansion in volatility above the 0% ATR reading or a decisive break away from the 1.102779 support/resistance level, and the small 14-trade backtest sample limits historical reliability."
+      }
+    },
+    {
+      "symbol": "GBPUSD",
+      "timeframe": "5m",
+      "direction": "PUT",
+      "score": 70,
+      "confidenceScore": 70,
+      "bullishScore": 0,
+      "bearishScore": 70,
+      "entryPrice": 1.320899248123169,
+      "suggestedExpirySeconds": 900,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "timestamp": "2026-11-14T00:53:30.034Z",
+      "indicators": {
+        "ema9": 1.320986,
+        "ema21": 1.321105,
+        "ema50": 1.321262,
+        "ema200": 1.322094,
+        "rsi14": 39.5,
+        "macdLine": -0.000102,
+        "macdSignal": -0.000057,
+        "macdHistogram": -0.000045,
+        "bbUpper": 1.321824,
+        "bbMiddle": 1.321223,
+        "bbLower": 1.320622,
+        "bbBandwidthPct": 0.091,
+        "bbPercentB": 0.231,
+        "atr14": 0.00012,
+        "atrPct": 0.0091,
+        "nearestSupport": 1.320899,
+        "nearestResistance": 1.320899,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "DOWNTREND",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bearish (9 < 21 < 50)",
+        "rsiState": "39.5 (Bearish zone)",
+        "macdState": "Negative (-0.000045)",
+        "bollingerState": "%B 0.231 · Width 0.091%",
+        "supportResistanceState": "Support 1.320899 (-0%) / Resistance 1.320899 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "DOWNTREND",
+        "volatilityState": "NORMAL (ATR 0.0091%)",
+        "multiTimeframe": "15m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "MODERATE",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0091,
+        "suggestedStakePct": 0.75,
+        "summary": "Standard risk conditions; apply configured per-trade cap."
+      },
+      "mtf": {
+        "primaryTimeframe": "5m",
+        "higherTimeframe": "15m",
+        "higherTrend": "RANGING",
+        "higherRsi": 40.56,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 22,
+        "wins": 12,
+        "losses": 10,
+        "winRatePct": 54.5,
+        "expectancyPerUnit": -0.018,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "EMA 9 < EMA 21 < EMA 50 stacked bearish trend.",
+        "MACD below signal line.",
+        "RSI(14) at 39.5 shows healthy bearish momentum.",
+        "Price holding in lower Bollinger expansion corridor."
+      ],
+      "warning": "Quantitative signal generated from live OHLCV indicators. Confidence score reflects indicator confluence, not guaranteed accuracy.",
+      "id": "13834e5d-234a-4d38-a9a2-5f7514722243",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "EURUSD",
+      "timeframe": "5m",
+      "direction": "WAIT",
+      "score": 60,
+      "confidenceScore": 60,
+      "bullishScore": 60,
+      "bearishScore": 0,
+      "entryPrice": 1.1027790307998657,
+      "suggestedExpirySeconds": 900,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "timestamp": "2026-11-14T00:53:30.025Z",
+      "indicators": {
+        "ema9": 1.102702,
+        "ema21": 1.102663,
+        "ema50": 1.102867,
+        "ema200": 1.10401,
+        "rsi14": 54.27,
+        "macdLine": 0.000001,
+        "macdSignal": -0.000049,
+        "macdHistogram": 0.00005,
+        "bbUpper": 1.102966,
+        "bbMiddle": 1.102621,
+        "bbLower": 1.102276,
+        "bbBandwidthPct": 0.0625,
+        "bbPercentB": 0.729,
+        "atr14": 0.000122,
+        "atrPct": 0.011,
+        "nearestSupport": 1.102779,
+        "nearestResistance": 1.102779,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "RANGING",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Mixed / Crossing",
+        "rsiState": "54.3 (Bullish zone)",
+        "macdState": "Positive (0.000050)",
+        "bollingerState": "%B 0.729 · Width 0.0625%",
+        "supportResistanceState": "Support 1.102779 (-0%) / Resistance 1.102779 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "RANGING",
+        "volatilityState": "NORMAL (ATR 0.011%)",
+        "multiTimeframe": "15m DOWNTREND (CONFLICT)"
+      },
+      "riskAssessment": {
+        "level": "HIGH",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.011,
+        "suggestedStakePct": 0.4,
+        "summary": "Elevated volatility or higher-timeframe conflict; reduce size or wait."
+      },
+      "mtf": {
+        "primaryTimeframe": "5m",
+        "higherTimeframe": "15m",
+        "higherTrend": "DOWNTREND",
+        "higherRsi": 42.56,
+        "alignment": "CONFLICT"
+      },
+      "backtest": {
+        "sampleSize": 16,
+        "wins": 6,
+        "losses": 10,
+        "winRatePct": 37.5,
+        "expectancyPerUnit": -0.325,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Confluence below threshold (Bull 60/100 vs Bear 0/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: EMA 9 above EMA 21 short-term lift."
+      ],
+      "warning": "Decision is WAIT — quantitative criteria or MTF alignment not satisfied.",
+      "id": "acd0ae6b-ad8f-43e6-b985-c4bce86b15e4",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "GBPUSD",
+      "timeframe": "5m",
+      "direction": "PUT",
+      "score": 70,
+      "confidenceScore": 70,
+      "bullishScore": 0,
+      "bearishScore": 70,
+      "entryPrice": 1.320899248123169,
+      "suggestedExpirySeconds": 900,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "timestamp": "2026-11-14T00:53:16.278Z",
+      "indicators": {
+        "ema9": 1.320986,
+        "ema21": 1.321105,
+        "ema50": 1.321262,
+        "ema200": 1.322094,
+        "rsi14": 39.5,
+        "macdLine": -0.000102,
+        "macdSignal": -0.000057,
+        "macdHistogram": -0.000045,
+        "bbUpper": 1.321824,
+        "bbMiddle": 1.321223,
+        "bbLower": 1.320622,
+        "bbBandwidthPct": 0.091,
+        "bbPercentB": 0.231,
+        "atr14": 0.00012,
+        "atrPct": 0.0091,
+        "nearestSupport": 1.320899,
+        "nearestResistance": 1.320899,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "DOWNTREND",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Bearish (9 < 21 < 50)",
+        "rsiState": "39.5 (Bearish zone)",
+        "macdState": "Negative (-0.000045)",
+        "bollingerState": "%B 0.231 · Width 0.091%",
+        "supportResistanceState": "Support 1.320899 (-0%) / Resistance 1.320899 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "DOWNTREND",
+        "volatilityState": "NORMAL (ATR 0.0091%)",
+        "multiTimeframe": "15m RANGING (NEUTRAL)"
+      },
+      "riskAssessment": {
+        "level": "MODERATE",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.0091,
+        "suggestedStakePct": 0.75,
+        "summary": "Standard risk conditions; apply configured per-trade cap."
+      },
+      "mtf": {
+        "primaryTimeframe": "5m",
+        "higherTimeframe": "15m",
+        "higherTrend": "RANGING",
+        "higherRsi": 40.56,
+        "alignment": "NEUTRAL"
+      },
+      "backtest": {
+        "sampleSize": 22,
+        "wins": 12,
+        "losses": 10,
+        "winRatePct": 54.5,
+        "expectancyPerUnit": -0.018,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "EMA 9 < EMA 21 < EMA 50 stacked bearish trend.",
+        "MACD below signal line.",
+        "RSI(14) at 39.5 shows healthy bearish momentum.",
+        "Price holding in lower Bollinger expansion corridor."
+      ],
+      "warning": "Quantitative signal generated from live OHLCV indicators. Confidence score reflects indicator confluence, not guaranteed accuracy.",
+      "id": "551ff7fd-8839-403a-88c1-0e71d5518373",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "EURUSD",
+      "timeframe": "5m",
+      "direction": "WAIT",
+      "score": 60,
+      "confidenceScore": 60,
+      "bullishScore": 60,
+      "bearishScore": 0,
+      "entryPrice": 1.1027790307998657,
+      "suggestedExpirySeconds": 900,
+      "provider": "Yahoo Finance FX (Currency Feed)",
+      "timestamp": "2026-11-14T00:53:16.158Z",
+      "indicators": {
+        "ema9": 1.102702,
+        "ema21": 1.102663,
+        "ema50": 1.102867,
+        "ema200": 1.10401,
+        "rsi14": 54.27,
+        "macdLine": 0.000001,
+        "macdSignal": -0.000049,
+        "macdHistogram": 0.00005,
+        "bbUpper": 1.102966,
+        "bbMiddle": 1.102621,
+        "bbLower": 1.102276,
+        "bbBandwidthPct": 0.0625,
+        "bbPercentB": 0.729,
+        "atr14": 0.000122,
+        "atrPct": 0.011,
+        "nearestSupport": 1.102779,
+        "nearestResistance": 1.102779,
+        "supportDistancePct": 0,
+        "resistanceDistancePct": 0,
+        "trend": "RANGING",
+        "volatilityRegime": "NORMAL",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "supportingIndicators": {
+        "emaAlignment": "Mixed / Crossing",
+        "rsiState": "54.3 (Bullish zone)",
+        "macdState": "Positive (0.000050)",
+        "bollingerState": "%B 0.729 · Width 0.0625%",
+        "supportResistanceState": "Support 1.102779 (-0%) / Resistance 1.102779 (+0%)",
+        "candlestickPattern": "Doji Indecision",
+        "trendDirection": "RANGING",
+        "volatilityState": "NORMAL (ATR 0.011%)",
+        "multiTimeframe": "15m DOWNTREND (CONFLICT)"
+      },
+      "riskAssessment": {
+        "level": "HIGH",
+        "volatilityRegime": "NORMAL",
+        "atrPct": 0.011,
+        "suggestedStakePct": 0.4,
+        "summary": "Elevated volatility or higher-timeframe conflict; reduce size or wait."
+      },
+      "mtf": {
+        "primaryTimeframe": "5m",
+        "higherTimeframe": "15m",
+        "higherTrend": "DOWNTREND",
+        "higherRsi": 42.56,
+        "alignment": "CONFLICT"
+      },
+      "backtest": {
+        "sampleSize": 16,
+        "wins": 6,
+        "losses": 10,
+        "winRatePct": 37.5,
+        "expectancyPerUnit": -0.325,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Confluence below threshold (Bull 60/100 vs Bear 0/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: EMA 9 above EMA 21 short-term lift."
+      ],
+      "warning": "Decision is WAIT — quantitative criteria or MTF alignment not satisfied.",
+      "id": "2036bd50-d63b-49cd-99be-3863fe71c5c7",
+      "aiExplanation": null
+    },
+    {
+      "symbol": "EURUSD",
+      "timeframe": "1m",
+      "direction": "WAIT",
+      "score": 64,
+      "bullishScore": 22,
+      "bearishScore": 64,
+      "entryPrice": 1.1012,
+      "provider": "Kraken Public OHLC",
+      "timestamp": "2026-11-14T00:40:27.933Z",
+      "indicators": {
+        "ema9": 1.101196,
+        "ema21": 1.101202,
+        "ema50": 1.101215,
+        "ema200": 1.101236,
+        "rsi14": 46.44,
+        "macdLine": -0.000007,
+        "macdSignal": -0.000008,
+        "macdHistogram": 0,
+        "bbUpper": 1.101236,
+        "bbMiddle": 1.101205,
+        "bbLower": 1.101174,
+        "bbBandwidthPct": 0.0056,
+        "bbPercentB": 0.418,
+        "atr14": 0.000032,
+        "atrPct": 0.0029,
+        "nearestSupport": 1.10119,
+        "nearestResistance": 1.10123,
+        "supportDistancePct": 0.001,
+        "resistanceDistancePct": 0.003,
+        "trend": "DOWNTREND",
+        "volatilityRegime": "LOW",
+        "patterns": [
+          "Doji Indecision"
+        ],
+        "priceActionSummary": "Latest bullish bar (0% body) formed Doji Indecision."
+      },
+      "mtf": {
+        "primaryTimeframe": "1m",
+        "higherTimeframe": "5m",
+        "higherTrend": "DOWNTREND",
+        "higherRsi": 42.81,
+        "alignment": "ALIGNED_BEARISH"
+      },
+      "backtest": {
+        "sampleSize": 19,
+        "wins": 4,
+        "losses": 15,
+        "winRatePct": 21.1,
+        "expectancyPerUnit": -0.621,
+        "horizonBars": 3,
+        "note": "Walk-forward check on 160 live-fetched bars (3-bar horizon, 80% payout assumption). Past sample is not a guarantee of future returns."
+      },
+      "reasons": [
+        "Confluence below threshold (Bull 22/100 vs Bear 64/100; required >= 65 with >= 16 pt margin).",
+        "Bullish factor: MACD above signal with expanding positive histogram.",
+        "Bearish factor: EMA 9 < EMA 21 < EMA 50 stacked bearish trend."
+      ],
+      "warning": "Decision is WAIT — quantitative criteria or MTF alignment not satisfied.",
+      "id": "82bb784b-bdb7-4d9b-a6a0-f203505a2068",
+      "aiExplanation": {
+        "available": true,
+        "model": "gemini-4-hydrogen",
+        "summary": "EURUSD (1m) trades at 1.1012 with a quantitative WAIT decision (Score: 64/100, Bear 64 versus Bull 22), reflecting a downtrend aligned with the 5m bearish structure under low volatility (ATR% 0.0029). Neutral momentum (RSI 46.44, MACD Hist 0, BB %B 0.418), a Doji Indecision pattern, tight range compression between 1.10119 support and 1.10123 resistance, and a 21.1% win rate across 19 backtest trades support remaining sidelined.",
+        "riskNote": "This WAIT stance and bearish alignment would be invalidated by a sustained breakout above the 1.10123 resistance level or an expansion in volatility that reverses the 5m downtrend."
+      }
+    }
+  ],
+  "assistedProposals": [],
+  "activityLog": [
+    {
+      "id": "813a215e-0201-4f28-94ef-f4f157dcdf74",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_REMOVED",
+      "summary": "Removed broker account fe87facf-fb87-476c-a9dd-9036fbbbf32f.",
+      "createdAt": "2026-11-15T14:13:15.291Z"
+    },
+    {
+      "id": "ded97517-0873-442a-bb0a-98ed61ead6c0",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_REMOVED",
+      "summary": "Removed broker account e2e84a56-bbfc-43b6-8149-70b6280d202c.",
+      "createdAt": "2026-11-15T14:13:15.285Z"
+    },
+    {
+      "id": "ceef5c69-867e-4a21-b489-fc5a51cc311e",
+      "category": "BROKER",
+      "eventType": "IQ_CONNECT_FAILED",
+      "summary": "fetch failed",
+      "createdAt": "2026-11-15T14:13:15.265Z"
+    },
+    {
+      "id": "8236dbd4-cb10-4e14-9bec-36a60b899b98",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "fetch failed",
+      "createdAt": "2026-11-15T14:13:15.254Z"
+    },
+    {
+      "id": "9c49dd6d-dfb5-47b5-aa9a-e9dae21b1bfe",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"Preview Nginx Test Offline Gateway\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-15T14:13:15.244Z"
+    },
+    {
+      "id": "d7d62aa3-536a-4eca-bc90-7fb6607fddd0",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "Broker account not found.",
+      "createdAt": "2026-11-15T14:13:15.229Z"
+    },
+    {
+      "id": "f63b2b52-647b-417f-9723-a7f819e082fe",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "MT5_BRIDGE_URL is not configured.",
+      "createdAt": "2026-11-15T14:13:15.222Z"
+    },
+    {
+      "id": "3fcfe5cd-edd3-47c7-a63f-e708b7b830d5",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"Preview Nginx Test Missing Bridge\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-15T14:13:15.205Z"
+    },
+    {
+      "id": "88e3a934-40a0-449a-b228-44ff38bddec2",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "Broker account not found.",
+      "createdAt": "2026-11-15T14:08:44.111Z"
+    },
+    {
+      "id": "5e209801-6ee1-4096-b6b6-a40cd9964759",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "Broker account not found.",
+      "createdAt": "2026-11-15T14:08:44.093Z"
+    },
+    {
+      "id": "5a2acba9-0659-4a97-86ae-d11bf9d4a513",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_REMOVED",
+      "summary": "Removed broker account e682d0a1-06d3-42cc-992e-62d58689e3e7.",
+      "createdAt": "2026-11-15T14:01:43.260Z"
+    },
+    {
+      "id": "50eee562-1d7c-4e9e-a717-5d89c67a16df",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "MT5_BRIDGE_URL is not configured.",
+      "createdAt": "2026-11-15T14:01:43.244Z"
+    },
+    {
+      "id": "a645f7dc-6a4d-44c2-8c91-592592144082",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"Test MT5\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-15T14:01:43.162Z"
+    },
+    {
+      "id": "f2d06d5b-5259-4921-bdbb-8a8eb4f1ee61",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_REMOVED",
+      "summary": "Removed broker account 4a1d382f-4f24-4aa8-8d32-4481612b4c32.",
+      "createdAt": "2026-11-15T13:59:17.802Z"
+    },
+    {
+      "id": "36892c10-a37e-49d1-81e7-b00401c9bed2",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "Broker account not found.",
+      "createdAt": "2026-11-15T13:59:09.115Z"
+    },
+    {
+      "id": "cc44e226-45d1-4690-bbb1-ea06139e5158",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"Test MT5\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-15T13:59:09.093Z"
+    },
+    {
+      "id": "dd0a1ccd-aea6-4732-a64e-107d648cce43",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_REMOVED",
+      "summary": "Removed broker account 5cc14c6b-b831-4201-b4a3-ac39eb113f40.",
+      "createdAt": "2026-11-14T13:32:12.556Z"
+    },
+    {
+      "id": "66b0d6c6-73ae-4b66-ba05-d0725b94be32",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "MT5_BRIDGE_URL is not configured.",
+      "createdAt": "2026-11-14T13:32:12.537Z"
+    },
+    {
+      "id": "6c997a04-9103-4e13-a70c-70140b13179d",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"MT5 Smoke Test\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-14T13:32:12.451Z"
+    },
+    {
+      "id": "b1fb6b7b-b6ca-4b02-bd9d-fdef2baa667e",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_REMOVED",
+      "summary": "Removed broker account 1e6afce9-53f8-47fa-a348-d5a36616e2a3.",
+      "createdAt": "2026-11-14T13:13:39.178Z"
+    },
+    {
+      "id": "12143558-4cd2-46a9-a863-980bc7bd5a9e",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "MT5_BRIDGE_URL is not configured.",
+      "createdAt": "2026-11-14T13:13:39.157Z"
+    },
+    {
+      "id": "d879b602-bced-4b25-b26d-b1e5512138e1",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"MT5 Verification\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-14T13:13:39.064Z"
+    },
+    {
+      "id": "47bfe4df-b1cc-475f-9c98-3f0e7bdc32c8",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT_FAILED",
+      "summary": "Broker account not found.",
+      "createdAt": "2026-11-14T13:10:37.593Z"
+    },
+    {
+      "id": "466e6f49-887c-4a00-943e-a6e3d6f69ac6",
+      "category": "RISK",
+      "eventType": "EMERGENCY_STOP_ON",
+      "summary": "Emergency stop engaged. Automatic trading halted.",
+      "createdAt": "2026-11-14T03:27:06.028Z"
+    },
+    {
+      "id": "d31f6939-402e-4558-a850-561ad8a83d32",
+      "category": "BROKER",
+      "eventType": "AUTO_BROKER_TOGGLED",
+      "summary": "Validated AI signals will route guarded demo orders to MT5 Demo Account while Emergency Stop and risk limits stay clear.",
+      "createdAt": "2026-11-14T03:27:06.024Z"
+    },
+    {
+      "id": "ac9c6457-65f2-46cc-be97-bf83235c379e",
+      "category": "BROKER",
+      "eventType": "ACTIVE_BROKER_SELECTED",
+      "summary": "Selected execution account 19b4074b-6f4e-41ac-8880-727db01ae9e8.",
+      "createdAt": "2026-11-14T03:27:06.020Z"
+    },
+    {
+      "id": "d00b1191-6d95-4836-b5e9-97018e3222df",
+      "category": "BROKER",
+      "eventType": "BROKER_DUPLICATE_PREVENTED",
+      "summary": "MetaTrader 5 (MT5): CALL EURUSD (FILLED)",
+      "createdAt": "2026-11-14T03:27:06.012Z"
+    },
+    {
+      "id": "efbefee6-9bb4-4a6a-9430-b1144462b6f8",
+      "category": "BROKER",
+      "eventType": "BROKER_DEMO_ORDER",
+      "summary": "MetaTrader 5 (MT5): CALL EURUSD (FILLED)",
+      "createdAt": "2026-11-14T03:27:06.007Z"
+    },
+    {
+      "id": "17cb81a0-9745-454c-b837-eefbde6df0f0",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT",
+      "summary": "Connected IQ Option Practice (PRACTICE).",
+      "createdAt": "2026-11-14T03:27:05.969Z"
+    },
+    {
+      "id": "79440a46-6aa7-4d4d-bd03-2c44607f4e8c",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"IQ Option Practice\" (IQ Option).",
+      "createdAt": "2026-11-14T03:27:05.956Z"
+    },
+    {
+      "id": "b49ff53f-8016-4399-8208-7289c951ad2b",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT",
+      "summary": "Connected MT5 Demo Account (DEMO (MetaQuotes-Demo)).",
+      "createdAt": "2026-11-14T03:27:05.928Z"
+    },
+    {
+      "id": "9c6f180f-6024-4563-827d-11d93d5addd4",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"MT5 Demo Account\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-14T03:27:05.914Z"
+    },
+    {
+      "id": "a555ed79-b93d-40f1-8995-7c80b475920d",
+      "category": "BROKER",
+      "eventType": "BROKER_CONNECT",
+      "summary": "Connected MT5 Demo Account (DEMO (MetaQuotes-Demo)).",
+      "createdAt": "2026-11-14T03:25:43.219Z"
+    },
+    {
+      "id": "4d9d9e2e-c65c-41b7-805e-1f62d1bbdf02",
+      "category": "BROKER",
+      "eventType": "BROKER_ACCOUNT_SAVED",
+      "summary": "Saved demo broker account \"MT5 Demo Account\" (MetaTrader 5 (MT5)).",
+      "createdAt": "2026-11-14T03:25:43.205Z"
+    },
+    {
+      "id": "d80d3e90-9f55-4c73-870b-b9c752db03e2",
+      "category": "SCHEDULER",
+      "eventType": "SCHEDULER_RECOVERY_FAILED",
+      "summary": "Supabase recovery query failed: Could not find the table 'public.user_settings' in the schema cache",
+      "createdAt": "2026-11-14T01:17:57.122Z"
+    },
+    {
+      "id": "2034be05-988e-4431-90df-887f5d6fcaad",
+      "category": "SETTINGS",
+      "eventType": "MODE_CHANGED",
+      "summary": "Operating mode switched to SIGNALS.",
+      "createdAt": "2026-11-14T01:05:39.560Z"
+    },
+    {
+      "id": "751377d2-4da5-4c32-86e0-d4debc31cb70",
+      "category": "RISK",
+      "eventType": "DAILY_COUNTERS_RESET",
+      "summary": "Daily simulated risk counters reset.",
+      "createdAt": "2026-11-14T00:53:30.386Z"
+    },
+    {
+      "id": "c8bab0ec-42c8-4ba5-8d0b-3f9701d7d694",
+      "category": "SETTINGS",
+      "eventType": "VIRTUAL_BALANCE_SET",
+      "summary": "Starting virtual balance set to 10000.00.",
+      "createdAt": "2026-11-14T00:53:30.383Z"
+    },
+    {
+      "id": "5cf89ee3-a0bc-43dd-aaa0-e842ef973a3d",
+      "category": "RISK",
+      "eventType": "EMERGENCY_STOP_OFF",
+      "summary": "Emergency stop cleared.",
+      "createdAt": "2026-11-14T00:53:30.376Z"
+    },
+    {
+      "id": "7030da60-f845-40b0-a6ae-e42047b0a11f",
+      "category": "RISK",
+      "eventType": "EMERGENCY_STOP_ON",
+      "summary": "Emergency stop engaged. Automatic trading halted.",
+      "createdAt": "2026-11-14T00:53:30.368Z"
+    },
+    {
+      "id": "0a6d9c3d-6f55-47f0-9d2a-c47b54407ebe",
+      "category": "RISK",
+      "eventType": "RISK_SETTINGS_UPDATED",
+      "summary": "Risk management parameters updated.",
+      "createdAt": "2026-11-14T00:53:30.365Z"
+    },
+    {
+      "id": "86de3b00-d386-48fb-82f1-765190e7a2a6",
+      "category": "RISK",
+      "eventType": "RISK_SETTINGS_UPDATED",
+      "summary": "Risk management parameters updated.",
+      "createdAt": "2026-11-14T00:53:30.355Z"
+    },
+    {
+      "id": "c46ad3fd-1b20-4355-9068-a6561c3e1e7c",
+      "category": "TRADE",
+      "eventType": "PAPER_TRADE_WON",
+      "summary": "Settled CALL EURUSD (WIN, PnL +40, by manual).",
+      "createdAt": "2026-11-14T00:53:30.097Z"
+    },
+    {
+      "id": "215b5c73-a471-44fd-920b-3896949bc975",
+      "category": "TRADE",
+      "eventType": "PAPER_TRADE_OPENED",
+      "summary": "Paper trade CALL EURUSD (stake 50, mode=manual, entry=1.1027790307998657).",
+      "createdAt": "2026-11-14T00:53:30.090Z"
+    },
+    {
+      "id": "f54df97d-3b45-4006-b006-82093e3d4b57",
+      "category": "SETTINGS",
+      "eventType": "VIRTUAL_BALANCE_SET",
+      "summary": "Starting virtual balance set to 25000.00.",
+      "createdAt": "2026-11-14T00:53:30.054Z"
+    },
+    {
+      "id": "f7be42b3-2dd8-4026-9231-79e809e17afa",
+      "category": "RISK",
+      "eventType": "EMERGENCY_STOP_OFF",
+      "summary": "Emergency stop cleared.",
+      "createdAt": "2026-11-14T00:53:30.045Z"
+    },
+    {
+      "id": "1dfdd0a2-1dd8-4b7e-a89e-684edca9213c",
+      "category": "RISK",
+      "eventType": "DAILY_COUNTERS_RESET",
+      "summary": "Daily simulated risk counters reset.",
+      "createdAt": "2026-11-14T00:53:30.039Z"
+    },
+    {
+      "id": "384ad1fd-fb87-410e-8ee7-20e7e1f1c55d",
+      "category": "TRADE",
+      "eventType": "PAPER_TRADE_WON",
+      "summary": "Settled CALL EURUSD (WIN, PnL +40, by manual).",
+      "createdAt": "2026-11-14T00:53:16.353Z"
+    },
+    {
+      "id": "472e34c1-fb8b-4f34-aae0-5230ed5f7b2d",
+      "category": "TRADE",
+      "eventType": "PAPER_TRADE_OPENED",
+      "summary": "Paper trade CALL EURUSD (stake 50, mode=manual, entry=1.1027790307998657).",
+      "createdAt": "2026-11-14T00:53:16.348Z"
+    },
+    {
+      "id": "bd7dc2fe-803c-4589-8b3d-ed3fd4cbaee4",
+      "category": "SETTINGS",
+      "eventType": "VIRTUAL_BALANCE_SET",
+      "summary": "Starting virtual balance set to 25000.00.",
+      "createdAt": "2026-11-14T00:53:16.298Z"
+    },
+    {
+      "id": "f577f21a-6c15-4df0-ae95-64a1eac11d8e",
+      "category": "RISK",
+      "eventType": "EMERGENCY_STOP_OFF",
+      "summary": "Emergency stop cleared.",
+      "createdAt": "2026-11-14T00:53:16.293Z"
+    },
+    {
+      "id": "fa8b36ed-8399-4b68-84e9-26c6ace52a68",
+      "category": "RISK",
+      "eventType": "DAILY_COUNTERS_RESET",
+      "summary": "Daily simulated risk counters reset.",
+      "createdAt": "2026-11-14T00:53:16.286Z"
+    },
+    {
+      "id": "5d27c4cf-6b05-4fa6-8190-5030c93e137d",
+      "category": "TRADE",
+      "eventType": "PAPER_TRADE_LOST",
+      "summary": "Settled CALL EURUSD (LOSS, PnL -50, by auto-expiry-monitor).",
+      "createdAt": "2026-11-14T00:41:06.628Z"
+    },
+    {
+      "id": "57752342-09a3-4a88-b7bf-82883f64ccea",
+      "category": "TRADE",
+      "eventType": "PAPER_TRADE_OPENED",
+      "summary": "Paper trade CALL EURUSD (50, mode=automatic, entry=1.1012).",
+      "createdAt": "2026-11-14T00:38:03.127Z"
+    },
+    {
+      "id": "bdcaf56d-7b5c-499c-b25c-6b2816769d15",
+      "category": "BROKER",
+      "eventType": "IQ_CONNECT_FAILED",
+      "summary": "Failed to parse URL from IQ_CONNECTOR_URL=http://localhost:8010/connect",
+      "createdAt": "2026-11-14T00:35:43.776Z"
+    },
+    {
+      "id": "646c6ba8-d391-459e-960a-182de58ca1ca",
+      "category": "SETTINGS",
+      "eventType": "MODE_CHANGED",
+      "summary": "Operating mode switched to AUTOMATIC.",
+      "createdAt": "2026-11-14T00:34:06.766Z"
+    },
+    {
+      "id": "91efedf4-efa1-4e41-85b5-05d707f04221",
+      "category": "SETTINGS",
+      "eventType": "MODE_CHANGED",
+      "summary": "Operating mode switched to ASSISTED.",
+      "createdAt": "2026-11-14T00:34:04.332Z"
+    }
+  ],
+  "consecutiveLosses": 0,
+  "simulatedDailyLoss": 0,
+  "simulatedDailyProfit": 0,
+  "dailyTradesCount": 0,
+  "dailyKey": "2026-11-14"
+}
