@@ -125,8 +125,14 @@ interface AndroidUserStore {
 }
 
 function hashSecret(secret: string): string {
-  const salt = (process.env.ANDROID_BRIDGE_SECRET || process.env.MT5_BRIDGE_TOKEN || 'novatrade-android-bridge-v1').trim();
-  return crypto.createHmac('sha256', salt).update(secret).digest('hex');
+  const bridgeSecret = (process.env.ANDROID_BRIDGE_SECRET ?? '').trim();
+  if (!bridgeSecret) {
+    throw new Error('ANDROID_BRIDGE_SECRET environment variable is required for Android pairing and device token hashing.');
+  }
+  if (Buffer.byteLength(bridgeSecret, 'utf8') < 32) {
+    throw new Error('ANDROID_BRIDGE_SECRET must be at least 32 bytes.');
+  }
+  return crypto.createHmac('sha256', bridgeSecret).update(secret).digest('hex');
 }
 
 function timingSafeHexMatch(a: string | null | undefined, b: string): boolean {
