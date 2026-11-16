@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getSupabaseAdmin } from './supabaseAdmin.ts';
+import { getSupabaseAdmin, getSupabaseServerConfig } from './supabaseAdmin.ts';
 import {
   ANDROID_TRADING_PACKAGES,
   type AndroidAccountMode,
@@ -263,7 +263,11 @@ export class AndroidCompanionManager {
     userId: string,
     input: { deviceName: string; allowMt5?: boolean; allowIqOption?: boolean }
   ): Promise<{ device: AndroidDevicePublic; pairingCode: string; expiresAt: string }> {
-    const store = this.getOrInitStore(userId);
+    const sbCfg = getSupabaseServerConfig();
+    if (userId === 'local-preview' && sbCfg.clientAuthConfigured) {
+      throw new Error('Authenticated Supabase session required for Android pairing.');
+    }
+
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 10 * 60 * 1000).toISOString();
     const pairingCode = generatePairingCode();
@@ -301,12 +305,11 @@ export class AndroidCompanionManager {
       updatedAt: now.toISOString(),
     };
 
-    store.devices.unshift(device);
-    if (store.devices.length > 20) store.devices.length = 20;
-    this.saveStore(userId);
-
     const admin = getSupabaseAdmin();
-    if (admin && userId !== 'local-preview') {
+    if (userId !== 'local-preview') {
+      if (!admin) {
+        throw new Error('Supabase service_role client is not configured; cannot persist pairing request.');
+      }
       const { error } = await admin.from('android_devices').insert({
         id: device.id,
         user_id: userId,
@@ -324,6 +327,11 @@ export class AndroidCompanionManager {
         throw new Error(`Failed to persist pairing request to Supabase: ${error.message}`);
       }
     }
+
+    const store = this.getOrInitStore(userId);
+    store.devices.unshift(device);
+    if (store.devices.length > 20) store.devices.length = 20;
+    this.saveStore(userId);
 
     return {
       device: toPublicDevice(device),
@@ -344,9 +352,44 @@ export class AndroidCompanionManager {
     if (!cleanCode) return null;
     const candidateHash = hashSecret(cleanCode);
 
+    const sbCfg = getSupabaseServerConfig();
     const admin = getSupabaseAdmin();
+
     if (!admin) {
-      throw new Error('Supabase admin service role is required for secure device pairing.');
+      // Never fall back to local pairing if Supabase auth/production is configured
+      if (sbCfg.clientAuthConfigured) {
+        throw new Error('Supabase admin service role is required for secure device pairing.');
+      }
+      // Isolated local-preview pairing only when Supabase is unconfigured
+      const previewStore = this.getOrInitStore('local-preview');
+      const nowMs = Date.now();
+      for (const dev of previewStore.devices) {
+        if (dev.status !== 'PAIRED_PENDING' || !dev.pairingCodeHash) continue;
+        if (dev.pairingExpiresAt && new Date(dev.pairingExpiresAt).getTime() <= nowMs) continue;
+        if (!timingSafeHexMatch(dev.pairingCodeHash, candidateHash)) continue;
+
+        const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
+        dev.deviceTokenHash = hashSecret(rawToken);
+        dev.tokenPrefix = rawToken.slice(0, 12);
+        dev.pairingCodeHash = null;
+        dev.pairingExpiresAt = null;
+        if (input.deviceName?.trim()) dev.deviceName = input.deviceName.trim().slice(0, 60);
+        if (input.deviceModel?.trim()) dev.deviceModel = input.deviceModel.trim().slice(0, 80);
+        if (input.osVersion?.trim()) dev.osVersion = input.osVersion.trim().slice(0, 40);
+        if (typeof input.mediaProjectionGranted === 'boolean') {
+          dev.permissions.mediaProjection = input.mediaProjectionGranted;
+        }
+        if (typeof input.accessibilityGranted === 'boolean') {
+          dev.permissions.accessibility = input.accessibilityGranted;
+        }
+        dev.permissions.realMoneyBlocked = true;
+        dev.status = 'ACTIVE';
+        dev.lastSeenAt = new Date().toISOString();
+        dev.updatedAt = dev.lastSeenAt;
+        this.saveStore('local-preview');
+        return { device: toPublicDevice(dev), deviceToken: rawToken };
+      }
+      return null;
     }
 
     const rawToken = `nt_dev_${crypto.randomBytes(24).toString('hex')}`;
@@ -383,7 +426,10 @@ export class AndroidCompanionManager {
       pairingExpiresAt: null,
       deviceTokenHash: dbDev.device_token_hash,
       tokenPrefix: dbDev.token_prefix,
-      permissions: dbDev.permissions,
+      permissions: {
+        ...(dbDev.permissions || {}),
+        realMoneyBlocked: true,
+      },
       targetPackages: dbDev.target_packages || [],
       status: dbDev.status,
       lastAppPackage: dbDev.last_app_package,
@@ -410,16 +456,9 @@ export class AndroidCompanionManager {
     if (!token.startsWith('nt_dev_') || token.length < 24) return null;
     const candidateHash = hashSecret(token);
 
-    for (const [userId, store] of this.stores.entries()) {
-      for (const dev of store.devices) {
-        if (dev.status === 'REVOKED' || !dev.deviceTokenHash) continue;
-        if (timingSafeHexMatch(dev.deviceTokenHash, candidateHash)) {
-          return { userId, device: dev };
-        }
-      }
-    }
-
+    const sbCfg = getSupabaseServerConfig();
     const admin = getSupabaseAdmin();
+
     if (admin) {
       const { data: matchedDevs, error } = await admin
         .from('android_devices')
@@ -428,7 +467,11 @@ export class AndroidCompanionManager {
         .neq('status', 'REVOKED')
         .limit(1);
 
-      if (!error && matchedDevs && matchedDevs.length > 0) {
+      if (error) {
+        throw new Error(`Database error validating device token: ${error.message}`);
+      }
+
+      if (matchedDevs && matchedDevs.length > 0) {
         const dbDev = matchedDevs[0];
         const userId = dbDev.user_id;
         const deviceInternal: AndroidDeviceInternal = {
@@ -441,7 +484,10 @@ export class AndroidCompanionManager {
           pairingExpiresAt: dbDev.pairing_expires_at,
           deviceTokenHash: dbDev.device_token_hash,
           tokenPrefix: dbDev.token_prefix,
-          permissions: dbDev.permissions,
+          permissions: {
+            ...(dbDev.permissions || {}),
+            realMoneyBlocked: true,
+          },
           targetPackages: dbDev.target_packages || [],
           status: dbDev.status,
           lastAppPackage: dbDev.last_app_package,
@@ -461,6 +507,21 @@ export class AndroidCompanionManager {
 
         return { userId, device: deviceInternal };
       }
+
+      return null;
+    }
+
+    if (sbCfg.clientAuthConfigured) {
+      throw new Error('Supabase admin service role is required to authenticate paired Android devices.');
+    }
+
+    // Isolated local-preview token verification when Supabase is unconfigured
+    const previewStore = this.getOrInitStore('local-preview');
+    for (const dev of previewStore.devices) {
+      if (dev.status === 'REVOKED' || !dev.deviceTokenHash) continue;
+      if (timingSafeHexMatch(dev.deviceTokenHash, candidateHash)) {
+        return { userId: 'local-preview', device: dev };
+      }
     }
 
     return null;
@@ -468,7 +529,10 @@ export class AndroidCompanionManager {
 
   async listDevices(userId: string): Promise<AndroidDevicePublic[]> {
     const admin = getSupabaseAdmin();
-    if (admin && userId !== 'local-preview') {
+    if (userId !== 'local-preview') {
+      if (!admin) {
+        throw new Error('Supabase admin service role is required to list paired Android devices.');
+      }
       const { data: dbDevs, error } = await admin
         .from('android_devices')
         .select('*')
@@ -476,28 +540,33 @@ export class AndroidCompanionManager {
         .neq('status', 'REVOKED')
         .order('created_at', { ascending: false });
 
-      if (!error && dbDevs) {
-        const store = this.getOrInitStore(userId);
-        store.devices = dbDevs.map((dbDev: Record<string, any>) => ({
-          id: dbDev.id,
-          userId: dbDev.user_id,
-          deviceName: dbDev.device_name,
-          deviceModel: dbDev.device_model,
-          osVersion: dbDev.os_version,
-          pairingCodeHash: dbDev.pairing_code_hash,
-          pairingExpiresAt: dbDev.pairing_expires_at,
-          deviceTokenHash: dbDev.device_token_hash,
-          tokenPrefix: dbDev.token_prefix,
-          permissions: dbDev.permissions,
-          targetPackages: dbDev.target_packages || [],
-          status: dbDev.status,
-          lastAppPackage: dbDev.last_app_package,
-          lastSeenAt: dbDev.last_seen_at,
-          createdAt: dbDev.created_at,
-          updatedAt: dbDev.updated_at,
-        }));
-        this.saveStore(userId);
+      if (error) {
+        throw new Error(`Failed to load paired Android devices from Supabase: ${error.message}`);
       }
+
+      const store = this.getOrInitStore(userId);
+      store.devices = (dbDevs || []).map((dbDev: Record<string, any>) => ({
+        id: dbDev.id,
+        userId: dbDev.user_id,
+        deviceName: dbDev.device_name,
+        deviceModel: dbDev.device_model,
+        osVersion: dbDev.os_version,
+        pairingCodeHash: dbDev.pairing_code_hash,
+        pairingExpiresAt: dbDev.pairing_expires_at,
+        deviceTokenHash: dbDev.device_token_hash,
+        tokenPrefix: dbDev.token_prefix,
+        permissions: {
+          ...(dbDev.permissions || {}),
+          realMoneyBlocked: true,
+        },
+        targetPackages: dbDev.target_packages || [],
+        status: dbDev.status,
+        lastAppPackage: dbDev.last_app_package,
+        lastSeenAt: dbDev.last_seen_at,
+        createdAt: dbDev.created_at,
+        updatedAt: dbDev.updated_at,
+      }));
+      this.saveStore(userId);
     }
 
     const store = this.getOrInitStore(userId);
@@ -527,6 +596,9 @@ export class AndroidCompanionManager {
       lastAppPackage?: string | null;
     }
   ): Promise<AndroidDevicePublic | null> {
+    if (userId !== 'local-preview') {
+      await this.listDevices(userId);
+    }
     const store = this.getOrInitStore(userId);
     const dev = store.devices.find((d) => d.id === deviceId && d.status !== 'REVOKED');
     if (!dev) return null;
@@ -545,11 +617,13 @@ export class AndroidCompanionManager {
     ];
     if (patch.lastAppPackage !== undefined) dev.lastAppPackage = patch.lastAppPackage;
     dev.updatedAt = new Date().toISOString();
-    this.saveStore(userId);
 
     const admin = getSupabaseAdmin();
-    if (admin && userId !== 'local-preview') {
-      await admin
+    if (userId !== 'local-preview') {
+      if (!admin) {
+        throw new Error('Supabase admin service role is required to update device permissions.');
+      }
+      const { error } = await admin
         .from('android_devices')
         .update({
           permissions: dev.permissions,
@@ -560,21 +634,31 @@ export class AndroidCompanionManager {
         })
         .eq('id', dev.id)
         .eq('user_id', userId);
+      if (error) {
+        throw new Error(`Failed to update device permissions in Supabase: ${error.message}`);
+      }
     }
+
+    this.saveStore(userId);
     return toPublicDevice(dev);
   }
 
   async revokeDevice(userId: string, deviceId: string): Promise<boolean> {
+    if (userId !== 'local-preview') {
+      await this.listDevices(userId);
+    }
     const store = this.getOrInitStore(userId);
     const dev = store.devices.find((d) => d.id === deviceId && d.status !== 'REVOKED');
     if (!dev) return false;
     dev.status = 'REVOKED';
     dev.updatedAt = new Date().toISOString();
-    this.saveStore(userId);
 
     const admin = getSupabaseAdmin();
-    if (admin && userId !== 'local-preview') {
-      await admin
+    if (userId !== 'local-preview') {
+      if (!admin) {
+        throw new Error('Supabase admin service role is required to revoke device.');
+      }
+      const { error } = await admin
         .from('android_devices')
         .update({
           status: 'REVOKED',
@@ -582,7 +666,12 @@ export class AndroidCompanionManager {
         })
         .eq('id', deviceId)
         .eq('user_id', userId);
+      if (error) {
+        throw new Error(`Failed to revoke device in Supabase: ${error.message}`);
+      }
     }
+
+    this.saveStore(userId);
     return true;
   }
 

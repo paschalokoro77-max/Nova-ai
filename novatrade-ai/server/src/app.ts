@@ -1914,10 +1914,14 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    return res.json({
-      devices: await androidManager.listDevices(userId),
-      realMoneyAutomationBlocked: true,
-    });
+    try {
+      return res.json({
+        devices: await androidManager.listDevices(userId),
+        realMoneyAutomationBlocked: true,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load Android devices.' });
+    }
   });
 
   router.post('/android/devices/pair', async (req, res) => {
@@ -1933,14 +1937,18 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid pairing request.' });
     }
     const userId = ws.userId || 'local-preview';
-    const pairing = await androidManager.createPairingRequest(userId, parsed.data);
-    ws.engine.logActivity(
-      'BROKER',
-      'ANDROID_PAIRING_CREATED',
-      `Generated single-use Android pairing code for "${pairing.device.deviceName}" (expires ${pairing.expiresAt}).`,
-      ws.userId
-    );
-    return res.status(201).json(pairing);
+    try {
+      const pairing = await androidManager.createPairingRequest(userId, parsed.data);
+      ws.engine.logActivity(
+        'BROKER',
+        'ANDROID_PAIRING_CREATED',
+        `Generated single-use Android pairing code for "${pairing.device.deviceName}" (expires ${pairing.expiresAt}).`,
+        ws.userId
+      );
+      return res.status(201).json(pairing);
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to create Android pairing request.' });
+    }
   });
 
   router.post('/android/devices/register', async (req, res) => {
@@ -1956,22 +1964,26 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid device registration payload.' });
     }
-    const result = await androidManager.registerDeviceWithPairingCode(parsed.data);
-    if (!result) {
-      return res.status(401).json({ error: 'Invalid or expired Android pairing code.' });
+    try {
+      const result = await androidManager.registerDeviceWithPairingCode(parsed.data);
+      if (!result) {
+        return res.status(401).json({ error: 'Invalid or expired Android pairing code.' });
+      }
+      const targetEngine = getEngineForUser(result.device.userId);
+      targetEngine.logActivity(
+        'BROKER',
+        'ANDROID_DEVICE_REGISTERED',
+        `Android companion device "${result.device.deviceName}" paired (${result.device.tokenPrefix}...).`,
+        result.device.userId === 'local-preview' ? undefined : result.device.userId
+      );
+      return res.status(201).json({
+        ...result,
+        realMoneyAutomationBlocked: true,
+        notice: 'Device paired. Real-money automated execution remains disabled.',
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Database error during Android device registration.' });
     }
-    const targetEngine = getEngineForUser(result.device.userId);
-    targetEngine.logActivity(
-      'BROKER',
-      'ANDROID_DEVICE_REGISTERED',
-      `Android companion device "${result.device.deviceName}" paired (${result.device.tokenPrefix}...).`,
-      result.device.userId === 'local-preview' ? undefined : result.device.userId
-    );
-    return res.status(201).json({
-      ...result,
-      realMoneyAutomationBlocked: true,
-      notice: 'Device paired. Real-money automated execution remains disabled.',
-    });
   });
 
   router.put('/android/devices/:deviceId/permissions', async (req, res) => {
@@ -1996,25 +2008,33 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       });
     }
     const userId = ws.userId || 'local-preview';
-    const updated = await androidManager.updateDevicePermissions(userId, req.params.deviceId, parsed.data);
-    if (!updated) return res.status(404).json({ error: 'Paired Android device not found.' });
-    ws.engine.logActivity(
-      'BROKER',
-      'ANDROID_DEVICE_UPDATED',
-      `Updated Android Bridge permissions for "${updated.deviceName}" (status=${updated.status}).`,
-      ws.userId
-    );
-    return res.json({ device: updated });
+    try {
+      const updated = await androidManager.updateDevicePermissions(userId, req.params.deviceId, parsed.data);
+      if (!updated) return res.status(404).json({ error: 'Paired Android device not found.' });
+      ws.engine.logActivity(
+        'BROKER',
+        'ANDROID_DEVICE_UPDATED',
+        `Updated Android Bridge permissions for "${updated.deviceName}" (status=${updated.status}).`,
+        ws.userId
+      );
+      return res.json({ device: updated });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to update Android device permissions.' });
+    }
   });
 
   router.delete('/android/devices/:deviceId', async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    const removed = await androidManager.revokeDevice(userId, req.params.deviceId);
-    if (!removed) return res.status(404).json({ error: 'Paired Android device not found.' });
-    ws.engine.logActivity('BROKER', 'ANDROID_DEVICE_REVOKED', `Revoked Android device ${req.params.deviceId}.`, ws.userId);
-    return res.json({ ok: true });
+    try {
+      const removed = await androidManager.revokeDevice(userId, req.params.deviceId);
+      if (!removed) return res.status(404).json({ error: 'Paired Android device not found.' });
+      ws.engine.logActivity('BROKER', 'ANDROID_DEVICE_REVOKED', `Revoked Android device ${req.params.deviceId}.`, ws.userId);
+      return res.json({ ok: true });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to revoke Android device.' });
+    }
   });
 
   router.get('/android/analyses', async (req, res) => {
@@ -2070,245 +2090,269 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     '/android/screen/analyze',
     express.json({ limit: '4mb' }),
     async (req, res) => {
-      // Authenticate either via paired Android device Bearer token (nt_dev_...) OR dashboard Supabase session
-      const deviceAuth = await androidManager.authenticateDeviceToken(req.headers.authorization);
-      let userId: string;
-      let engine: NovaTradeEngine;
-      let deviceId: string | null = null;
-      let activityUid: string | undefined;
+      try {
+        // Authenticate either via paired Android device Bearer token (nt_dev_...) OR dashboard Supabase session
+        const deviceAuth = await androidManager.authenticateDeviceToken(req.headers.authorization);
+        let userId: string;
+        let engine: NovaTradeEngine;
+        let deviceId: string | null = null;
+        let activityUid: string | undefined;
 
-      if (deviceAuth) {
-        if (deviceAuth.device.status !== 'ACTIVE') {
-          return res.status(401).json({ error: `Android device is ${deviceAuth.device.status}; resume device in NovaTrade dashboard.` });
+        if (deviceAuth) {
+          if (deviceAuth.device.status !== 'ACTIVE') {
+            return res.status(401).json({ error: `Android device is ${deviceAuth.device.status}; resume device in NovaTrade dashboard.` });
+          }
+          userId = deviceAuth.userId;
+          deviceId = deviceAuth.device.id;
+          engine = getEngineForUser(userId);
+          activityUid = userId === 'local-preview' ? undefined : userId;
+        } else {
+          const ws = await resolveWorkspace(req, res, true);
+          if (!ws) return;
+          userId = ws.userId || 'local-preview';
+          engine = ws.engine;
+          activityUid = ws.userId;
         }
-        userId = deviceAuth.userId;
-        deviceId = deviceAuth.device.id;
-        engine = getEngineForUser(userId);
-        activityUid = userId === 'local-preview' ? undefined : userId;
-      } else {
-        const ws = await resolveWorkspace(req, res, true);
-        if (!ws) return;
-        userId = ws.userId || 'local-preview';
-        engine = ws.engine;
-        activityUid = ws.userId;
-      }
 
-      const schema = z.object({
-        imageBase64: z.string().min(100),
-        mimeType: z.enum(['image/png', 'image/jpeg', 'image/webp']).default('image/jpeg'),
-        appPackageHint: z.string().max(120).nullable().optional(),
-        accessibilityText: z.array(z.string().max(240)).max(60).optional(),
-        notes: z.string().max(240).optional(),
-        deviceId: z.string().uuid().optional(),
-        createAssistedProposal: z.boolean().optional(),
-      });
-      const parsed = schema.safeParse(req.body ?? {});
-      if (!parsed.success) {
-        return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid screenshot analysis payload.' });
-      }
-
-      if (deviceId && deviceAuth) {
-        const hintLower = (parsed.data.appPackageHint || '').toLowerCase();
-        if (hintLower.includes('metatrader5') && !deviceAuth.device.permissions.allowMt5) {
-          return res.status(423).json({ error: 'MT5 screen capture is disabled in device permissions.' });
-        }
-        if (hintLower.includes('iqoption') && !deviceAuth.device.permissions.allowIqOption) {
-          return res.status(423).json({ error: 'IQ Option screen capture is disabled in device permissions.' });
-        }
-        await androidManager.recordDeviceHeartbeat(userId, deviceId, parsed.data.appPackageHint ?? null);
-      } else if (parsed.data.deviceId) {
-        const ownDevice = (await androidManager.listDevices(userId)).find((d) => d.id === parsed.data.deviceId);
-        if (ownDevice) deviceId = ownDevice.id;
-      }
-
-      const vision = await analyzeAndroidTradingScreen({
-        imageBase64: parsed.data.imageBase64,
-        mimeType: parsed.data.mimeType,
-        appPackageHint: parsed.data.appPackageHint,
-        accessibilityText: parsed.data.accessibilityText,
-        notes: parsed.data.notes,
-      });
-
-      if (!vision.visionAvailable) {
-        return res.status(vision.error?.includes('not configured') ? 422 : 424).json({
-          error: vision.error || 'Screen visual analysis failed.',
-          vision,
+        const schema = z.object({
+          imageBase64: z.string().min(100),
+          mimeType: z.enum(['image/png', 'image/jpeg', 'image/webp']).default('image/jpeg'),
+          appPackageHint: z.string().max(120).nullable().optional(),
+          accessibilityText: z.array(z.string().max(240)).max(60).optional(),
+          notes: z.string().max(240).optional(),
+          deviceId: z.string().uuid().optional(),
+          createAssistedProposal: z.boolean().optional(),
         });
-      }
-
-      if (deviceAuth) {
-        if (vision.appName === 'MT5' && !deviceAuth.device.permissions.allowMt5) {
-          return res.status(423).json({ error: 'MT5 screen analysis is disabled for this paired device.' });
+        const parsed = schema.safeParse(req.body ?? {});
+        if (!parsed.success) {
+          return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid screenshot analysis payload.' });
         }
-        if (vision.appName === 'IQ_OPTION' && !deviceAuth.device.permissions.allowIqOption) {
-          return res.status(423).json({ error: 'IQ Option screen analysis is disabled for this paired device.' });
+
+        if (deviceId && deviceAuth) {
+          const hintLower = (parsed.data.appPackageHint || '').toLowerCase();
+          if (hintLower.includes('metatrader5') && !deviceAuth.device.permissions.allowMt5) {
+            return res.status(423).json({ error: 'MT5 screen capture is disabled in device permissions.' });
+          }
+          if (hintLower.includes('iqoption') && !deviceAuth.device.permissions.allowIqOption) {
+            return res.status(423).json({ error: 'IQ Option screen capture is disabled in device permissions.' });
+          }
+          await androidManager.recordDeviceHeartbeat(userId, deviceId, parsed.data.appPackageHint ?? null);
+        } else if (parsed.data.deviceId) {
+          const ownDevice = (await androidManager.listDevices(userId)).find((d) => d.id === parsed.data.deviceId);
+          if (ownDevice) deviceId = ownDevice.id;
         }
-      }
 
-      const integrated = await engine.integrateAndroidScreenVision({
-        appName: vision.appName,
-        accountMode: vision.accountMode,
-        symbol: vision.normalizedSymbol || vision.detectedSymbol,
-        timeframe: vision.normalizedTimeframe,
-        detectedPrice: vision.detectedPrice,
-        visualBias: vision.visualBias,
-        visualConfidence: vision.visualConfidence,
-        summary: vision.summary,
-        riskWarning: vision.riskWarning,
-        observations: vision.candlestickObservations,
-        model: vision.model,
-        userId: activityUid,
-      });
-
-      const analysisRecord = await androidManager.recordScreenAnalysis({
-        userId,
-        deviceId,
-        vision,
-        quantSignal: integrated.signal,
-      });
-
-      integrated.signal.screenAnalysisId = analysisRecord.id;
-
-      let assistedProposal = null;
-      let queuedAction = null;
-      const shouldQueueAssisted =
-        (engine.mode === 'assisted' || engine.mode === 'automatic' || parsed.data.createAssistedProposal === true) &&
-        (analysisRecord.recommendedAction === 'CALL' || analysisRecord.recommendedAction === 'PUT');
-
-      if (shouldQueueAssisted) {
-        assistedProposal = engine.createAssistedProposal(integrated.signal, {
-          sourceApp: analysisRecord.appName,
-          screenAnalysisId: analysisRecord.id,
+        const vision = await analyzeAndroidTradingScreen({
+          imageBase64: parsed.data.imageBase64,
+          mimeType: parsed.data.mimeType,
+          appPackageHint: parsed.data.appPackageHint,
+          accessibilityText: parsed.data.accessibilityText,
+          notes: parsed.data.notes,
         });
-        const stake = engine.calculateRecommendedStake(analysisRecord.confidenceScore);
-        queuedAction = androidManager.queueActionFromScreen({
+
+        if (!vision.visionAvailable) {
+          return res.status(vision.error?.includes('not configured') ? 422 : 424).json({
+            error: vision.error || 'Screen visual analysis failed.',
+            vision,
+          });
+        }
+
+        if (deviceAuth) {
+          if (vision.appName === 'MT5' && !deviceAuth.device.permissions.allowMt5) {
+            return res.status(423).json({ error: 'MT5 screen analysis is disabled for this paired device.' });
+          }
+          if (vision.appName === 'IQ_OPTION' && !deviceAuth.device.permissions.allowIqOption) {
+            return res.status(423).json({ error: 'IQ Option screen analysis is disabled for this paired device.' });
+          }
+        }
+
+        const integrated = await engine.integrateAndroidScreenVision({
+          appName: vision.appName,
+          accountMode: vision.accountMode,
+          symbol: vision.normalizedSymbol || vision.detectedSymbol,
+          timeframe: vision.normalizedTimeframe,
+          detectedPrice: vision.detectedPrice,
+          visualBias: vision.visualBias,
+          visualConfidence: vision.visualConfidence,
+          summary: vision.summary,
+          riskWarning: vision.riskWarning,
+          observations: vision.candlestickObservations,
+          model: vision.model,
+          userId: activityUid,
+        });
+
+        const analysisRecord = await androidManager.recordScreenAnalysis({
           userId,
           deviceId,
-          analysis: analysisRecord,
-          operatingMode: engine.mode,
-          stakeOrVolume: stake,
-          expirySeconds: integrated.signal.suggestedExpirySeconds || engine.aiSettings.expirySeconds,
-          riskStatus: engine.getRiskStatus(),
+          vision,
+          quantSignal: integrated.signal,
         });
+
+        integrated.signal.screenAnalysisId = analysisRecord.id;
+
+        let assistedProposal = null;
+        let queuedAction = null;
+        const shouldQueueAssisted =
+          (engine.mode === 'assisted' || engine.mode === 'automatic' || parsed.data.createAssistedProposal === true) &&
+          (analysisRecord.recommendedAction === 'CALL' || analysisRecord.recommendedAction === 'PUT');
+
+        if (shouldQueueAssisted) {
+          assistedProposal = engine.createAssistedProposal(integrated.signal, {
+            sourceApp: analysisRecord.appName,
+            screenAnalysisId: analysisRecord.id,
+          });
+          const stake = engine.calculateRecommendedStake(analysisRecord.confidenceScore);
+          queuedAction = androidManager.queueActionFromScreen({
+            userId,
+            deviceId,
+            analysis: analysisRecord,
+            operatingMode: engine.mode,
+            stakeOrVolume: stake,
+            expirySeconds: integrated.signal.suggestedExpirySeconds || engine.aiSettings.expirySeconds,
+            riskStatus: engine.getRiskStatus(),
+          });
+        }
+
+        engine.logActivity(
+          'ANALYSIS',
+          'ANDROID_SCREEN_ANALYZED',
+          `Android ${analysisRecord.appName} (${analysisRecord.detectedAccountMode}) ${analysisRecord.detectedSymbol || 'Unknown'} -> ${analysisRecord.recommendedAction} (${analysisRecord.confidenceScore}/100, ${analysisRecord.alignmentStatus}).`,
+          activityUid
+        );
+
+        return res.status(201).json({
+          analysis: analysisRecord,
+          signal: integrated.signal,
+          assistedProposal,
+          queuedAction,
+          quantMatched: integrated.quantMatched,
+          marketError: integrated.marketError || null,
+          realMoneyAutomationBlocked: true,
+        });
+      } catch (err) {
+        return res.status(500).json({ error: err instanceof Error ? err.message : 'Screen analysis error.' });
       }
-
-      engine.logActivity(
-        'ANALYSIS',
-        'ANDROID_SCREEN_ANALYZED',
-        `Android ${analysisRecord.appName} (${analysisRecord.detectedAccountMode}) ${analysisRecord.detectedSymbol || 'Unknown'} -> ${analysisRecord.recommendedAction} (${analysisRecord.confidenceScore}/100, ${analysisRecord.alignmentStatus}).`,
-        activityUid
-      );
-
-      return res.status(201).json({
-        analysis: analysisRecord,
-        signal: integrated.signal,
-        assistedProposal,
-        queuedAction,
-        quantMatched: integrated.quantMatched,
-        marketError: integrated.marketError || null,
-        realMoneyAutomationBlocked: true,
-      });
     }
   );
 
   router.post('/android/device/heartbeat', async (req, res) => {
-    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
-    if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-    const schema = z.object({
-      appPackage: z.string().max(120).nullable().optional(),
-      mediaProjection: z.boolean().optional(),
-      accessibility: z.boolean().optional(),
-    });
-    const parsed = schema.safeParse(req.body ?? {});
-    if (!parsed.success) return res.status(400).json({ error: 'Invalid heartbeat payload.' });
-    const updated = await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id, parsed.data.appPackage, {
-      mediaProjection: parsed.data.mediaProjection,
-      accessibility: parsed.data.accessibility,
-    });
-    const engine = getEngineForUser(auth.userId);
-    return res.json({
-      device: updated,
-      operatingMode: engine.mode,
-      emergencyStop: engine.riskSettings.emergencyStop,
-      realMoneyAutomationBlocked: true,
-    });
+    try {
+      const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
+      if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
+      const schema = z.object({
+        appPackage: z.string().max(120).nullable().optional(),
+        mediaProjection: z.boolean().optional(),
+        accessibility: z.boolean().optional(),
+      });
+      const parsed = schema.safeParse(req.body ?? {});
+      if (!parsed.success) return res.status(400).json({ error: 'Invalid heartbeat payload.' });
+      const updated = await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id, parsed.data.appPackage, {
+        mediaProjection: parsed.data.mediaProjection,
+        accessibility: parsed.data.accessibility,
+      });
+      const engine = getEngineForUser(auth.userId);
+      return res.json({
+        device: updated,
+        operatingMode: engine.mode,
+        emergencyStop: engine.riskSettings.emergencyStop,
+        realMoneyAutomationBlocked: true,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Device heartbeat error.' });
+    }
   });
 
   router.get('/android/device/poll', async (req, res) => {
-    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
-    if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-    const engine = getEngineForUser(auth.userId);
-    await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id);
-    const actions = androidManager.pollAuthorizedActionsForDevice(
-      auth.userId,
-      auth.device.id,
-      engine.riskSettings.emergencyStop
-    );
-    return res.json({
-      actions,
-      emergencyStop: engine.riskSettings.emergencyStop,
-      realMoneyAutomationBlocked: true,
-    });
+    try {
+      const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
+      if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
+      const engine = getEngineForUser(auth.userId);
+      await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id);
+      const actions = androidManager.pollAuthorizedActionsForDevice(
+        auth.userId,
+        auth.device.id,
+        engine.riskSettings.emergencyStop
+      );
+      return res.json({
+        actions,
+        emergencyStop: engine.riskSettings.emergencyStop,
+        realMoneyAutomationBlocked: true,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Device poll error.' });
+    }
   });
 
   router.post('/android/device/ack', async (req, res) => {
-    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
-    if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-    const schema = z.object({
-      actionId: z.string().min(1),
-      outcome: z.enum(['EXECUTED_REPORTED', 'REJECTED', 'EXPIRED']),
-      note: z.string().max(240).optional(),
-    });
-    const parsed = schema.safeParse(req.body ?? {});
-    if (!parsed.success) return res.status(400).json({ error: 'Invalid action acknowledgement payload.' });
-    const updated = await androidManager.acknowledgeDeviceAction(
-      auth.userId,
-      auth.device.id,
-      parsed.data.actionId,
-      parsed.data.outcome,
-      parsed.data.note
-    );
-    if (!updated) return res.status(404).json({ error: 'Queued Android action not found.' });
-    const engine = getEngineForUser(auth.userId);
-    engine.logActivity(
-      'TRADE',
-      'ANDROID_ACTION_ACK',
-      `Device ack (${updated.status}) for ${updated.symbol} ${updated.direction}.`,
-      auth.userId === 'local-preview' ? undefined : auth.userId
-    );
-    return res.json({ action: updated });
+    try {
+      const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
+      if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
+      const schema = z.object({
+        actionId: z.string().min(1),
+        outcome: z.enum(['EXECUTED_REPORTED', 'REJECTED', 'EXPIRED']),
+        note: z.string().max(240).optional(),
+      });
+      const parsed = schema.safeParse(req.body ?? {});
+      if (!parsed.success) return res.status(400).json({ error: 'Invalid action acknowledgement payload.' });
+      const updated = await androidManager.acknowledgeDeviceAction(
+        auth.userId,
+        auth.device.id,
+        parsed.data.actionId,
+        parsed.data.outcome,
+        parsed.data.note
+      );
+      if (!updated) return res.status(404).json({ error: 'Queued Android action not found.' });
+      const engine = getEngineForUser(auth.userId);
+      engine.logActivity(
+        'TRADE',
+        'ANDROID_ACTION_ACK',
+        `Device ack (${updated.status}) for ${updated.symbol} ${updated.direction}.`,
+        auth.userId === 'local-preview' ? undefined : auth.userId
+      );
+      return res.json({ action: updated });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Device ack error.' });
+    }
   });
 
   router.post('/android/device/emergency-stop', async (req, res) => {
-    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
-    if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-    const schema = z.object({ engaged: z.boolean().default(true) });
-    const parsed = schema.safeParse(req.body ?? {});
-    if (!parsed.success) return res.status(400).json({ error: 'Provide engaged: boolean.' });
-    const engine = getEngineForUser(auth.userId);
-    const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
-    const status = engine.setEmergencyStop(parsed.data.engaged, actUid);
-    if (parsed.data.engaged) {
-      await brokerManager.setAutoBrokerExecutionEnabled(auth.userId, false, true);
-      androidManager.blockAllPendingOnEmergencyStop(auth.userId);
+    try {
+      const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
+      if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
+      const schema = z.object({ engaged: z.boolean().default(true) });
+      const parsed = schema.safeParse(req.body ?? {});
+      if (!parsed.success) return res.status(400).json({ error: 'Provide engaged: boolean.' });
+      const engine = getEngineForUser(auth.userId);
+      const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
+      const status = engine.setEmergencyStop(parsed.data.engaged, actUid);
+      if (parsed.data.engaged) {
+        await brokerManager.setAutoBrokerExecutionEnabled(auth.userId, false, true);
+        androidManager.blockAllPendingOnEmergencyStop(auth.userId);
+      }
+      await engine.syncSettingsToSupabase(actUid);
+      return res.json({
+        status,
+        emergencyStop: status.emergencyStop,
+        autoPaperArmed: engine.autoPaperArmed,
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Emergency stop error.' });
     }
-    await engine.syncSettingsToSupabase(actUid);
-    return res.json({
-      status,
-      emergencyStop: status.emergencyStop,
-      autoPaperArmed: engine.autoPaperArmed,
-    });
   });
 
   router.post('/android/device/disconnect', async (req, res) => {
-    const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
-    if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-    const revoked = await androidManager.revokeDevice(auth.userId, auth.device.id);
-    if (!revoked) return res.status(404).json({ error: 'Paired Android device not found.' });
-    const engine = getEngineForUser(auth.userId);
-    const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
-    engine.logActivity('BROKER', 'ANDROID_DEVICE_DISCONNECTED', `Android companion "${auth.device.deviceName}" disconnected by device user.`, actUid);
-    return res.json({ ok: true, revoked: true });
+    try {
+      const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
+      if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
+      const revoked = await androidManager.revokeDevice(auth.userId, auth.device.id);
+      if (!revoked) return res.status(404).json({ error: 'Paired Android device not found.' });
+      const engine = getEngineForUser(auth.userId);
+      const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
+      engine.logActivity('BROKER', 'ANDROID_DEVICE_DISCONNECTED', `Android companion "${auth.device.deviceName}" disconnected by device user.`, actUid);
+      return res.json({ ok: true, revoked: true });
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Device disconnect error.' });
+    }
   });
 
   router.get('/activity', async (req, res) => {

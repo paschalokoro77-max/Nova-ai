@@ -6,3 +6,13 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Runtime application state, user records, session data, and broker vaults
+.novatrade-data/
+*.broker-vault.key
+.broker-vault.key
+
+# Android local SDK config and build artifacts
+novatrade-ai/android-companion/local.properties
+novatrade-ai/android-companion/.gradle/
+novatrade-ai/android-companion/app/build/
