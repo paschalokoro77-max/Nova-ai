@@ -18,7 +18,6 @@ android {
 
     signingConfigs {
         create("release") {
-            // Optional: configure release signing if keystore env vars are provided
             val keystorePath = System.getenv("SIGNING_KEYSTORE_PATH")
             if (!keystorePath.isNullOrBlank() && file(keystorePath).exists()) {
                 storeFile = file(keystorePath)
@@ -31,8 +30,8 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
+            isMinifyEnabled = false
+            isShrinkResources = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
@@ -41,6 +40,10 @@ android {
             if (releaseSigning?.storeFile != null) {
                 signingConfig = releaseSigning
             }
+        }
+        debug {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
         }
     }
 
