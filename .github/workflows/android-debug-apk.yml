@@ -1,0 +1,45 @@
+name: Build Android Companion Debug APK
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant execute permission for gradlew
+        run: |
+          cd novatrade-ai/android-companion
+          chmod +x gradlew
+
+      - name: Build Debug APK with Gradle
+        run: |
+          cd novatrade-ai/android-companion
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Verify APK Exists
+        run: |
+          ls -la novatrade-ai/android-companion/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Upload Debug APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-companion-debug-apk
+          path: novatrade-ai/android-companion/app/build/outputs/apk/debug/app-debug.apk
