@@ -3,13 +3,15 @@ import os from 'node:os';
 import path from 'node:path';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
 import { z } from 'zod';
 import { createClient } from '@supabase/supabase-js';
 import { fetchMarketCandles, getAssetDefinition, getMarketDataProviderStatus, SUPPORTED_ASSETS, type Timeframe } from './marketData.ts';
-import { computeBollinger, computeEmaSeries } from './quantEngine.ts';
+import { computeBollinger, computeEmaSeries, isLiveMarketStatus } from './quantEngine.ts';
 import { BrokerRegistry } from './brokers/registry.ts';
 import { BrokerConnectionError, BrokerConnectionManager } from './brokers/connectionManager.ts';
 import { parseIqConnectorConfig } from './brokers/iqOption.ts';
+import { parseMt5BridgeConfig } from './brokers/mt5.ts';
 import { NovaTradeEngine } from './tradingEngine.ts';
 import { AndroidCompanionManager } from './androidCompanion.ts';
 import { analyzeAndroidTradingScreen } from './androidVision.ts';
@@ -17,14 +19,65 @@ import {
   getSupabaseAdmin,
   getSupabaseServerConfig,
   runSupabaseDiagnostics,
+  validateProductionEnvironment,
   verifySupabaseBearerToken,
 } from './supabaseAdmin.ts';
+
+export function resolveAllowedCorsOrigins(isProduction = process.env.NODE_ENV === 'production'): string[] {
+  const allowed = new Set<string>();
+  const addCandidates = (val?: string) => {
+    if (!val) return;
+    for (const part of val.split(',')) {
+      const trimmed = part.trim().replace(/\/+$/, '');
+      if (trimmed) allowed.add(trimmed);
+    }
+  };
+  addCandidates(process.env.WEB_ORIGIN);
+  addCandidates(process.env.APP_URL);
+  if (!isProduction) {
+    allowed.add('http://localhost:3000');
+    allowed.add('http://127.0.0.1:3000');
+    allowed.add('http://localhost:5173');
+    allowed.add('http://127.0.0.1:5173');
+  }
+  return Array.from(allowed);
+}
+
+export function createCorsOriginHandler(isProduction = process.env.NODE_ENV === 'production') {
+  return (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+    // Requests with no Origin header (native clients, server-to-server, curl, Android background services) are allowed
+    if (!origin) {
+      callback(null, true);
+      return;
+    }
+    const cleanOrigin = origin.trim().replace(/\/+$/, '');
+    const allowed = resolveAllowedCorsOrigins(isProduction);
+    // If not production and no explicit allowed origins configured, allow local loopbacks
+    if (!isProduction && allowed.length === 0) {
+      callback(null, true);
+      return;
+    }
+    if (allowed.includes(cleanOrigin)) {
+      callback(null, true);
+      return;
+    }
+    // Block untrusted cross-origin requests fail-closed
+    callback(null, false);
+  };
+}
 
 export interface CreateServerOptions {
   persistPath?: string | null;
   enableScheduler?: boolean;
   autoRestore?: boolean;
+  requireAuth?: boolean;
   verifyToken?: (authHeader?: string) => Promise<{ userId: string; email: string | null } | null>;
+  rateLimits?: {
+    windowMs?: number;
+    pairingMax?: number;
+    authMax?: number;
+    tradingMax?: number;
+  };
 }
 
 export interface SchedulerRecoverySummary {
@@ -47,8 +100,17 @@ function isLoopbackRequest(req: express.Request): boolean {
 }
 
 export function createNovaTradeRouter(options: CreateServerOptions = {}) {
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (isProduction) {
+    validateProductionEnvironment();
+  }
+
   const router = express.Router();
-  const persistPath = options.persistPath === undefined ? path.resolve(process.cwd(), '.novatrade-data/state.json') : options.persistPath;
+  const persistPath = isProduction
+    ? null
+    : options.persistPath === undefined
+      ? path.resolve(process.cwd(), '.novatrade-data/state.json')
+      : options.persistPath;
   const schedulerKey = persistPath || '__memory__';
   const schedulerInstanceId = crypto.randomUUID().slice(0, 8);
   const engines = new Map<string, NovaTradeEngine>();
@@ -61,9 +123,59 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   const iqOption = brokers.get('iq_option')!;
   const tokenVerifier = options.verifyToken ?? verifySupabaseBearerToken;
 
+  const rateLimitWindowMs = options.rateLimits?.windowMs ?? 15 * 60_000;
+  const tradingWindowMs = options.rateLimits?.windowMs ?? 60_000;
+
+  const pairingLimiter = rateLimit({
+    windowMs: rateLimitWindowMs,
+    limit: options.rateLimits?.pairingMax ?? 15,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: 'Too many Android pairing attempts. Please retry later.' },
+  });
+
+  const authLimiter = rateLimit({
+    windowMs: rateLimitWindowMs,
+    limit: options.rateLimits?.authMax ?? 30,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: 'Too many authentication or workspace requests. Please slow down.' },
+  });
+
+  const tradingLimiter = rateLimit({
+    windowMs: tradingWindowMs,
+    limit: options.rateLimits?.tradingMax ?? 60,
+    standardHeaders: 'draft-8',
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false, trustProxy: false },
+    message: { error: 'Trading execution rate limit exceeded. Wait briefly before submitting additional orders.' },
+  });
+
+  // Enforce HTTPS for Android Companion traffic in production
+  router.use('/android', (req, res, next) => {
+    if (isProduction) {
+      const xfProto = String(req.headers['x-forwarded-proto'] || '')
+        .split(',')[0]
+        ?.trim()
+        .toLowerCase();
+      const isHttps = req.secure || xfProto === 'https';
+      if (!isHttps) {
+        return res.status(426).json({
+          error: 'HTTPS is required for production Android Companion connections.',
+        });
+      }
+    }
+    next();
+  });
+
   function attachBrokerAutoHook(eng: NovaTradeEngine, uid: string) {
+    eng.getActiveAccountBucket = () => brokerManager.getActiveAccountBucket(uid);
     eng.onAutonomousSignalTriggered = async (signal, stake) => {
-      if (eng.riskSettings.emergencyStop || !brokerManager.isAutoBrokerExecutionEnabled(uid)) return;
+      if (eng.riskSettings.emergencyStop) return;
+      await brokerManager.ensureHydrated(uid);
+      if (!brokerManager.isAutoBrokerExecutionEnabled(uid)) return;
       const targetAccountId = brokerManager.getActiveExecutionAccountId(uid);
       if (!targetAccountId) return;
       if (signal.direction !== 'CALL' && signal.direction !== 'PUT') return;
@@ -78,7 +190,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
           orderType: 'MARKET',
           amount: stake,
           entryPrice: signal.entryPrice,
-          expirySeconds: signal.suggestedExpirySeconds || eng.aiSettings.expirySeconds,
+          expirySeconds: eng.resolveEffectiveExpirySeconds(signal),
           globalEmergencyStop: eng.riskSettings.emergencyStop,
         });
         if (!validation.valid) {
@@ -93,7 +205,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
           orderType: 'MARKET',
           amount: stake,
           entryPrice: signal.entryPrice,
-          expirySeconds: signal.suggestedExpirySeconds || eng.aiSettings.expirySeconds,
+          expirySeconds: eng.resolveEffectiveExpirySeconds(signal),
           idempotencyKey: `auto-${signal.id}`,
           source: 'automatic',
           globalEmergencyStop: eng.riskSettings.emergencyStop,
@@ -117,6 +229,10 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
 
   attachBrokerAutoHook(defaultEngine, 'local-preview');
 
+  const hydratedEngineUsers = new Set<string>();
+  const pendingEngineHydrations = new Map<string, Promise<NovaTradeEngine>>();
+  const engineRestoreOutcomes = new Map<string, 'restored' | 'blocked_emergency_stop' | 'paused_risk' | 'idle'>();
+
   function getEngineForUser(userId: string): NovaTradeEngine {
     const existing = engines.get(userId);
     if (existing) return existing;
@@ -126,6 +242,79 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     attachBrokerAutoHook(userEngine, userId);
     engines.set(userId, userEngine);
     return userEngine;
+  }
+
+  async function ensureEngineHydrated(
+    userId?: string,
+    preloadedSettingsRow?: Record<string, unknown> | null
+  ): Promise<NovaTradeEngine> {
+    const uid = (userId || '').trim() || 'local-preview';
+    const userEngine = getEngineForUser(uid);
+    if (uid === 'local-preview' || hydratedEngineUsers.has(uid)) {
+      return userEngine;
+    }
+
+    const inflight = pendingEngineHydrations.get(uid);
+    if (inflight) return inflight;
+
+    const hydrationPromise = (async (): Promise<NovaTradeEngine> => {
+      try {
+        await brokerManager.ensureHydrated(uid);
+        userEngine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(uid));
+
+        const admin = getSupabaseAdmin();
+        if (!admin) {
+          hydratedEngineUsers.add(uid);
+          return userEngine;
+        }
+
+        const [settingsRes, tradesRes, signalsRes] = await Promise.all([
+          preloadedSettingsRow !== undefined
+            ? Promise.resolve({ data: preloadedSettingsRow, error: null })
+            : admin.from('user_settings').select('*').eq('user_id', uid).maybeSingle(),
+          admin
+            .from('paper_trades')
+            .select('*')
+            .eq('user_id', uid)
+            .order('created_at', { ascending: false })
+            .limit(250),
+          admin
+            .from('trading_signals')
+            .select('*')
+            .eq('user_id', uid)
+            .order('created_at', { ascending: false })
+            .limit(100),
+        ]);
+
+        if (settingsRes.error || tradesRes.error || signalsRes.error) {
+          const msg =
+            settingsRes.error?.message ||
+            tradesRes.error?.message ||
+            signalsRes.error?.message ||
+            'Supabase workspace read failed';
+          console.warn(`[NovaTradeWorkspace] Supabase workspace hydration warning for ${uid}: ${msg}`);
+          return userEngine;
+        }
+
+        const outcome = userEngine.restoreFromSupabaseWorkspace({
+          settingsRow: (settingsRes.data as Record<string, unknown> | null) ?? null,
+          tradesRows: Array.isArray(tradesRes.data) ? (tradesRes.data as Array<Record<string, unknown>>) : [],
+          signalsRows: Array.isArray(signalsRes.data) ? (signalsRes.data as Array<Record<string, unknown>>) : [],
+        });
+        engineRestoreOutcomes.set(uid, outcome.status);
+        hydratedEngineUsers.add(uid);
+        return userEngine;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Workspace hydration error';
+        console.warn(`[NovaTradeWorkspace] Supabase workspace hydration error for ${uid}: ${msg}`);
+        return userEngine;
+      } finally {
+        pendingEngineHydrations.delete(uid);
+      }
+    })();
+
+    pendingEngineHydrations.set(uid, hydrationPromise);
+    return hydrationPromise;
   }
 
   let recoverySummary: SchedulerRecoverySummary = {
@@ -220,50 +409,31 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       }
     }
 
-    // 2. Restore eligible Supabase-backed user workspaces (auto_paper_armed = true)
+    // 2. Restore eligible Supabase-backed user workspaces
     const admin = getSupabaseAdmin();
     if (admin) {
       try {
-        const { data: armedRows, error } = await admin
+        const { data: userRows, error } = await admin
           .from('user_settings')
-          .select('*')
-          .eq('auto_paper_armed', true);
+          .select('*');
 
         if (error) {
           failedCount += 1;
           lastError = error.message;
           defaultEngine.logActivity('SCHEDULER', 'SCHEDULER_RECOVERY_FAILED', `Supabase recovery query failed: ${error.message}`);
-        } else if (Array.isArray(armedRows)) {
-          for (const row of armedRows) {
+        } else if (Array.isArray(userRows)) {
+          for (const row of userRows) {
             const userId = String(row.user_id || '');
             if (!userId) continue;
             try {
-              const userEngine = getEngineForUser(userId);
-              const [tradesRes, signalsRes] = await Promise.all([
-                admin
-                  .from('paper_trades')
-                  .select('*')
-                  .eq('user_id', userId)
-                  .order('created_at', { ascending: false })
-                  .limit(250),
-                admin
-                  .from('trading_signals')
-                  .select('*')
-                  .eq('user_id', userId)
-                  .order('created_at', { ascending: false })
-                  .limit(100),
-              ]);
-              const outcome = userEngine.restoreFromSupabaseWorkspace({
-                settingsRow: row as Record<string, unknown>,
-                tradesRows: Array.isArray(tradesRes.data) ? (tradesRes.data as Array<Record<string, unknown>>) : [],
-                signalsRows: Array.isArray(signalsRes.data) ? (signalsRes.data as Array<Record<string, unknown>>) : [],
-              });
-              if (outcome.status === 'restored' && !restoredUserIds.has(userId)) {
+              await ensureEngineHydrated(userId, row as Record<string, unknown>);
+              const outcomeStatus = engineRestoreOutcomes.get(userId) ?? 'idle';
+              if (outcomeStatus === 'restored' && !restoredUserIds.has(userId)) {
                 restoredCount += 1;
                 restoredUserIds.add(userId);
-              } else if (outcome.status === 'blocked_emergency_stop') {
+              } else if (outcomeStatus === 'blocked_emergency_stop') {
                 blockedByEmergencyStopCount += 1;
-              } else if (outcome.status === 'paused_risk') {
+              } else if (outcomeStatus === 'paused_risk') {
                 pausedByRiskCount += 1;
               }
             } catch (userErr) {
@@ -316,6 +486,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       void (async () => {
         try {
           for (const eng of engines.values()) {
+            if (eng.getActiveTrades().length > 0) {
+              await eng.monitorAndSettleExpiredTrades().catch(() => undefined);
+            }
             if (eng.riskSettings.emergencyStop) {
               if (eng.autoPaperArmed) {
                 eng.autoPaperArmed = false;
@@ -323,7 +496,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
               }
               continue;
             }
-            if (eng.autoPaperArmed || eng.getActiveTrades().length > 0) {
+            if (eng.autoPaperArmed) {
+              const uid = eng.ownerUserId || 'local-preview';
+              await brokerManager.ensureHydrated(uid).catch(() => undefined);
               await eng.runAutonomousCycle(false).catch(() => undefined);
             }
           }
@@ -354,27 +529,63 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       return null;
     }
     if (user.userId) {
-      return { engine: getEngineForUser(user.userId), userId: user.userId };
+      const engine = await ensureEngineHydrated(user.userId);
+      return { engine, userId: user.userId };
     }
     const sb = getSupabaseServerConfig();
-    if (requireAuthIfSupabaseConfigured && sb.clientAuthConfigured) {
+    const authRequired = isProduction || Boolean(options.requireAuth) || (requireAuthIfSupabaseConfigured && sb.clientAuthConfigured);
+    if (authRequired) {
       res.status(401).json({ error: 'Authenticated Supabase session required.' });
       return null;
     }
     return { engine: defaultEngine };
   }
 
-  router.get('/health', async (req, res) => {
+  const handleHealthRequest = async (req: express.Request, res: express.Response) => {
     const sb = getSupabaseServerConfig();
     const iqCfg = parseIqConnectorConfig();
+    const mt5Cfg = parseMt5BridgeConfig();
     const user = await resolveUser(req);
-    const activeEngine = user.userId ? getEngineForUser(user.userId) : defaultEngine;
+    const authRequired = isProduction || Boolean(options.requireAuth) || sb.clientAuthConfigured;
+
+    const executionCapabilities = {
+      paperSimulation: true,
+      mt5DemoOrderPlacement: true,
+      mt5RealOrderPlacement: true,
+      iqOptionReadInspection: true,
+      iqOptionOrderExecutionSupported: false as const,
+    };
+
+    if (authRequired && !user.userId) {
+      return res.json({
+        status: 'ok',
+        executionMode: 'paper only',
+        liveExecution: false,
+        authRequired: true,
+        version: '0.3.1',
+        supabase: {
+          clientConfigured: sb.clientAuthConfigured,
+          serverConfigured: sb.serviceRoleConfigured,
+        },
+        geminiConfigured: Boolean((process.env.GEMINI_API_KEY || '').trim() && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
+        iqConnectorConfigured: iqCfg.configured,
+        iqConnectorUrlValid: iqCfg.urlValid,
+        mt5BridgeConfigured: mt5Cfg.configured,
+        mt5BridgeUrlValid: mt5Cfg.urlValid,
+        executionCapabilities,
+      });
+    }
+
+    const activeEngine = user.userId ? await ensureEngineHydrated(user.userId) : defaultEngine;
+    const brokerSummary = brokerManager.getBrokerHealthSummary(user.userId || 'local-preview');
+    const executionMode = brokerSummary.autoBrokerRoutingEnabled ? 'broker routing' : 'paper only';
     const balance = activeEngine.getVirtualBalanceSummary();
     res.json({
       status: 'ok',
       mode: activeEngine.mode,
-      executionMode: 'paper only',
-      liveExecution: false,
+      executionMode,
+      liveExecution: brokerSummary.activeTarget === 'MT5_REAL' && brokerSummary.autoBrokerRoutingEnabled,
+      authRequired,
       version: '0.3.1',
       virtualBalance: balance,
       scheduler: {
@@ -392,10 +603,24 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       geminiConfigured: Boolean((process.env.GEMINI_API_KEY || '').trim() && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'),
       iqConnectorConfigured: iqCfg.configured,
       iqConnectorUrlValid: iqCfg.urlValid,
+      mt5BridgeConfigured: mt5Cfg.configured,
+      mt5BridgeUrlValid: mt5Cfg.urlValid,
+      executionCapabilities,
+      execution: {
+        activeTarget: brokerSummary.activeTarget,
+        autoBrokerRoutingEnabled: brokerSummary.autoBrokerRoutingEnabled,
+        paperSimulationActive: brokerSummary.activeTarget === 'PAPER_SIMULATOR',
+        mt5DemoConnected: brokerSummary.mt5DemoConnected,
+        mt5RealConnected: brokerSummary.mt5RealConnected,
+        iqOptionConnected: brokerSummary.iqDemoConnected || brokerSummary.iqRealConnected,
+        iqOptionOrderExecutionSupported: false as const,
+      },
     });
-  });
+  };
 
-  router.get('/supabase/status', (_req, res) => {
+  router.get('/health', handleHealthRequest);
+
+  router.get('/supabase/status', authLimiter, (_req, res) => {
     const sb = getSupabaseServerConfig();
     const rawUrl = (process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || '').trim();
     const rawAnon = (process.env.SUPABASE_ANON_KEY || process.env.VITE_SUPABASE_ANON_KEY || '').trim();
@@ -411,12 +636,14 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.get('/supabase/diagnostics', async (_req, res) => {
+  router.get('/supabase/diagnostics', authLimiter, async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const diagnostics = await runSupabaseDiagnostics();
     res.json(diagnostics);
   });
 
-  router.post('/supabase/verify-rls', async (req, res) => {
+  router.post('/supabase/verify-rls', authLimiter, async (req, res) => {
     if (!isLoopbackRequest(req)) {
       return res.status(401).json({ error: 'Loopback verification only.' });
     }
@@ -510,7 +737,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.post('/supabase/audit-account', async (req, res) => {
+  router.post('/supabase/audit-account', authLimiter, async (req, res) => {
     if (!isLoopbackRequest(req)) {
       return res.status(401).json({ error: 'Loopback verification only.' });
     }
@@ -823,17 +1050,21 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.post('/state/hydrate', async (req, res) => {
+  router.post('/state/hydrate', authLimiter, async (req, res) => {
     const user = await resolveUser(req);
     if (!user.userId) return res.status(401).json({ error: 'Authenticated Supabase session required.' });
-    const scopedEngine = getEngineForUser(user.userId);
+    const scopedEngine = await ensureEngineHydrated(user.userId);
     const body = req.body ?? {};
     scopedEngine.hydrateFromClient(body);
+    await brokerManager.ensureHydrated(user.userId);
+    scopedEngine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(user.userId));
     return res.json({ hydrated: true, analytics: scopedEngine.getAnalytics(), risk: scopedEngine.getRiskStatus() });
   });
 
   // Market data endpoints
-  router.get('/market/assets', async (_req, res) => {
+  router.get('/market/assets', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     let brokerBinarySymbols = new Set<string>();
     try {
       const iq = await iqOption.getStatus();
@@ -858,12 +1089,16 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.get('/market/status', async (_req, res) => {
+  router.get('/market/status', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const status = await getMarketDataProviderStatus();
     res.json(status);
   });
 
   router.get('/market/candles', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const schema = z.object({
       symbol: z.string().regex(/^[A-Z0-9_-]{3,20}$/).default('EURUSD'),
       timeframe: z.enum(['1m', '5m', '15m', '1h']).default('1m'),
@@ -904,7 +1139,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid symbol or timeframe.' });
 
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
 
     const { analysis, marketError } = await ws.engine.analyseAsset(
@@ -941,7 +1176,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
 
   // Market scanner (batch + progressive single-asset)
   router.post('/scanner/run', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const schema = z.object({
       symbols: z.array(z.string().regex(/^[A-Z0-9_-]{3,20}$/)).max(14).optional(),
@@ -958,7 +1193,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/scanner/scan-one', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const schema = z.object({
       symbol: z.string().regex(/^[A-Z0-9_-]{3,20}$/),
@@ -987,6 +1222,26 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     ws.engine.logActivity('SETTINGS', 'MODE_CHANGED', `Operating mode switched to ${parsed.data.mode.toUpperCase()}.`, ws.userId);
     await ws.engine.syncSettingsToSupabase(ws.userId);
     return res.json({ mode: ws.engine.mode, autoArmed: ws.engine.autoPaperArmed });
+  });
+
+  // Account-Aware Dashboard source preference (Paper Trading, MT5, IQ Option)
+  router.get('/dashboard/source', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
+    return res.json({ source: ws.engine.selectedDashboardSource || 'paper' });
+  });
+
+  router.put('/dashboard/source', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
+    const schema = z.object({ source: z.enum(['paper', 'mt5', 'iq_option']) });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ error: 'Invalid dashboard source. Expected paper, mt5, or iq_option.' });
+    }
+    ws.engine.selectedDashboardSource = parsed.data.source;
+    void ws.engine.syncRuntimeRecoveryToSupabase(ws.userId || undefined);
+    return res.json({ ok: true, source: ws.engine.selectedDashboardSource });
   });
 
   // Assisted trading mode (Mode B)
@@ -1021,13 +1276,13 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       proposal,
       notice: proposal
         ? 'Assisted trade proposal requires your explicit approval before paper execution.'
-        : analysis.isStale || analysis.marketStatus !== 'OPEN'
-          ? 'Market feed is closed or stale; assisted trade proposals are disabled until live OPEN data resumes.'
+        : analysis.isStale || !isLiveMarketStatus(analysis.marketStatus)
+          ? 'Market feed is closed or stale; assisted trade proposals are disabled until live data resumes.'
           : 'Quantitative decision is WAIT; no trade proposal created.',
     });
   });
 
-  router.post('/assisted/proposals/:id/approve', async (req, res) => {
+  router.post('/assisted/proposals/:id/approve', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const proposal = ws.engine.assistedProposals.find((p) => p.id === req.params.id);
@@ -1038,6 +1293,8 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid trade amount override.' });
 
+    const uid = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(uid);
     const amount = parsed.data.amount ?? proposal.recommendedAmount;
     const opened = ws.engine.openPaperTrade({
       symbol: proposal.symbol,
@@ -1047,15 +1304,21 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       mode: 'assisted',
       entryPrice: proposal.entryPrice,
       expirySeconds: proposal.expirySeconds,
+      requestedExpirySeconds: proposal.requestedExpirySeconds,
+      expiryAdjusted: proposal.expiryAdjusted,
+      expiryAdjustmentReason: proposal.expiryAdjustmentReason,
       signalScore: proposal.score,
       pendingOutcome: true,
       userId: ws.userId,
+      accountBucket: brokerManager.getActiveAccountBucket(uid),
+      strategyName: proposal.strategyName,
     });
     if (!opened.ok) {
       return res.status(409).json({ error: opened.error, risk: opened.risk });
     }
     proposal.status = 'APPROVED';
     proposal.decidedAt = new Date().toISOString();
+    void ws.engine.syncRuntimeRecoveryToSupabase(ws.userId);
     return res.status(201).json({
       proposal,
       trade: opened.trade,
@@ -1073,6 +1336,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     proposal.status = 'REJECTED';
     proposal.decidedAt = new Date().toISOString();
     ws.engine.logActivity('TRADE', 'ASSISTED_REJECTED', `Rejected assisted proposal for ${proposal.direction} ${proposal.symbol}.`, ws.userId);
+    void ws.engine.syncRuntimeRecoveryToSupabase(ws.userId);
     return res.json({ proposal });
   });
 
@@ -1097,7 +1361,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.post('/paper-trades', async (req, res) => {
+  router.post('/paper-trades', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const schema = z.object({
@@ -1119,6 +1383,8 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       if (latest.ok) entryPrice = latest.currentPrice;
     }
 
+    const uid = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(uid);
     const result = ws.engine.openPaperTrade({
       symbol: parsed.data.symbol,
       timeframe: parsed.data.timeframe as Timeframe | undefined,
@@ -1129,6 +1395,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       expirySeconds: parsed.data.expirySeconds,
       pendingOutcome: true,
       userId: ws.userId,
+      accountBucket: brokerManager.getActiveAccountBucket(uid),
     });
     if (!result.ok) {
       return res.status(409).json({ error: result.error, risk: result.risk });
@@ -1136,7 +1403,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     return res.status(201).json({ trade: result.trade, notice: 'Paper trade opened. Real-money broker execution is disabled.' });
   });
 
-  router.post('/paper-trades/:id/settle', async (req, res) => {
+  router.post('/paper-trades/:id/settle', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const schema = z.object({
@@ -1159,7 +1426,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.post('/paper-trades/:id/cancel', async (req, res) => {
+  router.post('/paper-trades/:id/cancel', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const cancelled = ws.engine.cancelPaperTrade(req.params.id);
@@ -1167,11 +1434,20 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     return res.json({ trade: cancelled.trade });
   });
 
-  // Analytics
+  // Analytics & Performance Learner Insights
   router.get('/analytics', async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     return res.json(ws.engine.getAnalytics());
+  });
+
+  router.get('/learning/insights', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
+    const uid = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(uid);
+    ws.engine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(uid));
+    return res.json(ws.engine.getLearningInsights());
   });
 
   // Risk management
@@ -1209,7 +1485,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       ws.engine.autoPaperArmed = false;
       ws.engine.autoPausedReason = 'Emergency stop engaged.';
       await brokerManager.setAutoBrokerExecutionEnabled(ws.userId || 'local-preview', false, true);
-      androidManager.blockAllPendingOnEmergencyStop(ws.userId || 'local-preview');
+      await androidManager.blockAllPendingOnEmergencyStop(ws.userId || 'local-preview');
     }
     ws.engine.logActivity('RISK', 'RISK_SETTINGS_UPDATED', 'Risk management parameters updated.', ws.userId);
     await ws.engine.syncSettingsToSupabase(ws.userId);
@@ -1225,7 +1501,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const status = ws.engine.setEmergencyStop(parsed.data.engaged, ws.userId);
     if (parsed.data.engaged) {
       await brokerManager.setAutoBrokerExecutionEnabled(ws.userId || 'local-preview', false, true);
-      androidManager.blockAllPendingOnEmergencyStop(ws.userId || 'local-preview');
+      await androidManager.blockAllPendingOnEmergencyStop(ws.userId || 'local-preview');
     }
     await ws.engine.syncSettingsToSupabase(ws.userId);
     return res.json({ status, autoPaperArmed: ws.engine.autoPaperArmed });
@@ -1267,7 +1543,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   // Autonomous paper mode (Mode C)
-  router.post('/auto-paper/arm', async (req, res) => {
+  router.post('/auto-paper/arm', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const enabled = z.object({ enabled: z.boolean() }).safeParse(req.body);
@@ -1298,6 +1574,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!ws) return;
     return res.json({
       armed: ws.engine.autoPaperArmed,
+      status: ws.engine.getAutonomousStatus(),
       risk: ws.engine.getRiskStatus(),
       execution: 'PAPER_ONLY',
       scanIntervalSeconds: ws.engine.aiSettings.scanIntervalSeconds,
@@ -1306,11 +1583,21 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.post('/auto-paper/evaluate', async (req, res) => {
+  router.post('/auto-paper/evaluate', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
+    if (ws.engine.riskSettings.emergencyStop) {
+      ws.engine.autoPaperArmed = false;
+      ws.engine.autoPausedReason = 'Emergency stop is engaged.';
+      return res.status(409).json({
+        entered: false,
+        armed: false,
+        reason: 'Emergency Stop is engaged; autonomous evaluation and trading are halted.',
+        risk: ws.engine.getRiskStatus(),
+      });
+    }
     if (!ws.engine.autoPaperArmed) {
-      return res.status(409).json({ entered: false, reason: 'Automatic paper mode is not armed.' });
+      return res.status(409).json({ entered: false, armed: false, reason: 'Automatic paper mode is not armed.' });
     }
     const schema = z.object({
       symbol: z.string().regex(/^[A-Z0-9_-]{3,20}$/).default('EURUSD'),
@@ -1319,68 +1606,102 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid market request.' });
 
+    const uid = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(uid);
+    ws.engine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(uid));
+
+    // Settle any expired pending shadow signals BEFORE checking temporary risk waits
+    await ws.engine.settlePendingShadowSignals();
+
     const risk = ws.engine.getRiskStatus();
-    if (!risk.allowed) {
+    const isTemporaryWait =
+      !risk.allowed &&
+      risk.reasons.every((r) => r.includes('simultaneous trades') || r.includes('max open') || r.includes('cooldown'));
+
+    if (!risk.allowed && !isTemporaryWait) {
       ws.engine.autoPaperArmed = false;
       ws.engine.autoPausedReason = risk.reasons.join(' ');
-      return res.status(409).json({ entered: false, reason: `Risk guard stopped automatic trading: ${ws.engine.autoPausedReason}`, risk });
+      void ws.engine.syncSettingsToSupabase(ws.userId);
+      return res.status(409).json({
+        entered: false,
+        armed: false,
+        reason: `Risk guard stopped automatic trading: ${ws.engine.autoPausedReason}`,
+        risk,
+      });
     }
 
-    const { analysis, marketError } = await ws.engine.analyseAsset(parsed.data.symbol, parsed.data.timeframe as Timeframe, false, ws.userId);
-    if (marketError) {
-      return res.json({ entered: false, reason: `Market data unavailable: ${marketError}`, analysis });
-    }
-    if (analysis.isStale || analysis.marketStatus !== 'OPEN') {
-      return res.json({ entered: false, reason: `Market status is ${analysis.marketStatus}; signal suppressed to WAIT.`, analysis });
-    }
-    if (analysis.direction !== 'CALL' && analysis.direction !== 'PUT') {
-      return res.json({ entered: false, reason: 'Quantitative engine decision is WAIT. No paper trade opened.', analysis });
-    }
+    const decision = await ws.engine.evaluateAndExecuteAutonomousSignal(
+      parsed.data.symbol,
+      parsed.data.timeframe as Timeframe,
+      { allowExecution: risk.allowed }
+    );
 
-    const stake = ws.engine.calculateRecommendedStake(analysis.score);
-    const opened = ws.engine.openPaperTrade({
-      symbol: analysis.symbol,
-      timeframe: analysis.timeframe,
-      direction: analysis.direction,
-      amount: stake,
-      mode: 'automatic',
-      entryPrice: analysis.entryPrice,
-      expirySeconds: analysis.suggestedExpirySeconds || ws.engine.aiSettings.expirySeconds,
-      signalScore: analysis.score,
-      provider: analysis.provider,
-      pendingOutcome: true,
-      userId: ws.userId,
-    });
-    if (!opened.ok) {
-      return res.status(409).json({ entered: false, reason: opened.error, analysis });
+    if (decision.action === 'OPENED' && decision.trade) {
+      return res.status(201).json({
+        entered: true,
+        armed: ws.engine.autoPaperArmed,
+        trade: decision.trade,
+        analysis: decision.analysis,
+        risk: decision.risk,
+        notice: 'Evaluated through unified autonomous pipeline.',
+      });
     }
-    return res.status(201).json({
-      entered: true,
-      trade: opened.trade,
-      analysis,
-      notice: 'Paper simulation only. No broker order was sent.',
+    if (decision.action === 'SHADOW_RECORDED') {
+      return res.status(200).json({
+        entered: false,
+        armed: ws.engine.autoPaperArmed,
+        shadowRecorded: true,
+        reason: decision.reason,
+        analysis: decision.analysis,
+        risk: decision.risk,
+      });
+    }
+    if (decision.action === 'WAIT') {
+      return res.status(200).json({
+        entered: false,
+        armed: ws.engine.autoPaperArmed,
+        reason: decision.reason,
+        analysis: decision.analysis,
+        risk: decision.risk,
+      });
+    }
+    return res.status(409).json({
+      entered: false,
+      armed: ws.engine.autoPaperArmed,
+      reason: decision.reason,
+      analysis: decision.analysis,
+      risk: decision.risk,
     });
   });
 
-  router.post('/auto-paper/cycle', async (req, res) => {
+  router.post('/auto-paper/cycle', tradingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
+    const uid = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(uid);
+    ws.engine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(uid));
     const result = await ws.engine.runAutonomousCycle(true);
     return res.json({ ...result, status: ws.engine.getRiskStatus(), armed: ws.engine.autoPaperArmed });
   });
 
   // Multi-Broker & Legacy IQ Option endpoints
-  router.get('/broker/status', async (_req, res) => {
+  router.get('/broker/status', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const status = await iqOption.getStatus();
     return res.json(status);
   });
 
-  router.get('/broker/catalog', async (_req, res) => {
+  router.get('/broker/catalog', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const catalog = await brokers.listCatalog();
     return res.json({ brokers: catalog });
   });
 
-  router.get('/brokers/catalog', async (_req, res) => {
+  router.get('/brokers/catalog', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const catalog = await brokers.listCatalog();
     return res.json({ brokers: catalog });
   });
@@ -1411,7 +1732,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/brokers/accounts', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const schema = z.object({
@@ -1447,14 +1768,14 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid broker account payload.' });
     }
-    if (parsed.data.environment === 'real') {
-      return res.status(423).json({
-        error: 'Real-money broker accounts are locked while live execution is disabled. Use demo/practice only.',
-      });
-    }
     try {
       const account = await brokerManager.createOrUpdateAccount(userId, parsed.data);
-      ws.engine.logActivity('BROKER', 'BROKER_ACCOUNT_SAVED', `Saved demo broker account "${account.label}" (${account.brokerName}).`, ws.userId);
+      ws.engine.logActivity(
+        'BROKER',
+        'BROKER_ACCOUNT_SAVED',
+        `Saved ${account.environment.toUpperCase()} broker account "${account.label}" (${account.brokerName}).`,
+        ws.userId
+      );
       return res.status(201).json({ account });
     } catch (err) {
       return res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to save broker account.' });
@@ -1462,24 +1783,24 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.delete('/brokers/accounts/:accountId', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    const removed = brokerManager.deleteAccount(userId, req.params.accountId);
+    const removed = await brokerManager.deleteAccount(userId, req.params.accountId);
     if (!removed) return res.status(404).json({ error: 'Broker account not found.' });
     ws.engine.logActivity('BROKER', 'BROKER_ACCOUNT_REMOVED', `Removed broker account ${req.params.accountId}.`, ws.userId);
     return res.json({ ok: true });
   });
 
   router.post('/brokers/active', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const schema = z.object({ accountId: z.string().nullable() });
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid accountId.' });
     try {
-      const result = brokerManager.selectActiveAccount(userId, parsed.data.accountId);
+      const result = await brokerManager.selectActiveAccount(userId, parsed.data.accountId);
       ws.engine.logActivity(
         'BROKER',
         'ACTIVE_BROKER_SELECTED',
@@ -1493,7 +1814,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/brokers/accounts/:accountId/connect', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     try {
@@ -1522,7 +1843,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/brokers/accounts/:accountId/disconnect', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     try {
@@ -1535,7 +1856,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/brokers/accounts/:accountId/sync', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     try {
@@ -1547,7 +1868,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.put('/brokers/accounts/:accountId/risk', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const schema = z.object({
@@ -1561,7 +1882,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) return res.status(400).json({ error: 'Invalid per-account risk limits.' });
     try {
-      const riskLimits = brokerManager.updateAccountRiskLimits(userId, req.params.accountId, parsed.data);
+      const riskLimits = await brokerManager.updateAccountRiskLimits(userId, req.params.accountId, parsed.data);
       return res.json({ riskLimits });
     } catch (err) {
       return res.status(404).json({ error: err instanceof Error ? err.message : 'Broker account not found.' });
@@ -1580,6 +1901,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!parsed.success) return res.status(400).json({ error: 'Invalid symbol or orderType.' });
     const meta = getAssetDefinition(parsed.data.symbol);
     try {
+      await brokerManager.ensureHydrated(userId);
       const result = brokerManager.checkInstrumentCompatibilityForAccount(
         userId,
         req.params.accountId,
@@ -1597,17 +1919,18 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(userId);
     const accountId = typeof req.query.accountId === 'string' ? req.query.accountId : undefined;
     return res.json({ orders: brokerManager.listOrders(userId, accountId) });
   });
 
-  router.post('/brokers/orders', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+  router.post('/brokers/orders', tradingLimiter, async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const schema = z.object({
       accountId: z.string().min(1),
-      environment: z.enum(['demo', 'real']).default('demo'),
+      environment: z.enum(['demo', 'real']).optional(),
       symbol: z.string().min(2).max(20),
       direction: z.enum(['CALL', 'PUT']),
       orderType: z.enum(['MARKET', 'LIMIT', 'BINARY_FIXED_EXPIRY']).default('MARKET'),
@@ -1621,10 +1944,22 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid broker order payload.' });
     }
-    if (parsed.data.environment === 'real') {
+    const { accounts } = await brokerManager.listAccounts(userId);
+    const targetAcct = accounts.find((a) => a.id === parsed.data.accountId);
+    if (!targetAcct) {
+      return res.status(404).json({ executed: false, error: 'Selected broker account not found.' });
+    }
+    const requestedEnv = parsed.data.environment ?? targetAcct.environment;
+    if (requestedEnv === 'real' && targetAcct.brokerId !== 'mt5') {
       return res.status(423).json({
         executed: false,
-        error: 'Real-money broker order execution is locked. Only demo/sandbox orders are permitted.',
+        error: 'Real-money orders are locked for IQ Option. Only MetaTrader 5 (MT5) Real accounts support real execution.',
+      });
+    }
+    if (requestedEnv !== targetAcct.environment) {
+      return res.status(409).json({
+        executed: false,
+        error: `Environment mismatch: account "${targetAcct.label}" is configured as ${targetAcct.environment.toUpperCase()}, not ${requestedEnv.toUpperCase()}.`,
       });
     }
 
@@ -1653,8 +1988,8 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       });
       ws.engine.logActivity(
         'BROKER',
-        result.duplicatePrevented ? 'BROKER_DUPLICATE_PREVENTED' : 'BROKER_DEMO_ORDER',
-        `${result.order.brokerName}: ${result.order.direction} ${result.order.mappedSymbol} (${result.order.status})`,
+        result.duplicatePrevented ? 'BROKER_DUPLICATE_PREVENTED' : result.order.environment === 'real' ? 'BROKER_REAL_ORDER' : 'BROKER_DEMO_ORDER',
+        `${result.order.brokerName} (${result.order.environment.toUpperCase()}): ${result.order.direction} ${result.order.mappedSymbol} (${result.order.status})`,
         ws.userId
       );
       return res.status(result.duplicatePrevented ? 200 : 201).json(result);
@@ -1667,11 +2002,12 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/brokers/orders/reconcile', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const accountId = typeof req.body?.accountId === 'string' ? req.body.accountId : undefined;
     const result = await brokerManager.reconcileOrders(userId, accountId);
+    ws.engine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(userId));
     return res.json(result);
   });
 
@@ -1731,13 +2067,13 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.post('/brokers/orders/validate', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+  router.post('/brokers/orders/validate', tradingLimiter, async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const schema = z.object({
       accountId: z.string().min(1),
-      environment: z.enum(['demo', 'real']).default('demo'),
+      environment: z.enum(['demo', 'real']).optional(),
       symbol: z.string().min(2).max(20),
       direction: z.enum(['CALL', 'PUT']),
       orderType: z.enum(['MARKET', 'LIMIT', 'BINARY_FIXED_EXPIRY']).default('MARKET'),
@@ -1749,11 +2085,24 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     if (!parsed.success) {
       return res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid order validation payload.' });
     }
-    if (parsed.data.environment === 'real') {
+    const { accounts } = await brokerManager.listAccounts(userId);
+    const targetAcct = accounts.find((a) => a.id === parsed.data.accountId);
+    if (!targetAcct) {
+      return res.status(404).json({ valid: false, compatible: false, reason: 'Selected broker account not found.' });
+    }
+    const requestedEnv = parsed.data.environment ?? targetAcct.environment;
+    if (requestedEnv === 'real' && targetAcct.brokerId !== 'mt5') {
       return res.status(423).json({
         valid: false,
         compatible: false,
-        reason: 'Real-money broker orders are locked. Demo/Practice environment only.',
+        reason: 'Real-money orders are locked for IQ Option. Only MetaTrader 5 (MT5) supports Demo or Real orders.',
+      });
+    }
+    if (requestedEnv !== targetAcct.environment) {
+      return res.status(409).json({
+        valid: false,
+        compatible: false,
+        reason: `Environment mismatch: account "${targetAcct.label}" is configured as ${targetAcct.environment.toUpperCase()}.`,
       });
     }
     const assetMeta = getAssetDefinition(parsed.data.symbol);
@@ -1775,6 +2124,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
+    await brokerManager.ensureHydrated(userId);
     return res.json({
       enabled: brokerManager.isAutoBrokerExecutionEnabled(userId) && !ws.engine.riskSettings.emergencyStop,
       activeAccountId: brokerManager.getActiveExecutionAccountId(userId),
@@ -1782,8 +2132,8 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     });
   });
 
-  router.put('/brokers/auto-execution', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+  router.put('/brokers/auto-execution', tradingLimiter, async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
     const schema = z.object({ enabled: z.boolean() });
@@ -1808,6 +2158,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const userId = ws.userId || 'local-preview';
     try {
       const result = await brokerManager.syncAccountTradeHistory(userId, req.params.accountId);
+      if (result.learnedRecords.length > 0) {
+        ws.engine.ingestBrokerOutcomes(result.learnedRecords);
+      }
       return res.json(result);
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Trade history sync failed.';
@@ -1816,7 +2169,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/broker/iq/connect', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     try {
       const result = await iqOption.connect();
@@ -1835,7 +2188,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/broker/iq/disconnect', async (req, res) => {
-    const ws = await resolveWorkspace(req, res, false);
+    const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     try {
       const result = await iqOption.disconnect();
@@ -1846,7 +2199,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.get('/broker/iq/balance', async (_req, res) => {
+  router.get('/broker/iq/balance', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     try {
       const data = await iqOption.getBalance();
       return res.json(data);
@@ -1856,7 +2211,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.get('/broker/iq/assets', async (_req, res) => {
+  router.get('/broker/iq/assets', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     try {
       const data = await iqOption.getAssets();
       return res.json(data);
@@ -1867,6 +2224,8 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
   });
 
   router.post('/broker/iq/candles', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     const schema = z.object({
       symbol: z.string().regex(/^[A-Z0-9_-]{3,25}$/).default('EURUSD'),
       intervalSeconds: z.number().int().min(5).max(3600).default(60),
@@ -1883,7 +2242,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.get('/broker/iq/history', async (_req, res) => {
+  router.get('/broker/iq/history', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
     try {
       const data = await iqOption.getTradeHistory();
       return res.json(data);
@@ -1924,7 +2285,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.post('/android/devices/pair', async (req, res) => {
+  router.post('/android/devices/pair', pairingLimiter, async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const schema = z.object({
@@ -1951,7 +2312,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
-  router.post('/android/devices/register', async (req, res) => {
+  router.post('/android/devices/register', pairingLimiter, async (req, res) => {
     const schema = z.object({
       pairingCode: z.string().min(4).max(16),
       deviceName: z.string().min(1).max(60).optional(),
@@ -1969,7 +2330,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       if (!result) {
         return res.status(401).json({ error: 'Invalid or expired Android pairing code.' });
       }
-      const targetEngine = getEngineForUser(result.device.userId);
+      const targetEngine = await ensureEngineHydrated(result.device.userId);
       targetEngine.logActivity(
         'BROKER',
         'ANDROID_DEVICE_REGISTERED',
@@ -2041,21 +2402,33 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    return res.json({ analyses: androidManager.listAnalyses(userId) });
+    return res.json({ analyses: await androidManager.listAnalyses(userId) });
   });
 
   router.get('/android/actions', async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    return res.json({ actions: androidManager.listActions(userId) });
+    return res.json({ actions: await androidManager.listActions(userId) });
   });
 
   router.post('/android/actions/:actionId/approve', async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    const result = androidManager.approveAction(userId, req.params.actionId, ws.engine.getRiskStatus());
+    await brokerManager.ensureHydrated(userId);
+    const existingActions = await androidManager.listActions(userId);
+    const targetAction = existingActions.find((a) => a.id === req.params.actionId);
+    const verifiedSession = brokerManager.resolveVerifiedBrokerSession(
+      userId,
+      targetAction?.appName || 'UNKNOWN'
+    );
+    const result = await androidManager.approveAction(
+      userId,
+      req.params.actionId,
+      ws.engine.getRiskStatus(),
+      verifiedSession
+    );
     if (!result.ok) {
       return res.status(result.statusCode || 409).json({ error: result.error });
     }
@@ -2075,7 +2448,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const userId = ws.userId || 'local-preview';
-    const updated = androidManager.rejectAction(userId, req.params.actionId);
+    const updated = await androidManager.rejectAction(userId, req.params.actionId);
     if (!updated) return res.status(404).json({ error: 'Pending Android action not found.' });
     ws.engine.logActivity(
       'TRADE',
@@ -2104,7 +2477,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
           }
           userId = deviceAuth.userId;
           deviceId = deviceAuth.device.id;
-          engine = getEngineForUser(userId);
+          engine = await ensureEngineHydrated(userId);
           activityUid = userId === 'local-preview' ? undefined : userId;
         } else {
           const ws = await resolveWorkspace(req, res, true);
@@ -2202,14 +2575,17 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
             screenAnalysisId: analysisRecord.id,
           });
           const stake = engine.calculateRecommendedStake(analysisRecord.confidenceScore);
-          queuedAction = androidManager.queueActionFromScreen({
+          await brokerManager.ensureHydrated(userId);
+          const verifiedSession = brokerManager.resolveVerifiedBrokerSession(userId, analysisRecord.appName);
+          queuedAction = await androidManager.queueActionFromScreen({
             userId,
             deviceId,
             analysis: analysisRecord,
             operatingMode: engine.mode,
             stakeOrVolume: stake,
-            expirySeconds: integrated.signal.suggestedExpirySeconds || engine.aiSettings.expirySeconds,
+            expirySeconds: engine.resolveEffectiveExpirySeconds(integrated.signal),
             riskStatus: engine.getRiskStatus(),
+            verifiedBrokerSession: verifiedSession,
           });
         }
 
@@ -2250,7 +2626,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         mediaProjection: parsed.data.mediaProjection,
         accessibility: parsed.data.accessibility,
       });
-      const engine = getEngineForUser(auth.userId);
+      const engine = await ensureEngineHydrated(auth.userId);
       return res.json({
         device: updated,
         operatingMode: engine.mode,
@@ -2266,9 +2642,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     try {
       const auth = await androidManager.authenticateDeviceToken(req.headers.authorization);
       if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
-      const engine = getEngineForUser(auth.userId);
+      const engine = await ensureEngineHydrated(auth.userId);
       await androidManager.recordDeviceHeartbeat(auth.userId, auth.device.id);
-      const actions = androidManager.pollAuthorizedActionsForDevice(
+      const actions = await androidManager.pollAuthorizedActionsForDevice(
         auth.userId,
         auth.device.id,
         engine.riskSettings.emergencyStop
@@ -2301,8 +2677,8 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         parsed.data.outcome,
         parsed.data.note
       );
-      if (!updated) return res.status(404).json({ error: 'Queued Android action not found.' });
-      const engine = getEngineForUser(auth.userId);
+      if (!updated) return res.status(404).json({ error: 'Queued Android action not found or invalid transition.' });
+      const engine = await ensureEngineHydrated(auth.userId);
       engine.logActivity(
         'TRADE',
         'ANDROID_ACTION_ACK',
@@ -2322,12 +2698,12 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       const schema = z.object({ engaged: z.boolean().default(true) });
       const parsed = schema.safeParse(req.body ?? {});
       if (!parsed.success) return res.status(400).json({ error: 'Provide engaged: boolean.' });
-      const engine = getEngineForUser(auth.userId);
+      const engine = await ensureEngineHydrated(auth.userId);
       const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
       const status = engine.setEmergencyStop(parsed.data.engaged, actUid);
       if (parsed.data.engaged) {
         await brokerManager.setAutoBrokerExecutionEnabled(auth.userId, false, true);
-        androidManager.blockAllPendingOnEmergencyStop(auth.userId);
+        await androidManager.blockAllPendingOnEmergencyStop(auth.userId);
       }
       await engine.syncSettingsToSupabase(actUid);
       return res.json({
@@ -2346,7 +2722,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       if (!auth) return res.status(401).json({ error: 'Invalid or revoked Android device token.' });
       const revoked = await androidManager.revokeDevice(auth.userId, auth.device.id);
       if (!revoked) return res.status(404).json({ error: 'Paired Android device not found.' });
-      const engine = getEngineForUser(auth.userId);
+      const engine = await ensureEngineHydrated(auth.userId);
       const actUid = auth.userId === 'local-preview' ? undefined : auth.userId;
       engine.logActivity('BROKER', 'ANDROID_DEVICE_DISCONNECTED', `Android companion "${auth.device.deviceName}" disconnected by device user.`, actUid);
       return res.json({ ok: true, revoked: true });
@@ -2390,16 +2766,20 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     engine: defaultEngine,
     stopScheduler,
     getEngineForUser,
+    ensureEngineHydrated,
     restoreEligibleSchedulers,
     recoveryPromise,
     getRecoverySummary: () => recoverySummary,
     schedulerInstanceId,
+    handleHealthRequest,
   };
 }
 
 export function createStandaloneApp(options: CreateServerOptions = {}) {
+  const isProduction = process.env.NODE_ENV === 'production';
   const app = express();
-  app.use(cors({ origin: process.env.WEB_ORIGIN || true }));
+  app.set('trust proxy', 1);
+  app.use(cors({ origin: createCorsOriginHandler(isProduction) }));
   const standardJson = express.json({ limit: '150kb' });
   app.use((req, res, next) => {
     if (req.path === '/api/android/screen/analyze') {
@@ -2409,6 +2789,7 @@ export function createStandaloneApp(options: CreateServerOptions = {}) {
     standardJson(req, res, next);
   });
   const result = createNovaTradeRouter(options);
+  app.get('/health', result.handleHealthRequest);
   app.use('/api', result.router);
   return { app, ...result };
 }

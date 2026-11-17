@@ -2,7 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   analyzeMarketQuant,
+  evaluateTimeframeExpiryCompatibility,
   getHigherTimeframe,
+  isLiveMarketStatus,
   type QuantAnalysisResult,
   type StrategyProfile,
 } from './quantEngine.ts';
@@ -13,6 +15,33 @@ import {
 } from './marketData.ts';
 import { generateGeminiExplanation, type GeminiCommentary } from './geminiAdvisor.ts';
 import { getSupabaseAdmin } from './supabaseAdmin.ts';
+import {
+  PerformanceLearner,
+  type AccountPerformanceBucket,
+  type LearnableTradeRecord,
+  type LearningInsights,
+  type PersistedLearnerState,
+} from './performanceLearner.ts';
+import type { AdaptiveStrategyName } from './quantEngine.ts';
+
+export interface PendingShadowSignal {
+  symbol: string;
+  timeframe: Timeframe;
+  direction: 'CALL' | 'PUT';
+  strategy: AdaptiveStrategyName;
+  entryPrice: number;
+  expiresAtMs: number;
+}
+
+export type DashboardAccountSource = 'paper' | 'mt5' | 'iq_option';
+
+export interface RuntimeRecoveryPayload {
+  pendingShadowSignals: PendingShadowSignal[];
+  assistedProposals: AssistedProposal[];
+  learnerState: PersistedLearnerState;
+  updatedAt: string;
+  selectedDashboardSource?: DashboardAccountSource;
+}
 
 export type OperatingMode = 'signals' | 'assisted' | 'automatic';
 
@@ -23,6 +52,9 @@ export interface RiskSettings {
   maxConsecutiveLosses: number;
   maxDailyTrades: number;
   maxSimultaneousTrades: number;
+  maxTradesPerInstrument?: number;
+  lossCooldownSeconds?: number;
+  minAvailableBalancePct?: number;
   tradingScheduleEnabled: boolean;
   tradingStartHourUtc: number;
   tradingEndHourUtc: number;
@@ -51,7 +83,12 @@ export interface PaperTrade {
   payoutRate: number;
   entryPrice: number | null;
   exitPrice: number | null;
+  stopLoss?: number | null;
+  takeProfit?: number | null;
   expirySeconds: number;
+  requestedExpirySeconds?: number;
+  expiryAdjusted?: boolean;
+  expiryAdjustmentReason?: string | null;
   expiresAt: string | null;
   status:
     | 'SIMULATED_NOT_EXECUTED'
@@ -67,6 +104,9 @@ export interface PaperTrade {
   settledBy: string | null;
   createdAt: string;
   closedAt: string | null;
+  accountBucket?: AccountPerformanceBucket;
+  strategyName?: AdaptiveStrategyName;
+  signalId?: string;
 }
 
 export interface StoredSignal extends QuantAnalysisResult {
@@ -86,10 +126,14 @@ export interface AssistedProposal {
   recommendedAmount: number;
   entryPrice: number | null;
   expirySeconds: number;
+  requestedExpirySeconds?: number;
+  expiryAdjusted?: boolean;
+  expiryAdjustmentReason?: string | null;
   reasons: string[];
   status: 'PENDING_APPROVAL' | 'APPROVED' | 'REJECTED';
   createdAt: string;
   decidedAt: string | null;
+  strategyName?: AdaptiveStrategyName;
   sourceApp?: 'MT5' | 'IQ_OPTION' | 'UNKNOWN';
   screenAnalysisId?: string;
 }
@@ -142,9 +186,11 @@ export class NovaTradeEngine {
   lastScanAt: string | null = null;
   lastCycleSummary: string | null = null;
   startingVirtualBalance = 10000;
+  selectedDashboardSource: DashboardAccountSource = 'paper';
   private schedulerRunning = false;
   private schedulerTimer: ReturnType<typeof setInterval> | null = null;
   onAutonomousSignalTriggered?: (signal: StoredSignal, stake: number) => Promise<void>;
+  getActiveAccountBucket?: () => AccountPerformanceBucket;
 
   riskSettings: RiskSettings = {
     maxTradeAmount: 100,
@@ -153,6 +199,9 @@ export class NovaTradeEngine {
     maxConsecutiveLosses: 3,
     maxDailyTrades: 25,
     maxSimultaneousTrades: 3,
+    maxTradesPerInstrument: 1,
+    lossCooldownSeconds: 180,
+    minAvailableBalancePct: 10,
     tradingScheduleEnabled: false,
     tradingStartHourUtc: 7,
     tradingEndHourUtc: 20,
@@ -161,11 +210,11 @@ export class NovaTradeEngine {
 
   aiSettings: AiSettings = {
     strategyProfile: 'balanced',
-    minSignalScore: 65,
+    minSignalScore: 72,
     requireMtfAlignment: true,
     enabledAssets: ['EURUSD', 'GBPUSD', 'USDJPY', 'EURJPY', 'BTCUSD', 'ETHUSD'],
-    defaultTimeframe: '1m',
-    expirySeconds: 180,
+    defaultTimeframe: '5m',
+    expirySeconds: 900,
     scanIntervalSeconds: 60,
     useGeminiCommentary: true,
   };
@@ -174,22 +223,92 @@ export class NovaTradeEngine {
   signals: StoredSignal[] = [];
   assistedProposals: AssistedProposal[] = [];
   activityLog: ActivityEvent[] = [];
+  readonly learner = new PerformanceLearner();
 
   private consecutiveLosses = 0;
   private simulatedDailyLoss = 0;
   private simulatedDailyProfit = 0;
   private dailyTradesCount = 0;
   private dailyKey = new Date().toISOString().slice(0, 10);
+  private lossCooldownUntilMs = 0;
+  private readonly instrumentCooldownUntilMs = new Map<string, number>();
+  private readonly pendingShadowSignals: PendingShadowSignal[] = [];
+  private externalBrokerTrades: LearnableTradeRecord[] = [];
+  private runtimeRecoveryColumnUnavailable = false;
   private readonly persistPath: string | null;
   readonly ownerUserId?: string;
 
   constructor(
-    persistPath: string | null = path.resolve(process.cwd(), '.novatrade-data/state.json'),
+    persistPath: string | null = process.env.NODE_ENV === 'production'
+      ? null
+      : path.resolve(process.cwd(), '.novatrade-data/state.json'),
     ownerUserId?: string
   ) {
-    this.persistPath = persistPath;
+    this.persistPath = process.env.NODE_ENV === 'production' ? null : persistPath;
     this.ownerUserId = ownerUserId;
     this.loadState();
+  }
+
+  buildRuntimeRecoveryPayload(): RuntimeRecoveryPayload {
+    return {
+      pendingShadowSignals: this.pendingShadowSignals.slice(0, 30).map((s) => ({ ...s })),
+      assistedProposals: this.assistedProposals.slice(0, 60).map((p) => ({ ...p })),
+      learnerState: this.learner.exportState(),
+      selectedDashboardSource: this.selectedDashboardSource,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  exportRuntimeRecoveryPayload(): RuntimeRecoveryPayload {
+    return this.buildRuntimeRecoveryPayload();
+  }
+
+  private applyRuntimeRecoveryPayload(recovery?: Partial<RuntimeRecoveryPayload> | null) {
+    if (!recovery || typeof recovery !== 'object') return;
+    if (
+      recovery.selectedDashboardSource === 'paper' ||
+      recovery.selectedDashboardSource === 'mt5' ||
+      recovery.selectedDashboardSource === 'iq_option'
+    ) {
+      this.selectedDashboardSource = recovery.selectedDashboardSource;
+    }
+    if (recovery.learnerState) {
+      this.learner.restoreState(recovery.learnerState);
+    }
+    if (Array.isArray(recovery.pendingShadowSignals)) {
+      for (const item of recovery.pendingShadowSignals) {
+        if (!item || !item.symbol || !item.strategy || (item.direction !== 'CALL' && item.direction !== 'PUT')) {
+          continue;
+        }
+        const dup = this.pendingShadowSignals.some(
+          (s) => s.symbol === item.symbol && s.timeframe === item.timeframe && s.strategy === item.strategy
+        );
+        if (!dup && this.pendingShadowSignals.length < 30) {
+          this.pendingShadowSignals.push({
+            symbol: String(item.symbol),
+            timeframe: item.timeframe,
+            direction: item.direction,
+            strategy: item.strategy,
+            entryPrice: Number(item.entryPrice),
+            expiresAtMs: Number(item.expiresAtMs),
+          });
+        }
+      }
+    }
+    if (Array.isArray(recovery.assistedProposals)) {
+      const merged = new Map<string, AssistedProposal>();
+      for (const existing of this.assistedProposals) {
+        if (existing?.id) merged.set(existing.id, existing);
+      }
+      for (const incoming of recovery.assistedProposals) {
+        if (incoming?.id && !merged.has(incoming.id)) {
+          merged.set(incoming.id, incoming);
+        }
+      }
+      this.assistedProposals = Array.from(merged.values())
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, 60);
+    }
   }
 
   private loadState() {
@@ -204,8 +323,12 @@ export class NovaTradeEngine {
           riskSettings: RiskSettings;
           aiSettings: AiSettings;
           paperTrades: PaperTrade[];
+          externalBrokerTrades: LearnableTradeRecord[];
           signals: StoredSignal[];
           assistedProposals: AssistedProposal[];
+          pendingShadowSignals: PendingShadowSignal[];
+          selectedDashboardSource: DashboardAccountSource;
+          learnerState: PersistedLearnerState;
           activityLog: ActivityEvent[];
           consecutiveLosses: number;
           simulatedDailyLoss: number;
@@ -214,6 +337,13 @@ export class NovaTradeEngine {
           dailyKey: string;
         }>;
         if (raw.mode) this.mode = raw.mode;
+        if (
+          raw.selectedDashboardSource === 'paper' ||
+          raw.selectedDashboardSource === 'mt5' ||
+          raw.selectedDashboardSource === 'iq_option'
+        ) {
+          this.selectedDashboardSource = raw.selectedDashboardSource;
+        }
         if (typeof raw.autoPaperArmed === 'boolean') this.autoPaperArmed = raw.autoPaperArmed;
         if (raw.autoPausedReason !== undefined) this.autoPausedReason = raw.autoPausedReason;
         if (typeof raw.startingVirtualBalance === 'number' && raw.startingVirtualBalance > 0) {
@@ -222,6 +352,7 @@ export class NovaTradeEngine {
         if (raw.riskSettings) this.riskSettings = { ...this.riskSettings, ...raw.riskSettings };
         if (raw.aiSettings) this.aiSettings = { ...this.aiSettings, ...raw.aiSettings };
         if (Array.isArray(raw.paperTrades)) this.paperTrades = raw.paperTrades;
+        if (Array.isArray(raw.externalBrokerTrades)) this.externalBrokerTrades = raw.externalBrokerTrades;
         if (Array.isArray(raw.signals)) this.signals = raw.signals;
         if (Array.isArray(raw.assistedProposals)) this.assistedProposals = raw.assistedProposals;
         if (Array.isArray(raw.activityLog)) this.activityLog = raw.activityLog;
@@ -230,6 +361,11 @@ export class NovaTradeEngine {
         if (typeof raw.simulatedDailyProfit === 'number') this.simulatedDailyProfit = raw.simulatedDailyProfit;
         if (typeof raw.dailyTradesCount === 'number') this.dailyTradesCount = raw.dailyTradesCount;
         if (raw.dailyKey) this.dailyKey = raw.dailyKey;
+        this.applyRuntimeRecoveryPayload({
+          pendingShadowSignals: raw.pendingShadowSignals,
+          learnerState: raw.learnerState,
+          selectedDashboardSource: raw.selectedDashboardSource,
+        });
       }
     } catch {
       // Ignore corrupt cache
@@ -245,14 +381,18 @@ export class NovaTradeEngine {
         JSON.stringify(
           {
             mode: this.mode,
+            selectedDashboardSource: this.selectedDashboardSource,
             autoPaperArmed: this.autoPaperArmed,
             autoPausedReason: this.autoPausedReason,
             startingVirtualBalance: this.startingVirtualBalance,
             riskSettings: this.riskSettings,
             aiSettings: this.aiSettings,
             paperTrades: this.paperTrades.slice(0, 250),
+            externalBrokerTrades: this.externalBrokerTrades.slice(0, 250),
             signals: this.signals.slice(0, 150),
             assistedProposals: this.assistedProposals.slice(0, 60),
+            pendingShadowSignals: this.pendingShadowSignals.slice(0, 30),
+            learnerState: this.learner.exportState(),
             activityLog: this.activityLog.slice(0, 150),
             consecutiveLosses: this.consecutiveLosses,
             simulatedDailyLoss: this.simulatedDailyLoss,
@@ -307,7 +447,7 @@ export class NovaTradeEngine {
 
   async syncSettingsToSupabase(userId = this.ownerUserId): Promise<boolean> {
     const admin = getSupabaseAdmin();
-    if (!admin || !userId) return false;
+    if (!admin || !userId || userId === 'local-preview') return false;
     const basePayload = {
       user_id: userId,
       preferred_mode: this.mode,
@@ -338,8 +478,21 @@ export class NovaTradeEngine {
       max_daily_trades: this.riskSettings.maxDailyTrades,
     };
 
-    const { error } = await admin.from('user_settings').upsert(fullPayload, { onConflict: 'user_id' });
+    const payloadWithRecovery = this.runtimeRecoveryColumnUnavailable
+      ? fullPayload
+      : {
+          ...fullPayload,
+          runtime_recovery: this.buildRuntimeRecoveryPayload(),
+        };
+
+    const { error } = await admin.from('user_settings').upsert(payloadWithRecovery, { onConflict: 'user_id' });
     if (!error) return true;
+
+    if (error.message.includes('runtime_recovery')) {
+      this.runtimeRecoveryColumnUnavailable = true;
+      const retryFull = await admin.from('user_settings').upsert(fullPayload, { onConflict: 'user_id' });
+      if (!retryFull.error) return true;
+    }
 
     const mentionsV2Column =
       error.message.includes('starting_virtual_balance') || error.message.includes('max_daily_trades');
@@ -349,6 +502,25 @@ export class NovaTradeEngine {
     }
 
     this.logActivity('SETTINGS', 'SUPABASE_SETTINGS_SYNC_FAILED', `Failed to persist settings to Supabase: ${error.message}`, userId);
+    return false;
+  }
+
+  async syncRuntimeRecoveryToSupabase(userId = this.ownerUserId): Promise<boolean> {
+    const admin = getSupabaseAdmin();
+    if (!admin || !userId || userId === 'local-preview' || this.runtimeRecoveryColumnUnavailable) {
+      return false;
+    }
+    const payload = {
+      user_id: userId,
+      runtime_recovery: this.buildRuntimeRecoveryPayload(),
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await admin.from('user_settings').upsert(payload, { onConflict: 'user_id' });
+    if (!error) return true;
+    if (error.message.includes('runtime_recovery') || error.code === 'PGRST204') {
+      this.runtimeRecoveryColumnUnavailable = true;
+      return false;
+    }
     return false;
   }
 
@@ -401,74 +573,144 @@ export class NovaTradeEngine {
         scanIntervalSeconds: Number(s.scan_interval_seconds ?? this.aiSettings.scanIntervalSeconds),
         useGeminiCommentary: s.use_gemini_commentary !== false,
       };
+      if (s.runtime_recovery && typeof s.runtime_recovery === 'object') {
+        this.applyRuntimeRecoveryPayload(s.runtime_recovery as Partial<RuntimeRecoveryPayload>);
+      }
     }
 
     if (Array.isArray(input.tradesRows) && input.tradesRows.length > 0) {
-      this.paperTrades = input.tradesRows.map((row) => ({
-        id: String(row.id),
-        userId: this.ownerUserId,
-        symbol: String(row.symbol),
-        timeframe: (row.timeframe as Timeframe) || '1m',
-        direction: row.direction === 'PUT' ? 'PUT' : 'CALL',
-        mode: (row.mode as OperatingMode | 'manual') || 'manual',
-        amount: Number(row.amount ?? 0),
-        payoutRate: Number(row.payout_rate ?? 0.8),
-        entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
-        exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
-        expirySeconds: Number(row.expiry_seconds ?? 180),
-        expiresAt: row.expires_at ? String(row.expires_at) : null,
-        status: (row.status as PaperTrade['status']) || 'SIMULATED_PENDING_OUTCOME',
-        pnl: row.pnl != null ? Number(row.pnl) : null,
-        signalScore: row.signal_score != null ? Number(row.signal_score) : null,
-        provider: 'supabase-recovery',
-        settledBy: row.settled_by ? String(row.settled_by) : null,
-        createdAt: String(row.created_at),
-        closedAt: row.closed_at ? String(row.closed_at) : null,
-      }));
+      const mergedById = new Map<string, PaperTrade>();
+      for (const existing of this.paperTrades) {
+        if (existing?.id) mergedById.set(existing.id, existing);
+      }
+
+      for (const row of input.tradesRows) {
+        const rawBucket = typeof row.account_bucket === 'string' ? row.account_bucket : undefined;
+        const accountBucket: AccountPerformanceBucket =
+          rawBucket === 'MT5_DEMO' ||
+          rawBucket === 'MT5_REAL' ||
+          rawBucket === 'IQ_OPTION_DEMO' ||
+          rawBucket === 'IQ_OPTION_REAL' ||
+          rawBucket === 'PAPER_SIMULATOR'
+            ? rawBucket
+            : 'PAPER_SIMULATOR';
+        const rawStrategy = typeof row.strategy_name === 'string' ? row.strategy_name : undefined;
+        const strategyName: AdaptiveStrategyName | undefined =
+          rawStrategy === 'TREND_CONTINUATION' ||
+          rawStrategy === 'RANGE_MEAN_REVERSION' ||
+          rawStrategy === 'STRUCTURE_REVERSAL' ||
+          rawStrategy === 'VOLATILITY_BREAKOUT' ||
+          rawStrategy === 'CAPITAL_PROTECTION'
+            ? rawStrategy
+            : undefined;
+        const mapped: PaperTrade = {
+          id: String(row.id),
+          userId: this.ownerUserId,
+          symbol: String(row.symbol),
+          timeframe: (row.timeframe as Timeframe) || '1m',
+          direction: row.direction === 'PUT' ? 'PUT' : 'CALL',
+          mode: (row.mode as OperatingMode | 'manual') || 'manual',
+          amount: Number(row.amount ?? 0),
+          payoutRate: Number(row.payout_rate ?? 0.8),
+          entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
+          exitPrice: row.exit_price != null ? Number(row.exit_price) : null,
+          stopLoss: row.stop_loss != null ? Number(row.stop_loss) : null,
+          takeProfit: row.take_profit != null ? Number(row.take_profit) : null,
+          expirySeconds: Number(row.expiry_seconds ?? 180),
+          expiresAt: row.expires_at ? String(row.expires_at) : null,
+          status: (row.status as PaperTrade['status']) || 'SIMULATED_PENDING_OUTCOME',
+          pnl: row.pnl != null ? Number(row.pnl) : null,
+          signalScore: row.signal_score != null ? Number(row.signal_score) : null,
+          provider: 'supabase-recovery',
+          settledBy: row.settled_by ? String(row.settled_by) : null,
+          createdAt: String(row.created_at),
+          closedAt: row.closed_at ? String(row.closed_at) : null,
+          accountBucket,
+          strategyName,
+        };
+
+        const existing = mergedById.get(mapped.id);
+        if (!existing) {
+          mergedById.set(mapped.id, mapped);
+        } else {
+          const existingPending = existing.status === 'SIMULATED_PENDING_OUTCOME';
+          const mappedSettled = mapped.status !== 'SIMULATED_PENDING_OUTCOME';
+          mergedById.set(mapped.id, {
+            ...mapped,
+            ...existing,
+            accountBucket: existing.accountBucket ?? mapped.accountBucket,
+            strategyName: existing.strategyName ?? mapped.strategyName,
+            status: existingPending && mappedSettled ? mapped.status : existing.status,
+            exitPrice: existing.exitPrice ?? mapped.exitPrice,
+            pnl: existing.pnl ?? mapped.pnl,
+            closedAt: existing.closedAt ?? mapped.closedAt,
+            settledBy: existing.settledBy ?? mapped.settledBy,
+          });
+        }
+      }
+
+      this.paperTrades = Array.from(mergedById.values())
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .slice(0, 250);
       this.recalculateDailyCountersFromTrades();
     }
 
+    if (this.paperTrades.length > 0 || this.externalBrokerTrades.length > 0) {
+      this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
+    }
+
     if (Array.isArray(input.signalsRows) && input.signalsRows.length > 0 && this.signals.length === 0) {
-      this.signals = input.signalsRows.map((row) => ({
-        id: String(row.id),
-        symbol: String(row.symbol),
-        timeframe: (row.timeframe as Timeframe) || '1m',
-        direction: row.direction === 'CALL' || row.direction === 'PUT' ? row.direction : 'WAIT',
-        score: Number(row.score ?? 0),
-        confidenceScore: Number(row.score ?? 0),
-        bullishScore: Number(row.score ?? 0),
-        bearishScore: 0,
-        entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
-        suggestedExpirySeconds: Number(row.suggested_expiry_seconds ?? 180),
-        provider: String(row.data_source || 'supabase-recovery'),
-        marketStatus: 'OPEN',
-        isStale: false,
-        timestamp: String(row.created_at),
-        indicators: (row.indicators as QuantAnalysisResult['indicators']) || null,
-        supportingIndicators: null,
-        riskAssessment: (row.risk_assessment as QuantAnalysisResult['riskAssessment']) || {
-          level: 'MODERATE',
-          volatilityRegime: 'UNKNOWN',
-          atrPct: null,
-          suggestedStakePct: 1,
-          summary: 'Restored from Supabase.',
-        },
-        mtf: null,
-        backtest: {
-          sampleSize: Number(row.confidence_sample_size ?? 0),
-          wins: 0,
-          losses: 0,
-          winRatePct: row.confidence_win_rate != null ? Number(row.confidence_win_rate) : null,
-          expectancyPerUnit: null,
-          horizonBars: 3,
-          note: 'Restored from Supabase archive.',
-        },
-        reasons: Array.isArray(row.reasons) ? (row.reasons as string[]) : [],
-        warning: 'Restored from Supabase archive.',
-        aiExplanation: row.ai_explanation
-          ? { available: true, model: 'gemini-2.5-flash', summary: String(row.ai_explanation), riskNote: null }
-          : null,
-      }));
+      this.signals = input.signalsRows.map((row) => {
+        const storedScore = Number(row.score ?? 0);
+        const dir: 'CALL' | 'PUT' | 'WAIT' = row.direction === 'CALL' || row.direction === 'PUT' ? row.direction : 'WAIT';
+        return {
+          id: String(row.id),
+          symbol: String(row.symbol),
+          timeframe: (row.timeframe as Timeframe) || '1m',
+          direction: dir,
+          score: storedScore,
+          confidenceScore: storedScore,
+          rawDirectionalConfidence: storedScore,
+          actionableConfidence: storedScore,
+          confidenceState: dir === 'WAIT' ? 'WEAK_SETUP_WAIT' : 'STRONG_SETUP_ACTIONABLE',
+          zeroConfidenceReason:
+            storedScore === 0
+              ? 'Archived signal recorded 0/100 before confidence pipeline update; run a fresh analysis for live indicator confidence.'
+              : null,
+          bullishScore: dir === 'PUT' ? 0 : storedScore,
+          bearishScore: dir === 'PUT' ? storedScore : 0,
+          entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
+          suggestedExpirySeconds: Number(row.suggested_expiry_seconds ?? 180),
+          provider: String(row.data_source || 'supabase-recovery'),
+          marketStatus: 'LIVE',
+          isStale: false,
+          timestamp: String(row.created_at),
+          indicators: (row.indicators as QuantAnalysisResult['indicators']) || null,
+          supportingIndicators: null,
+          riskAssessment: (row.risk_assessment as QuantAnalysisResult['riskAssessment']) || {
+            level: 'MODERATE',
+            volatilityRegime: 'UNKNOWN',
+            atrPct: null,
+            suggestedStakePct: 1,
+            summary: 'Restored from Supabase.',
+          },
+          mtf: null,
+          backtest: {
+            sampleSize: Number(row.confidence_sample_size ?? 0),
+            wins: 0,
+            losses: 0,
+            winRatePct: row.confidence_win_rate != null ? Number(row.confidence_win_rate) : null,
+            expectancyPerUnit: null,
+            horizonBars: 3,
+            note: 'Restored from Supabase archive.',
+          },
+          reasons: Array.isArray(row.reasons) ? (row.reasons as string[]) : [],
+          warning: 'Restored from Supabase archive.',
+          aiExplanation: row.ai_explanation
+            ? { available: true, model: 'gemini-2.5-flash', summary: String(row.ai_explanation), riskNote: null }
+            : null,
+        };
+      });
     }
 
     // CRITICAL SAFETY: Never resume automatic trading when emergency stop is active
@@ -518,6 +760,9 @@ export class NovaTradeEngine {
       }
     }
 
+    if (s && s.auto_paper_armed === false) {
+      this.autoPaperArmed = false;
+    }
     this.saveState();
     return { status: 'idle' };
   }
@@ -531,6 +776,9 @@ export class NovaTradeEngine {
   }
 
   getVirtualBalanceSummary() {
+    const pendingTrades = this.paperTrades.filter((t) => t.status === 'SIMULATED_PENDING_OUTCOME');
+    const reservedBalance = pendingTrades.reduce((acc, t) => acc + t.amount, 0);
+
     const settled = this.paperTrades.filter(
       (t) =>
         t.status === 'SIMULATED_WIN' ||
@@ -538,15 +786,20 @@ export class NovaTradeEngine {
         t.status === 'CLOSED_WIN' ||
         t.status === 'CLOSED_LOSS'
     );
-    const totalPnl = settled.reduce((acc, t) => {
+    const settledPnl = settled.reduce((acc, t) => {
       const p = t.pnl ?? (t.status.includes('WIN') ? t.amount * t.payoutRate : -t.amount);
       return acc + p;
     }, 0);
-    const currentBalance = Number((this.startingVirtualBalance + totalPnl).toFixed(2));
+
+    const totalEquity = Number((this.startingVirtualBalance + settledPnl).toFixed(2));
+    const currentBalance = Number((totalEquity - reservedBalance).toFixed(2));
+
     return {
       startingBalance: this.startingVirtualBalance,
       currentBalance,
-      totalNetPnl: Number(totalPnl.toFixed(2)),
+      reservedBalance: Number(reservedBalance.toFixed(2)),
+      totalEquity,
+      totalNetPnl: Number(settledPnl.toFixed(2)),
     };
   }
 
@@ -625,6 +878,10 @@ export class NovaTradeEngine {
     if (activeTradesCount >= this.riskSettings.maxSimultaneousTrades) {
       reasons.push(`Maximum simultaneous trades (${this.riskSettings.maxSimultaneousTrades}) reached.`);
     }
+    if (this.lossCooldownUntilMs > Date.now()) {
+      const remainingSec = Math.ceil((this.lossCooldownUntilMs - Date.now()) / 1000);
+      reasons.push(`Post-loss cooldown active (${remainingSec}s remaining after repeated losses).`);
+    }
 
     return {
       allowed: reasons.length === 0,
@@ -653,12 +910,45 @@ export class NovaTradeEngine {
     return Math.max(1, Math.round(raw * 100) / 100);
   }
 
+  private async mapWithConcurrency<T, R>(
+    items: T[],
+    concurrency: number,
+    fn: (item: T) => Promise<R>
+  ): Promise<R[]> {
+    const limit = Math.max(1, concurrency);
+    const results = new Array<R>(items.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < items.length) {
+        const idx = cursor++;
+        results[idx] = await fn(items[idx]);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+    return results;
+  }
+
+  resolveEffectiveExpirySeconds(analysis: QuantAnalysisResult): number {
+    if (typeof analysis.effectiveExpirySeconds === 'number' && analysis.effectiveExpirySeconds > 0) {
+      return analysis.effectiveExpirySeconds;
+    }
+    const compat = analysis.timeframeExpiryCompatibility;
+    if (compat) {
+      return compat.compatible
+        ? compat.requestedExpirySeconds || this.aiSettings.expirySeconds
+        : compat.recommendedExpirySeconds;
+    }
+    return this.aiSettings.expirySeconds || analysis.suggestedExpirySeconds;
+  }
+
   async analyseAsset(
     symbol: string,
     timeframe: Timeframe = this.aiSettings.defaultTimeframe,
     includeGemini = this.aiSettings.useGeminiCommentary,
-    userId: string | undefined = this.ownerUserId
+    userId: string | undefined = this.ownerUserId,
+    options?: { skipLearnerRecompute?: boolean; requestedExpirySeconds?: number }
   ): Promise<{ analysis: StoredSignal; marketError?: string }> {
+    const requestedExpiry = options?.requestedExpirySeconds ?? this.aiSettings.expirySeconds;
     const primary = await fetchMarketCandles(symbol, timeframe, 160);
     if (!primary.ok) {
       const fallback = analyzeMarketQuant(symbol, timeframe, [], primary.provider, {
@@ -667,6 +957,7 @@ export class NovaTradeEngine {
         strategyProfile: this.aiSettings.strategyProfile,
         marketStatus: primary.marketStatus,
         isStale: true,
+        requestedExpirySeconds: requestedExpiry,
       });
       const stored: StoredSignal = {
         ...fallback,
@@ -678,6 +969,10 @@ export class NovaTradeEngine {
 
     const higherTf = getHigherTimeframe(timeframe);
     const htfResult = await fetchMarketCandles(symbol, higherTf, 100);
+    if (!options?.skipLearnerRecompute) {
+      this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
+    }
+    const historicalBias = this.learner.getBiasForSetup(symbol, timeframe);
 
     const quant = analyzeMarketQuant(symbol, timeframe, primary.candles, primary.provider, {
       minScore: this.aiSettings.minSignalScore,
@@ -686,6 +981,8 @@ export class NovaTradeEngine {
       marketStatus: primary.marketStatus,
       isStale: primary.isStale,
       higherTimeframeCandles: htfResult.ok ? { timeframe: higherTf, candles: htfResult.candles } : null,
+      historicalBias,
+      requestedExpirySeconds: requestedExpiry,
     });
 
     const aiExplanation = includeGemini ? await generateGeminiExplanation(quant) : null;
@@ -728,9 +1025,14 @@ export class NovaTradeEngine {
     return { analysis: stored };
   }
 
-  async scanSingleAsset(symbol: string, timeframe: Timeframe = this.aiSettings.defaultTimeframe, userId: string | undefined = this.ownerUserId) {
+  async scanSingleAsset(
+    symbol: string,
+    timeframe: Timeframe = this.aiSettings.defaultTimeframe,
+    userId: string | undefined = this.ownerUserId,
+    options?: { skipLearnerRecompute?: boolean }
+  ) {
     const assetMeta = SUPPORTED_ASSETS.find((a) => a.symbol === symbol);
-    const { analysis, marketError } = await this.analyseAsset(symbol, timeframe, false, userId);
+    const { analysis, marketError } = await this.analyseAsset(symbol, timeframe, false, userId, options);
     this.lastScanAt = new Date().toISOString();
     this.saveState();
     return {
@@ -741,7 +1043,15 @@ export class NovaTradeEngine {
       timeframe: analysis.timeframe,
       direction: analysis.direction,
       score: analysis.score,
+      rawDirectionalConfidence: analysis.rawDirectionalConfidence ?? analysis.score,
+      actionableConfidence: analysis.actionableConfidence ?? analysis.score,
+      confidenceState: analysis.confidenceState,
+      zeroConfidenceReason: analysis.zeroConfidenceReason ?? null,
       suggestedExpirySeconds: analysis.suggestedExpirySeconds,
+      requestedExpirySeconds: analysis.requestedExpirySeconds ?? this.aiSettings.expirySeconds,
+      effectiveExpirySeconds: this.resolveEffectiveExpirySeconds(analysis),
+      expiryAdjusted: analysis.expiryAdjusted ?? false,
+      expiryAdjustmentReason: analysis.expiryAdjustmentReason ?? null,
       entryPrice: analysis.entryPrice,
       provider: analysis.provider,
       marketStatus: analysis.marketStatus,
@@ -753,6 +1063,9 @@ export class NovaTradeEngine {
       backtestWinRate: analysis.backtest.winRatePct,
       backtestSampleSize: analysis.backtest.sampleSize,
       riskLevel: analysis.riskAssessment.level,
+      marketRegime: analysis.marketRegime ?? null,
+      activeStrategy: analysis.activeStrategy ?? null,
+      timeframeExpiryCompatibility: analysis.timeframeExpiryCompatibility ?? null,
       reasons: analysis.reasons,
       error: marketError || null,
       timestamp: analysis.timestamp,
@@ -761,7 +1074,10 @@ export class NovaTradeEngine {
 
   async scanMarkets(symbols?: string[], timeframe: Timeframe = this.aiSettings.defaultTimeframe) {
     const targetSymbols = (symbols && symbols.length > 0 ? symbols : this.aiSettings.enabledAssets).slice(0, 14);
-    const results = await Promise.all(targetSymbols.map((sym) => this.scanSingleAsset(sym, timeframe, this.ownerUserId)));
+    this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
+    const results = await this.mapWithConcurrency(targetSymbols, 4, (sym) =>
+      this.scanSingleAsset(sym, timeframe, this.ownerUserId, { skipLearnerRecompute: true })
+    );
     this.lastScanAt = new Date().toISOString();
     this.saveState();
     return results;
@@ -771,7 +1087,7 @@ export class NovaTradeEngine {
     analysis: StoredSignal,
     meta?: { sourceApp?: 'MT5' | 'IQ_OPTION' | 'UNKNOWN'; screenAnalysisId?: string }
   ): AssistedProposal | null {
-    if (analysis.direction === 'WAIT' || analysis.isStale || analysis.marketStatus !== 'OPEN') return null;
+    if (analysis.direction === 'WAIT' || analysis.isStale || !isLiveMarketStatus(analysis.marketStatus)) return null;
     const recommendedAmount = this.calculateRecommendedStake(analysis.score);
     const proposal: AssistedProposal = {
       id: crypto.randomUUID(),
@@ -781,11 +1097,15 @@ export class NovaTradeEngine {
       score: analysis.score,
       recommendedAmount,
       entryPrice: analysis.entryPrice,
-      expirySeconds: analysis.suggestedExpirySeconds || this.aiSettings.expirySeconds,
+      expirySeconds: this.resolveEffectiveExpirySeconds(analysis),
+      requestedExpirySeconds: analysis.requestedExpirySeconds ?? this.aiSettings.expirySeconds,
+      expiryAdjusted: analysis.expiryAdjusted ?? false,
+      expiryAdjustmentReason: analysis.expiryAdjustmentReason ?? null,
       reasons: analysis.reasons,
       status: 'PENDING_APPROVAL',
       createdAt: new Date().toISOString(),
       decidedAt: null,
+      ...(analysis.activeStrategy ? { strategyName: analysis.activeStrategy } : {}),
       ...(meta?.sourceApp ? { sourceApp: meta.sourceApp } : analysis.sourceApp ? { sourceApp: analysis.sourceApp } : {}),
       ...(meta?.screenAnalysisId
         ? { screenAnalysisId: meta.screenAnalysisId }
@@ -802,6 +1122,7 @@ export class NovaTradeEngine {
       this.ownerUserId
     );
     this.saveState();
+    void this.syncRuntimeRecoveryToSupabase();
     return proposal;
   }
 
@@ -833,6 +1154,8 @@ export class NovaTradeEngine {
         quantMatched = true;
         const higherTf = getHigherTimeframe(tf);
         const htfResult = await fetchMarketCandles(candidateSymbol, higherTf, 100);
+        this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
+        const historicalBias = this.learner.getBiasForSetup(candidateSymbol, tf);
         const quant = analyzeMarketQuant(candidateSymbol, tf, primary.candles, primary.provider, {
           minScore: this.aiSettings.minSignalScore,
           requireMtfAlignment: this.aiSettings.requireMtfAlignment,
@@ -840,6 +1163,8 @@ export class NovaTradeEngine {
           marketStatus: primary.marketStatus,
           isStale: primary.isStale,
           higherTimeframeCandles: htfResult.ok ? { timeframe: higherTf, candles: htfResult.candles } : null,
+          historicalBias,
+          requestedExpirySeconds: this.aiSettings.expirySeconds,
         });
 
         let fusedDirection: 'CALL' | 'PUT' | 'WAIT' = quant.direction;
@@ -867,6 +1192,12 @@ export class NovaTradeEngine {
           direction: fusedDirection,
           score: fusedScore,
           confidenceScore: fusedScore,
+          actionableConfidence: quant.isStale ? 0 : fusedScore,
+          confidenceState: quant.isStale
+            ? 'STALE_OR_UNAVAILABLE'
+            : fusedDirection === 'WAIT'
+              ? 'WEAK_SETUP_WAIT'
+              : 'STRONG_SETUP_ACTIONABLE',
           sourceApp: input.appName,
           accountModeDetected: input.accountMode,
           aiExplanation: {
@@ -932,6 +1263,7 @@ export class NovaTradeEngine {
     model: string;
   }): StoredSignal {
     const score = Math.max(0, Math.min(100, input.visualConfidence));
+    const compat = evaluateTimeframeExpiryCompatibility(input.timeframe, this.aiSettings.expirySeconds);
     return {
       id: crypto.randomUUID(),
       symbol: input.symbol,
@@ -945,7 +1277,12 @@ export class NovaTradeEngine {
       bullishScore: input.visualBias === 'CALL' ? score : 0,
       bearishScore: input.visualBias === 'PUT' ? score : 0,
       entryPrice: input.detectedPrice,
-      suggestedExpirySeconds: this.aiSettings.expirySeconds,
+      suggestedExpirySeconds: compat.recommendedExpirySeconds,
+      requestedExpirySeconds: this.aiSettings.expirySeconds,
+      effectiveExpirySeconds: compat.compatible ? this.aiSettings.expirySeconds : compat.recommendedExpirySeconds,
+      expiryAdjusted: !compat.compatible,
+      expiryAdjustmentReason: !compat.compatible ? compat.note : null,
+      timeframeExpiryCompatibility: compat,
       provider: `android-vision-${input.appName.toLowerCase()}`,
       marketStatus: 'OPEN',
       isStale: false,
@@ -989,11 +1326,18 @@ export class NovaTradeEngine {
     amount: number;
     mode: OperatingMode | 'manual';
     entryPrice?: number | null;
+    atr?: number | null;
     expirySeconds?: number;
+    requestedExpirySeconds?: number;
+    expiryAdjusted?: boolean;
+    expiryAdjustmentReason?: string | null;
     signalScore?: number | null;
     provider?: string;
     pendingOutcome?: boolean;
     userId?: string;
+    accountBucket?: AccountPerformanceBucket;
+    strategyName?: AdaptiveStrategyName;
+    signalId?: string;
   }): { ok: boolean; trade?: PaperTrade; error?: string; risk?: RiskStatus } {
     const risk = this.getRiskStatus();
     if (!risk.allowed) {
@@ -1014,10 +1358,81 @@ export class NovaTradeEngine {
         risk,
       };
     }
+    const balanceSummary = this.getVirtualBalanceSummary();
+    if (input.amount > balanceSummary.currentBalance) {
+      return {
+        ok: false,
+        error: `Insufficient available virtual balance ($${balanceSummary.currentBalance.toFixed(2)}) for stake ($${input.amount}).`,
+        risk,
+      };
+    }
+
+    // Instrument-specific exposure limit & minimum reserve protection for autonomous execution
+    const maxPerInst = Math.max(1, this.riskSettings.maxTradesPerInstrument ?? 1);
+    const activeOnSymbol = this.getActiveTrades().filter((t) => t.symbol === input.symbol).length;
+    if (input.mode === 'automatic' && activeOnSymbol >= maxPerInst) {
+      return {
+        ok: false,
+        error: `Instrument exposure limit reached for ${input.symbol} (max ${maxPerInst} simultaneous trade).`,
+        risk,
+      };
+    }
+    const symCooldownUntil = this.instrumentCooldownUntilMs.get(input.symbol) || 0;
+    if (input.mode === 'automatic' && symCooldownUntil > Date.now()) {
+      const rem = Math.ceil((symCooldownUntil - Date.now()) / 1000);
+      return {
+        ok: false,
+        error: `Instrument cooldown active for ${input.symbol} (${rem}s remaining after repeated losses).`,
+        risk,
+      };
+    }
+    if (input.mode === 'automatic') {
+      const minReservePct = Math.max(0, Math.min(50, this.riskSettings.minAvailableBalancePct ?? 10));
+      const minReserveFloor = Number(((this.startingVirtualBalance * minReservePct) / 100).toFixed(2));
+      if (balanceSummary.currentBalance - input.amount < minReserveFloor) {
+        return {
+          ok: false,
+          error: `Minimum balance reserve ($${minReserveFloor.toFixed(2)}, ${minReservePct}%) would be breached by stake ($${input.amount}).`,
+          risk,
+        };
+      }
+      const recentDuplicate = this.paperTrades.find(
+        (t) =>
+          t.symbol === input.symbol &&
+          t.direction === input.direction &&
+          t.status !== 'CANCELLED' &&
+          Date.now() - new Date(t.createdAt).getTime() < 10_000
+      );
+      if (recentDuplicate) {
+        return {
+          ok: false,
+          error: `Duplicate-order protection: ${input.direction} ${input.symbol} was already opened within the last 10 seconds.`,
+          risk,
+        };
+      }
+    }
 
     const expirySeconds = input.expirySeconds ?? this.aiSettings.expirySeconds;
     const now = Date.now();
     const pending = input.pendingOutcome ?? true;
+    const entry = input.entryPrice ?? null;
+
+    let stopLoss: number | null = null;
+    let takeProfit: number | null = null;
+    if (entry != null && entry > 0) {
+      // ATR-aware SL/TP when ATR is supplied (clamped safely to 0.15%..1.5% of price); preserves 0.5% fallback
+      const rawDelta = input.atr != null && input.atr > 0 ? input.atr * 1.5 : entry * 0.005;
+      const delta = Math.max(entry * 0.0015, Math.min(entry * 0.015, rawDelta));
+      const tpDelta = delta * 1.6;
+      const decimals = entry > 100 ? 2 : 5;
+      if (input.direction === 'CALL') {
+        stopLoss = Number((entry - delta).toFixed(decimals));
+        takeProfit = Number((entry + tpDelta).toFixed(decimals));
+      } else {
+        stopLoss = Number((entry + delta).toFixed(decimals));
+        takeProfit = Number((entry - tpDelta).toFixed(decimals));
+      }
+    }
 
     const trade: PaperTrade = {
       id: crypto.randomUUID(),
@@ -1028,9 +1443,14 @@ export class NovaTradeEngine {
       mode: input.mode,
       amount: Number(input.amount.toFixed(2)),
       payoutRate: 0.8,
-      entryPrice: input.entryPrice ?? null,
+      entryPrice: entry,
       exitPrice: null,
+      stopLoss,
+      takeProfit,
       expirySeconds,
+      requestedExpirySeconds: input.requestedExpirySeconds ?? expirySeconds,
+      expiryAdjusted: input.expiryAdjusted ?? false,
+      expiryAdjustmentReason: input.expiryAdjustmentReason ?? null,
       expiresAt: pending ? new Date(now + expirySeconds * 1000).toISOString() : null,
       status: pending ? 'SIMULATED_PENDING_OUTCOME' : 'SIMULATED_NOT_EXECUTED',
       pnl: null,
@@ -1039,6 +1459,9 @@ export class NovaTradeEngine {
       settledBy: null,
       createdAt: new Date(now).toISOString(),
       closedAt: null,
+      accountBucket: input.accountBucket ?? this.getActiveAccountBucket?.() ?? 'PAPER_SIMULATOR',
+      strategyName: input.strategyName,
+      signalId: input.signalId,
     };
 
     this.dailyTradesCount += 1;
@@ -1047,36 +1470,54 @@ export class NovaTradeEngine {
     this.logActivity(
       'TRADE',
       'PAPER_TRADE_OPENED',
-      `Paper trade ${trade.direction} ${trade.symbol} (stake ${trade.amount}, mode=${trade.mode}, entry=${trade.entryPrice ?? 'N/A'}).`,
+      `Paper trade ${trade.direction} ${trade.symbol} (stake ${trade.amount}, mode=${trade.mode}, bucket=${trade.accountBucket}, entry=${trade.entryPrice ?? 'N/A'}, SL=${stopLoss ?? 'N/A'}, TP=${takeProfit ?? 'N/A'}).`,
       input.userId
     );
     this.saveState();
 
     const admin = getSupabaseAdmin();
     if (admin && input.userId) {
+      const baseInsert = {
+        id: trade.id,
+        user_id: input.userId,
+        symbol: trade.symbol,
+        timeframe: trade.timeframe,
+        direction: trade.direction,
+        mode: trade.mode,
+        amount: trade.amount,
+        payout_rate: trade.payoutRate,
+        entry_price: trade.entryPrice,
+        stop_loss: trade.stopLoss,
+        take_profit: trade.takeProfit,
+        expiry_seconds: trade.expirySeconds,
+        expires_at: trade.expiresAt,
+        status: trade.status,
+        signal_score: trade.signalScore,
+        created_at: trade.createdAt,
+      };
+      const fullInsert = {
+        ...baseInsert,
+        account_bucket: trade.accountBucket ?? 'PAPER_SIMULATOR',
+        strategy_name: trade.strategyName ?? null,
+      };
       void admin
         .from('paper_trades')
-        .insert({
-          id: trade.id,
-          user_id: input.userId,
-          symbol: trade.symbol,
-          timeframe: trade.timeframe,
-          direction: trade.direction,
-          mode: trade.mode,
-          amount: trade.amount,
-          payout_rate: trade.payoutRate,
-          entry_price: trade.entryPrice,
-          expiry_seconds: trade.expirySeconds,
-          expires_at: trade.expiresAt,
-          status: trade.status,
-          signal_score: trade.signalScore,
-          created_at: trade.createdAt,
-        })
+        .insert(fullInsert)
         .then(
-          ({ error }) => {
-            if (error) {
-              this.logActivity('TRADE', 'SUPABASE_TRADE_SYNC_FAILED', `Paper trade Supabase insert warning: ${error.message}`, input.userId);
+          async ({ error }) => {
+            if (!error) return;
+            const missingV3Col =
+              error.message.includes('account_bucket') || error.message.includes('strategy_name');
+            if (missingV3Col) {
+              const retry = await admin.from('paper_trades').insert(baseInsert);
+              if (!retry.error) return;
             }
+            this.logActivity(
+              'TRADE',
+              'SUPABASE_TRADE_SYNC_FAILED',
+              `Paper trade Supabase insert warning: ${error.message}`,
+              input.userId
+            );
           },
           () => undefined
         );
@@ -1117,17 +1558,37 @@ export class NovaTradeEngine {
     if (outcome === 'win') {
       this.simulatedDailyProfit += pnl;
       this.consecutiveLosses = 0;
+      this.lossCooldownUntilMs = 0;
+      this.instrumentCooldownUntilMs.delete(trade.symbol);
     } else {
       this.simulatedDailyLoss += pnl;
       this.consecutiveLosses += 1;
+      const baseCooldownSec = Math.max(0, this.riskSettings.lossCooldownSeconds ?? 180);
+      if (this.consecutiveLosses >= 2 && baseCooldownSec > 0 && trade.mode === 'automatic') {
+        this.lossCooldownUntilMs = Date.now() + baseCooldownSec * 1000 * (this.consecutiveLosses - 1);
+      }
+      // Track symbol-specific consecutive losses for per-instrument cooldown
+      const recentSymTrades = this.paperTrades
+        .filter((t) => t.symbol === trade.symbol && (t.status.includes('WIN') || t.status.includes('LOSS')))
+        .slice(0, 2);
+      if (recentSymTrades.length >= 2 && recentSymTrades.every((t) => t.status.includes('LOSS')) && baseCooldownSec > 0) {
+        this.instrumentCooldownUntilMs.set(trade.symbol, Date.now() + Math.max(baseCooldownSec * 2, 300) * 1000);
+      }
     }
+
+    this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
 
     const risk = this.getRiskStatus();
     if (!risk.allowed && this.autoPaperArmed) {
-      this.autoPaperArmed = false;
-      this.autoPausedReason = risk.reasons.join(' ');
-      this.logActivity('RISK', 'AUTO_PAUSED', `Automatic paper trading paused: ${this.autoPausedReason}`, trade.userId);
-      void this.syncSettingsToSupabase(trade.userId ?? this.ownerUserId);
+      const isTemporaryGuard = risk.reasons.every(
+        (r) => r.includes('simultaneous trades') || r.includes('max open') || r.includes('cooldown')
+      );
+      if (!isTemporaryGuard) {
+        this.autoPaperArmed = false;
+        this.autoPausedReason = risk.reasons.join(' ');
+        this.logActivity('RISK', 'AUTO_PAUSED', `Automatic paper trading paused: ${this.autoPausedReason}`, trade.userId);
+        void this.syncSettingsToSupabase(trade.userId ?? this.ownerUserId);
+      }
     }
 
     this.logActivity(
@@ -1137,6 +1598,7 @@ export class NovaTradeEngine {
       trade.userId
     );
     this.saveState();
+    void this.syncRuntimeRecoveryToSupabase(trade.userId ?? this.ownerUserId);
 
     const admin = getSupabaseAdmin();
     if (admin && trade.userId) {
@@ -1185,6 +1647,21 @@ export class NovaTradeEngine {
     trade.closedAt = new Date().toISOString();
     this.logActivity('TRADE', 'PAPER_TRADE_CANCELLED', `Cancelled paper trade ${trade.symbol} (${trade.id.slice(0, 8)}).`, trade.userId);
     this.saveState();
+
+    const admin = getSupabaseAdmin();
+    if (admin && trade.userId) {
+      void admin
+        .from('paper_trades')
+        .update({
+          status: 'CANCELLED',
+          pnl: 0,
+          settled_by: 'user-cancelled',
+          closed_at: trade.closedAt,
+        })
+        .eq('id', trade.id)
+        .then(() => undefined, () => undefined);
+    }
+
     return { ok: true, trade };
   }
 
@@ -1198,8 +1675,16 @@ export class NovaTradeEngine {
     startingVirtualBalance?: number;
   }) {
     if (Array.isArray(payload.paperTrades) && payload.paperTrades.length > 0 && this.paperTrades.length === 0) {
-      this.paperTrades = payload.paperTrades.map((t) => ({ ...t, userId: this.ownerUserId }));
+      const seen = new Set<string>();
+      const deduped: PaperTrade[] = [];
+      for (const t of payload.paperTrades) {
+        if (!t?.id || seen.has(t.id)) continue;
+        seen.add(t.id);
+        deduped.push({ ...t, userId: this.ownerUserId });
+      }
+      this.paperTrades = deduped;
       this.recalculateDailyCountersFromTrades();
+      this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
     }
     if (Array.isArray(payload.signals) && payload.signals.length > 0 && this.signals.length === 0) {
       this.signals = payload.signals;
@@ -1248,11 +1733,71 @@ export class NovaTradeEngine {
     this.simulatedDailyLoss = 0;
     this.simulatedDailyProfit = 0;
     this.dailyTradesCount = 0;
+    this.lossCooldownUntilMs = 0;
+    this.instrumentCooldownUntilMs.clear();
     this.autoPausedReason = null;
     this.dailyKey = new Date().toISOString().slice(0, 10);
     this.logActivity('RISK', 'DAILY_COUNTERS_RESET', 'Daily simulated risk counters reset.', userId);
     this.saveState();
     return this.getRiskStatus();
+  }
+
+  getAllLearnableTrades(): LearnableTradeRecord[] {
+    // Verified external broker outcomes appear first so signalId/brokerOrderId dedup preserves real broker settlement over synthetic duplicates
+    return [...this.externalBrokerTrades, ...this.paperTrades];
+  }
+
+  ingestBrokerOutcomes(records: LearnableTradeRecord[]): {
+    added: number;
+    updated: number;
+    insights: LearningInsights;
+  } {
+    let added = 0;
+    let updated = 0;
+    for (const raw of records) {
+      if (!raw || !raw.id) continue;
+      // Enrich missing strategyName or signalScore from matching paper trade / signal when linked
+      const matchedPaper = raw.signalId
+        ? this.paperTrades.find((p) => p.signalId === raw.signalId)
+        : undefined;
+      const matchedSignal = raw.signalId
+        ? this.signals.find((s) => s.id === raw.signalId)
+        : undefined;
+
+      const enriched: LearnableTradeRecord = {
+        ...raw,
+        strategyName: raw.strategyName ?? matchedPaper?.strategyName ?? matchedSignal?.activeStrategy,
+        signalScore: raw.signalScore ?? matchedPaper?.signalScore ?? matchedSignal?.score ?? null,
+        timeframe: matchedPaper?.timeframe ?? matchedSignal?.timeframe ?? raw.timeframe,
+      };
+
+      const existingIdx = this.externalBrokerTrades.findIndex(
+        (x) =>
+          x.id === enriched.id ||
+          (enriched.brokerOrderId != null && x.brokerOrderId === enriched.brokerOrderId)
+      );
+      if (existingIdx >= 0) {
+        const prev = this.externalBrokerTrades[existingIdx];
+        if (prev.pnl !== enriched.pnl || prev.status !== enriched.status || prev.accountBucket !== enriched.accountBucket) {
+          this.externalBrokerTrades[existingIdx] = enriched;
+          updated += 1;
+        }
+      } else {
+        this.externalBrokerTrades.unshift(enriched);
+        added += 1;
+      }
+    }
+    if (this.externalBrokerTrades.length > 300) this.externalBrokerTrades.length = 300;
+    if (added > 0 || updated > 0) {
+      this.saveState();
+      void this.syncRuntimeRecoveryToSupabase();
+    }
+    const insights = this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
+    return { added, updated, insights };
+  }
+
+  getLearningInsights(): LearningInsights {
+    return this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
   }
 
   getAnalytics() {
@@ -1373,23 +1918,273 @@ export class NovaTradeEngine {
 
   async monitorAndSettleExpiredTrades() {
     const now = Date.now();
-    const expired = this.paperTrades.filter(
-      (t) => t.status === 'SIMULATED_PENDING_OUTCOME' && t.expiresAt && new Date(t.expiresAt).getTime() <= now
-    );
+    const activeTrades = this.paperTrades.filter((t) => t.status === 'SIMULATED_PENDING_OUTCOME');
     let settledCount = 0;
 
-    for (const trade of expired) {
+    for (const trade of activeTrades) {
       const feed = await fetchMarketCandles(trade.symbol, trade.timeframe, 15, true);
       if (!feed.ok || feed.currentPrice == null) continue;
-      const exitPrice = feed.currentPrice;
-      const entry = trade.entryPrice ?? exitPrice;
-      const won =
-        (trade.direction === 'CALL' && exitPrice > entry) ||
-        (trade.direction === 'PUT' && exitPrice < entry);
-      this.settlePaperTrade(trade.id, won ? 'win' : 'loss', undefined, exitPrice, 'auto-expiry-monitor');
-      settledCount++;
+      const currentPrice = feed.currentPrice;
+      const entry = trade.entryPrice ?? currentPrice;
+      const isExpired = trade.expiresAt && new Date(trade.expiresAt).getTime() <= now;
+
+      let triggerOutcome: 'win' | 'loss' | null = null;
+      let settledBy = 'auto-expiry-monitor';
+      let exitPrice = currentPrice;
+
+      if (trade.direction === 'CALL') {
+        if (trade.stopLoss != null && currentPrice <= trade.stopLoss) {
+          triggerOutcome = 'loss';
+          settledBy = 'stop-loss-triggered';
+          exitPrice = trade.stopLoss;
+        } else if (trade.takeProfit != null && currentPrice >= trade.takeProfit) {
+          triggerOutcome = 'win';
+          settledBy = 'take-profit-triggered';
+          exitPrice = trade.takeProfit;
+        } else if (isExpired) {
+          triggerOutcome = currentPrice > entry ? 'win' : 'loss';
+          settledBy = 'auto-expiry-monitor';
+          exitPrice = currentPrice;
+        }
+      } else { // PUT
+        if (trade.stopLoss != null && currentPrice >= trade.stopLoss) {
+          triggerOutcome = 'loss';
+          settledBy = 'stop-loss-triggered';
+          exitPrice = trade.stopLoss;
+        } else if (trade.takeProfit != null && currentPrice <= trade.takeProfit) {
+          triggerOutcome = 'win';
+          settledBy = 'take-profit-triggered';
+          exitPrice = trade.takeProfit;
+        } else if (isExpired) {
+          triggerOutcome = currentPrice < entry ? 'win' : 'loss';
+          settledBy = 'auto-expiry-monitor';
+          exitPrice = currentPrice;
+        }
+      }
+
+      if (triggerOutcome) {
+        this.settlePaperTrade(trade.id, triggerOutcome, undefined, exitPrice, settledBy);
+        settledCount++;
+      }
     }
     return settledCount;
+  }
+
+  getPendingShadowSignalsCount(): number {
+    return this.pendingShadowSignals.length;
+  }
+
+  getPendingShadowSignals(): PendingShadowSignal[] {
+    return this.pendingShadowSignals.map((s) => ({ ...s }));
+  }
+
+  recordShadowSignalForTesting(shadow: PendingShadowSignal): void {
+    this.pendingShadowSignals.push({ ...shadow });
+    this.saveState();
+  }
+
+  async settlePendingShadowSignals(): Promise<number> {
+    if (this.riskSettings.emergencyStop) return 0;
+    const nowMs = Date.now();
+    let settledCount = 0;
+    for (let idx = this.pendingShadowSignals.length - 1; idx >= 0; idx--) {
+      const shadow = this.pendingShadowSignals[idx];
+      if (shadow.expiresAtMs > nowMs) continue;
+      const feed = await fetchMarketCandles(shadow.symbol, shadow.timeframe, 10, true);
+      if (!feed.ok || feed.currentPrice == null) continue;
+      const won =
+        (shadow.direction === 'CALL' && feed.currentPrice > shadow.entryPrice) ||
+        (shadow.direction === 'PUT' && feed.currentPrice < shadow.entryPrice);
+      const updatedState = this.learner.recordShadowValidation(shadow.strategy, won);
+      this.pendingShadowSignals.splice(idx, 1);
+      settledCount += 1;
+      if (!updatedState.paused) {
+        this.logActivity(
+          'ANALYSIS',
+          'STRATEGY_AUTO_RESUMED',
+          `Strategy ${shadow.strategy} resumed automatically after validated shadow performance recovered.`,
+          this.ownerUserId
+        );
+      }
+    }
+    if (settledCount > 0) {
+      this.saveState();
+      void this.syncRuntimeRecoveryToSupabase();
+    }
+    return settledCount;
+  }
+
+  private recordShadowSignal(analysis: StoredSignal): boolean {
+    if (!analysis.activeStrategy || analysis.entryPrice == null) return false;
+    if (analysis.direction !== 'CALL' && analysis.direction !== 'PUT') return false;
+    const dup = this.pendingShadowSignals.some(
+      (s) => s.symbol === analysis.symbol && s.timeframe === analysis.timeframe && s.strategy === analysis.activeStrategy
+    );
+    if (dup || this.pendingShadowSignals.length >= 30) return false;
+    this.pendingShadowSignals.push({
+      symbol: analysis.symbol,
+      timeframe: analysis.timeframe,
+      direction: analysis.direction,
+      strategy: analysis.activeStrategy,
+      entryPrice: analysis.entryPrice,
+      expiresAtMs: Date.now() + this.resolveEffectiveExpirySeconds(analysis) * 1000,
+    });
+    this.saveState();
+    void this.syncRuntimeRecoveryToSupabase();
+    return true;
+  }
+
+  /**
+   * Unified autonomous signal evaluation and execution pipeline shared by
+   * runAutonomousCycle() and POST /api/auto-paper/evaluate.
+   */
+  async evaluateAndExecuteAutonomousSignal(
+    symbol: string,
+    timeframe: Timeframe = this.aiSettings.defaultTimeframe,
+    options: {
+      allowExecution?: boolean;
+      includeGemini?: boolean;
+      precomputed?: { analysis: StoredSignal; marketError?: string };
+      skipLearnerRecompute?: boolean;
+    } = {}
+  ): Promise<{
+    analysis: StoredSignal;
+    action: 'OPENED' | 'WAIT' | 'SHADOW_RECORDED' | 'SKIPPED_RISK' | 'SKIPPED_ACTIVE' | 'SKIPPED_COOLDOWN';
+    trade?: PaperTrade;
+    reason: string;
+    risk: RiskStatus;
+  }> {
+    const riskBefore = this.getRiskStatus();
+    if (this.riskSettings.emergencyStop) {
+      const { analysis } = options.precomputed
+        ? options.precomputed
+        : await this.analyseAsset(symbol, timeframe, false, this.ownerUserId, {
+            skipLearnerRecompute: options.skipLearnerRecompute,
+          });
+      return {
+        analysis,
+        action: 'SKIPPED_RISK',
+        reason: 'Emergency Stop is engaged; autonomous analysis/execution paused.',
+        risk: this.getRiskStatus(),
+      };
+    }
+
+    const { analysis, marketError } = options.precomputed
+      ? options.precomputed
+      : await this.analyseAsset(symbol, timeframe, Boolean(options.includeGemini), this.ownerUserId, {
+          skipLearnerRecompute: options.skipLearnerRecompute,
+        });
+    const riskNow = this.getRiskStatus();
+
+    if (marketError) {
+      return { analysis, action: 'WAIT', reason: `Market data unavailable: ${marketError}`, risk: riskNow };
+    }
+    if (analysis.isStale || !isLiveMarketStatus(analysis.marketStatus)) {
+      return {
+        analysis,
+        action: 'WAIT',
+        reason: `Market status is ${analysis.marketStatus}; signal suppressed to WAIT.`,
+        risk: riskNow,
+      };
+    }
+    if (analysis.direction !== 'CALL' && analysis.direction !== 'PUT') {
+      return {
+        analysis,
+        action: 'WAIT',
+        reason: analysis.rejectionReasons?.[0] || 'Quantitative engine decision is WAIT. No trade opened.',
+        risk: riskNow,
+      };
+    }
+
+    // Intelligent Performance Protection: EVERY automatic path checks isStrategyPaused()
+    // and records shadow validation while paused instead of executing trades.
+    const strategyCheck = this.learner.isStrategyPaused(analysis.activeStrategy);
+    if (strategyCheck.paused && analysis.activeStrategy) {
+      this.recordShadowSignal(analysis);
+      return {
+        analysis,
+        action: 'SHADOW_RECORDED',
+        reason: strategyCheck.reason || `Strategy ${analysis.activeStrategy} is paused; shadow validation signal recorded.`,
+        risk: riskNow,
+      };
+    }
+
+    const allowExec = options.allowExecution ?? riskNow.allowed;
+    if (!allowExec || !riskNow.allowed) {
+      return {
+        analysis,
+        action: 'SKIPPED_RISK',
+        reason: `Risk guard deferred live entry: ${riskNow.reasons.join(' ')}`,
+        risk: riskNow,
+      };
+    }
+
+    const activeOnSymbol = this.getActiveTrades().some((t) => t.symbol === analysis.symbol);
+    if (activeOnSymbol) {
+      return {
+        analysis,
+        action: 'SKIPPED_ACTIVE',
+        reason: `Active pending position already open on ${analysis.symbol}.`,
+        risk: riskNow,
+      };
+    }
+
+    const symCooldown = this.instrumentCooldownUntilMs.get(analysis.symbol) || 0;
+    if (symCooldown > Date.now()) {
+      const rem = Math.ceil((symCooldown - Date.now()) / 1000);
+      return {
+        analysis,
+        action: 'SKIPPED_COOLDOWN',
+        reason: `Instrument cooldown active for ${analysis.symbol} (${rem}s remaining).`,
+        risk: riskNow,
+      };
+    }
+
+    // Anti-martingale position sizing + selected account bucket attribution
+    const recommended = this.calculateRecommendedStake(analysis.score);
+    const stake = Math.min(recommended, this.riskSettings.maxTradeAmount, this.getVirtualBalanceSummary().currentBalance);
+    const accountBucket = this.getActiveAccountBucket?.() ?? 'PAPER_SIMULATOR';
+    const placed = this.openPaperTrade({
+      symbol: analysis.symbol,
+      timeframe: analysis.timeframe,
+      direction: analysis.direction,
+      amount: stake,
+      mode: 'automatic',
+      entryPrice: analysis.entryPrice,
+      atr: analysis.indicators?.atr14 ?? null,
+      expirySeconds: this.resolveEffectiveExpirySeconds(analysis),
+      requestedExpirySeconds: analysis.requestedExpirySeconds ?? this.aiSettings.expirySeconds,
+      expiryAdjusted: analysis.expiryAdjusted ?? false,
+      expiryAdjustmentReason: analysis.expiryAdjustmentReason ?? null,
+      signalScore: analysis.score,
+      provider: analysis.provider,
+      pendingOutcome: true,
+      userId: this.ownerUserId,
+      accountBucket,
+      strategyName: analysis.activeStrategy,
+      signalId: analysis.id,
+    });
+
+    if (!placed.ok || !placed.trade) {
+      return {
+        analysis,
+        action: 'SKIPPED_RISK',
+        reason: placed.error || 'Trade blocked by risk control.',
+        risk: placed.risk || riskBefore,
+      };
+    }
+
+    if (this.onAutonomousSignalTriggered && !this.riskSettings.emergencyStop) {
+      await this.onAutonomousSignalTriggered(analysis, stake).catch(() => undefined);
+    }
+
+    return {
+      analysis,
+      action: 'OPENED',
+      trade: placed.trade,
+      reason: `Opened ${placed.trade.direction} ${placed.trade.symbol} (${analysis.activeStrategy || 'ADAPTIVE'}, bucket=${accountBucket}).`,
+      risk: this.getRiskStatus(),
+    };
   }
 
   async runAutonomousCycle(forceScan = false): Promise<{ settled: number; opened: PaperTrade[]; summary: string }> {
@@ -1401,23 +2196,41 @@ export class NovaTradeEngine {
       const settled = await this.monitorAndSettleExpiredTrades();
       const opened: PaperTrade[] = [];
 
+      if (this.riskSettings.emergencyStop) {
+        this.autoPaperArmed = false;
+        this.autoPausedReason = 'Emergency stop is engaged.';
+        const summary = settled > 0 ? `Settled ${settled} expired trade(s). Emergency stop engaged.` : 'Emergency stop engaged.';
+        this.lastCycleSummary = summary;
+        return { settled, opened, summary };
+      }
+
       if (!this.autoPaperArmed) {
         const summary = settled > 0 ? `Settled ${settled} expired trade(s). Auto mode paused.` : 'Auto mode paused.';
         this.lastCycleSummary = summary;
         return { settled, opened, summary };
       }
 
+      // Evaluate any pending shadow signals FIRST so temporary risk restrictions (cooldowns / max open trades)
+      // never block validated shadow outcomes from resuming paused strategies.
+      const shadowSettled = await this.settlePendingShadowSignals();
+
       const lastScanMs = this.lastScanAt ? new Date(this.lastScanAt).getTime() : 0;
       const elapsedMs = Date.now() - lastScanMs;
       if (!forceScan && elapsedMs < this.aiSettings.scanIntervalSeconds * 1000) {
-        const summary = settled > 0
-          ? `Settled ${settled} expired trade(s). Next scan in ${Math.ceil((this.aiSettings.scanIntervalSeconds * 1000 - elapsedMs) / 1000)}s.`
+        const summary = settled > 0 || shadowSettled > 0
+          ? `Settled ${settled} trade(s) and ${shadowSettled} shadow signal(s). Next scan in ${Math.ceil((this.aiSettings.scanIntervalSeconds * 1000 - elapsedMs) / 1000)}s.`
           : this.lastCycleSummary || 'Waiting for next scheduled scan interval.';
         return { settled, opened, summary };
       }
 
       const riskCheck = this.getRiskStatus();
-      if (!riskCheck.allowed) {
+      const isTemporaryWait =
+        !riskCheck.allowed &&
+        riskCheck.reasons.every(
+          (r) => r.includes('simultaneous trades') || r.includes('max open') || r.includes('cooldown')
+        );
+
+      if (!riskCheck.allowed && !isTemporaryWait) {
         this.autoPaperArmed = false;
         this.autoPausedReason = riskCheck.reasons.join(' ');
         this.logActivity('RISK', 'AUTO_PAUSED', `Autonomous scheduler paused: ${this.autoPausedReason}`, this.ownerUserId);
@@ -1427,53 +2240,78 @@ export class NovaTradeEngine {
         return { settled, opened, summary: this.lastCycleSummary };
       }
 
-      const activeSymbols = new Set(this.getActiveTrades().map((t) => t.symbol));
-      let decisionsRecorded = 0;
+      const hasPausedStrategy = this.learner.getPausedStrategies().length > 0;
+      if (isTemporaryWait && !hasPausedStrategy) {
+        this.lastCycleSummary = `Waiting (Auto armed): ${riskCheck.reasons.join(' ')}`;
+        return { settled, opened, summary: this.lastCycleSummary };
+      }
 
-      for (const symbol of this.aiSettings.enabledAssets) {
+      if (riskCheck.allowed && this.autoPausedReason) {
+        this.autoPausedReason = null;
+      }
+
+      const activeSymbols = new Set(this.getActiveTrades().map((t) => t.symbol));
+      this.learner.analyzeHistory(this.getAllLearnableTrades(), this.aiSettings.minSignalScore);
+
+      const scanTargets = this.aiSettings.enabledAssets.filter(
+        (symbol) => hasPausedStrategy || !activeSymbols.has(symbol) || !riskCheck.allowed
+      );
+      const analyzedCandidates = await this.mapWithConcurrency(scanTargets, 4, async (symbol) => ({
+        symbol,
+        computed: await this.analyseAsset(symbol, this.aiSettings.defaultTimeframe, false, this.ownerUserId, {
+          skipLearnerRecompute: true,
+        }),
+      }));
+
+      // Prioritize highest-conviction actionable setups first so simultaneous exposure caps allocate to strongest signals
+      analyzedCandidates.sort((a, b) => {
+        const aAct = a.computed.analysis.direction !== 'WAIT' ? 1 : 0;
+        const bAct = b.computed.analysis.direction !== 'WAIT' ? 1 : 0;
+        if (aAct !== bAct) return bAct - aAct;
+        return b.computed.analysis.score - a.computed.analysis.score;
+      });
+
+      let decisionsRecorded = 0;
+      let shadowRecorded = 0;
+      let waitCount = 0;
+
+      for (const candidate of analyzedCandidates) {
         const currentRisk = this.getRiskStatus();
-        if (!currentRisk.allowed) {
+        const currentTempWait =
+          !currentRisk.allowed &&
+          currentRisk.reasons.every(
+            (r) => r.includes('simultaneous trades') || r.includes('max open') || r.includes('cooldown')
+          );
+        if (!currentRisk.allowed && !currentTempWait) {
           this.autoPaperArmed = false;
           this.autoPausedReason = currentRisk.reasons.join(' ');
           void this.syncSettingsToSupabase();
           break;
         }
-        if (activeSymbols.has(symbol)) continue;
+        if (currentRisk.allowed && activeSymbols.has(candidate.symbol)) continue;
 
-        const { analysis } = await this.analyseAsset(symbol, this.aiSettings.defaultTimeframe, false, this.ownerUserId);
-        decisionsRecorded += 1;
-
-        if (
-          !analysis.isStale &&
-          analysis.marketStatus === 'OPEN' &&
-          (analysis.direction === 'CALL' || analysis.direction === 'PUT')
-        ) {
-          const stake = this.calculateRecommendedStake(analysis.score);
-          const placed = this.openPaperTrade({
-            symbol: analysis.symbol,
-            timeframe: analysis.timeframe,
-            direction: analysis.direction,
-            amount: stake,
-            mode: 'automatic',
-            entryPrice: analysis.entryPrice,
-            expirySeconds: analysis.suggestedExpirySeconds || this.aiSettings.expirySeconds,
-            signalScore: analysis.score,
-            provider: analysis.provider,
-            pendingOutcome: true,
-            userId: this.ownerUserId,
-          });
-          if (placed.ok && placed.trade) {
-            opened.push(placed.trade);
-            activeSymbols.add(symbol);
-            if (this.onAutonomousSignalTriggered && !this.riskSettings.emergencyStop) {
-              await this.onAutonomousSignalTriggered(analysis, stake).catch(() => undefined);
-            }
+        const res = await this.evaluateAndExecuteAutonomousSignal(
+          candidate.symbol,
+          this.aiSettings.defaultTimeframe,
+          {
+            allowExecution: currentRisk.allowed,
+            precomputed: candidate.computed,
+            skipLearnerRecompute: true,
           }
+        );
+        decisionsRecorded += 1;
+        if (res.action === 'OPENED' && res.trade) {
+          opened.push(res.trade);
+          activeSymbols.add(candidate.symbol);
+        } else if (res.action === 'SHADOW_RECORDED') {
+          shadowRecorded += 1;
+        } else if (res.action === 'WAIT') {
+          waitCount += 1;
         }
       }
 
       this.lastScanAt = new Date().toISOString();
-      const summary = `Settled ${settled} trade(s); scanned ${decisionsRecorded} instrument(s); opened ${opened.length} paper trade(s).`;
+      const summary = `Settled ${settled} trade(s), ${shadowSettled} shadow signal(s); scanned ${decisionsRecorded} instrument(s) (${waitCount} WAIT); opened ${opened.length} trade(s), recorded ${shadowRecorded} shadow setup(s).`;
       this.lastCycleSummary = summary;
       this.logActivity('SCHEDULER', 'AUTO_SCAN_CYCLE', summary, this.ownerUserId);
       this.saveState();
@@ -1486,6 +2324,27 @@ export class NovaTradeEngine {
     } finally {
       this.schedulerRunning = false;
     }
+  }
+
+  getAutonomousStatus(): 'SCANNING' | 'ANALYZING' | 'WAITING FOR OPPORTUNITY' | 'TRADE EXECUTED' | 'MANAGING POSITION' | 'RISK PAUSED' {
+    const risk = this.getRiskStatus();
+    if (!risk.allowed || this.riskSettings.emergencyStop) {
+      return 'RISK PAUSED';
+    }
+    if (this.getActiveTrades().length > 0) {
+      return 'MANAGING POSITION';
+    }
+    const recentTrade = this.paperTrades[0];
+    if (recentTrade && (Date.now() - new Date(recentTrade.createdAt).getTime() < 45000) && recentTrade.mode === 'automatic') {
+      return 'TRADE EXECUTED';
+    }
+    if (this.schedulerRunning) {
+      return 'SCANNING';
+    }
+    if (this.autoPaperArmed) {
+      return 'WAITING FOR OPPORTUNITY';
+    }
+    return 'WAITING FOR OPPORTUNITY';
   }
 
   startScheduler(tickIntervalMs = 5_000) {

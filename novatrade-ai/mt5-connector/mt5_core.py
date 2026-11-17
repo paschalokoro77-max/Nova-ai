@@ -1,4 +1,4 @@
-"""Official MetaTrader 5 Python SDK service layer (DEMO-only, fail-closed on REAL accounts).
+"""Official MetaTrader 5 Python SDK service layer (supports DEMO and REAL MT5 accounts).
 
 Requires a Windows host running the MetaTrader 5 Desktop Terminal (`terminal64.exe`) when used with
 the official `MetaTrader5` PyPI package. Accepts an injectable `mt5_module` for deterministic unit testing.
@@ -134,6 +134,26 @@ class MT5BridgeService:
         info, mode_label = self.ensure_authenticated_account(mt5_mod)
         return mt5_mod, info, mode_label
 
+    def _require_connected_for_environment(
+        self, expected_environment: Optional[str] = None
+    ) -> tuple[Any, Any, str]:
+        mt5_mod, info, mode_label = self._require_connected_account()
+        if mode_label not in ("DEMO", "REAL"):
+            raise BridgeError(
+                403,
+                f"Order execution and bridge access require a DEMO or REAL MT5 account (current trade_mode={mode_label}).",
+            )
+        if expected_environment:
+            expected_label = expected_environment.strip().upper()
+            if expected_label not in ("DEMO", "REAL"):
+                raise BridgeError(400, f"Invalid MT5 environment '{expected_environment}'. Expected 'demo' or 'real'.")
+            if mode_label != expected_label:
+                raise BridgeError(
+                    403,
+                    f"Environment mismatch: target environment is {expected_label}, but connected MT5 terminal is {mode_label}.",
+                )
+        return mt5_mod, info, mode_label
+
     def _require_connected_demo(self) -> tuple[Any, Any]:
         mt5_mod, info, mode_label = self._require_connected_account()
         demo_const = getattr(mt5_mod, "ACCOUNT_TRADE_MODE_DEMO", 0)
@@ -184,10 +204,10 @@ class MT5BridgeService:
                 "tradeMode": mode_label,
                 "accountLogin": _attr(info, "login"),
                 "server": _attr(info, "server"),
-                "realTradingEnabled": False,
+                "realTradingEnabled": mode_label == "REAL",
                 "sdk": "MetaTrader5",
                 "sdkInstalled": True,
-                "lastError": self._last_error if mode_label == "DEMO" else f"Authenticated {mode_label} account (inspection mode; real trading disabled).",
+                "lastError": self._last_error,
             }
 
     def connect(
@@ -195,6 +215,7 @@ class MT5BridgeService:
         login: Optional[str] = None,
         password: Optional[str] = None,
         server: Optional[str] = None,
+        environment: Optional[str] = None,
     ) -> Dict[str, Any]:
         with self._lock:
             mt5_mod = self._mt5()
@@ -226,6 +247,16 @@ class MT5BridgeService:
                     raise BridgeError(401, self._last_error)
 
             info, mode_label = self.ensure_authenticated_account(mt5_mod)
+            if environment:
+                expected_label = environment.strip().upper()
+                if expected_label not in ("DEMO", "REAL"):
+                    raise BridgeError(400, f"Invalid MT5 environment '{environment}'. Use 'demo' or 'real'.")
+                if mode_label != expected_label:
+                    self._connected = False
+                    raise BridgeError(
+                        403,
+                        f"Selected account environment is {expected_label}, but MT5 terminal authenticated a {mode_label} account.",
+                    )
             self._connected = True
             self._last_error = None
             return {
@@ -240,7 +271,7 @@ class MT5BridgeService:
                 "marginFree": _as_float(_attr(info, "margin_free")),
                 "currency": _attr(info, "currency", "USD"),
                 "leverage": _as_int(_attr(info, "leverage")),
-                "realTradingEnabled": False,
+                "realTradingEnabled": mode_label == "REAL",
                 "source": "MT5_OFFICIAL_PYTHON",
             }
 
@@ -256,10 +287,10 @@ class MT5BridgeService:
 
     def get_account(self) -> Dict[str, Any]:
         with self._lock:
-            _, info = self._require_connected_demo()
+            _, info, mode_label = self._require_connected_for_environment()
             return {
                 "connected": True,
-                "tradeMode": "DEMO",
+                "tradeMode": mode_label,
                 "login": _attr(info, "login"),
                 "server": _attr(info, "server"),
                 "balance": _as_float(_attr(info, "balance")),
@@ -269,13 +300,13 @@ class MT5BridgeService:
                 "profit": _as_float(_attr(info, "profit"), 0.0),
                 "leverage": _as_int(_attr(info, "leverage")),
                 "currency": _attr(info, "currency", "USD"),
-                "realTradingEnabled": False,
+                "realTradingEnabled": mode_label == "REAL",
                 "source": "MT5_OFFICIAL_PYTHON",
             }
 
     def get_symbols(self, limit: int = 200) -> Dict[str, Any]:
         with self._lock:
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, _ = self._require_connected_for_environment()
             raw = mt5_mod.symbols_get() or []
             symbols: List[Dict[str, Any]] = []
             for item in raw:
@@ -314,7 +345,7 @@ class MT5BridgeService:
 
     def get_price(self, symbol: str) -> Dict[str, Any]:
         with self._lock:
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, _ = self._require_connected_for_environment()
             sym_info = self._prepare_symbol(mt5_mod, symbol)
             clean = str(_attr(sym_info, "name", symbol)).upper()
             tick = mt5_mod.symbol_info_tick(clean)
@@ -340,7 +371,7 @@ class MT5BridgeService:
 
     def get_candles(self, symbol: str, interval_seconds: int = 60, count: int = 100) -> Dict[str, Any]:
         with self._lock:
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, _ = self._require_connected_for_environment()
             sym_info = self._prepare_symbol(mt5_mod, symbol)
             clean = str(_attr(sym_info, "name", symbol)).upper()
             tf_map = self._timeframe_map(mt5_mod)
@@ -386,7 +417,7 @@ class MT5BridgeService:
 
     def get_positions(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, _ = self._require_connected_for_environment()
             raw = mt5_mod.positions_get(symbol=symbol.strip().upper()) if symbol else mt5_mod.positions_get()
             positions: List[Dict[str, Any]] = []
             buy_type = getattr(mt5_mod, "POSITION_TYPE_BUY", 0)
@@ -415,7 +446,7 @@ class MT5BridgeService:
 
     def get_history(self, days: int = 14) -> Dict[str, Any]:
         with self._lock:
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, mode_label = self._require_connected_for_environment()
             to_dt = datetime.now(timezone.utc) + timedelta(minutes=5)
             from_dt = to_dt - timedelta(days=max(1, min(90, days)))
             deals = mt5_mod.history_deals_get(from_dt, to_dt) or []
@@ -446,7 +477,7 @@ class MT5BridgeService:
             return {
                 "supported": True,
                 "trades": trades[:150],
-                "note": f"Synced {len(trades[:150])} MT5 DEMO deal(s) via history_deals_get().",
+                "note": f"Synced {len(trades[:150])} MT5 {mode_label} deal(s) via history_deals_get().",
                 "source": "MT5_OFFICIAL_PYTHON",
             }
 
@@ -548,10 +579,11 @@ class MT5BridgeService:
         comment: str = "NovaTrade-Validate",
     ) -> Dict[str, Any]:
         with self._lock:
-            if environment.strip().lower() != "demo":
-                raise BridgeError(403, "MT5 live order validation blocked. Only 'demo' environment is permitted.")
+            env_clean = environment.strip().lower()
+            if env_clean not in ("demo", "real"):
+                raise BridgeError(400, f"Invalid environment '{environment}'. Use 'demo' or 'real'.")
 
-            mt5_mod, acct = self._require_connected_demo()
+            mt5_mod, acct, mode_label = self._require_connected_for_environment(env_clean)
             sym_info = self._prepare_symbol(mt5_mod, symbol)
             clean_symbol = str(_attr(sym_info, "name", symbol)).upper()
             req, norm_vol, filling_mode = self._build_trade_request(
@@ -564,6 +596,7 @@ class MT5BridgeService:
                 return {
                     "valid": False,
                     "compatible": True,
+                    "tradeMode": mode_label,
                     "mappedSymbol": clean_symbol,
                     "volume": norm_vol,
                     "fillingMode": filling_mode,
@@ -581,6 +614,7 @@ class MT5BridgeService:
             return {
                 "valid": is_valid,
                 "compatible": True,
+                "tradeMode": mode_label,
                 "mappedSymbol": clean_symbol,
                 "volume": norm_vol,
                 "fillingMode": filling_mode,
@@ -591,7 +625,7 @@ class MT5BridgeService:
                 "source": "MT5_OFFICIAL_ORDER_CHECK",
             }
 
-    def place_demo_order(
+    def place_order(
         self,
         *,
         environment: str,
@@ -600,13 +634,14 @@ class MT5BridgeService:
         order_type: str,
         volume: float,
         price: Optional[float] = None,
-        comment: str = "NovaTrade-Demo",
+        comment: str = "NovaTrade",
     ) -> Dict[str, Any]:
         with self._lock:
-            if environment.strip().lower() != "demo":
-                raise BridgeError(403, "MT5 live execution is locked. Only 'demo' orders are permitted.")
+            env_clean = environment.strip().lower()
+            if env_clean not in ("demo", "real"):
+                raise BridgeError(400, f"Invalid environment '{environment}'. Use 'demo' or 'real'.")
 
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, mode_label = self._require_connected_for_environment(env_clean)
             sym_info = self._prepare_symbol(mt5_mod, symbol)
             clean_symbol = str(_attr(sym_info, "name", symbol)).upper()
             req, norm_vol, _ = self._build_trade_request(
@@ -638,6 +673,7 @@ class MT5BridgeService:
 
             return {
                 "accepted": accepted,
+                "tradeMode": mode_label,
                 "orderId": str(order_id),
                 "dealId": str(_attr(send_res, "deal", "")),
                 "status": status,
@@ -648,9 +684,12 @@ class MT5BridgeService:
                 "source": "MT5_OFFICIAL_PYTHON",
             }
 
+    def place_demo_order(self, **kwargs: Any) -> Dict[str, Any]:
+        return self.place_order(**kwargs)
+
     def get_order_status(self, order_id: str) -> Dict[str, Any]:
         with self._lock:
-            mt5_mod, _ = self._require_connected_demo()
+            mt5_mod, _, mode_label = self._require_connected_for_environment()
             try:
                 ticket = int(order_id)
             except ValueError:
@@ -664,7 +703,7 @@ class MT5BridgeService:
                     "status": "FILLED",
                     "filledPrice": _as_float(_attr(pos, "price_open")),
                     "pnl": _as_float(_attr(pos, "profit")),
-                    "note": f"Open MT5 demo position #{ticket}",
+                    "note": f"Open MT5 {mode_label} position #{ticket}",
                 }
 
             hist_orders = mt5_mod.history_orders_get(ticket=ticket) or []
@@ -688,7 +727,7 @@ class MT5BridgeService:
                     "status": status,
                     "filledPrice": _as_float(_attr(ord_obj, "price_current") or _attr(ord_obj, "price_open")),
                     "pnl": None,
-                    "note": f"Historical MT5 order #{ticket} (state={state})",
+                    "note": f"Historical MT5 {mode_label} order #{ticket} (state={state})",
                 }
 
-            return {"found": False, "status": "UNKNOWN", "note": f"Ticket #{ticket} not found in active or recent MT5 demo state."}
+            return {"found": False, "status": "UNKNOWN", "note": f"Ticket #{ticket} not found in active or recent MT5 {mode_label} state."}

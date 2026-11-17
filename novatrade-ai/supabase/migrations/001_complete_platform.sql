@@ -205,6 +205,8 @@ alter table public.paper_trades
   add column if not exists mode text not null default 'signals' check (mode in ('signals','assisted','automatic','manual')),
   add column if not exists entry_price numeric(18,6),
   add column if not exists exit_price numeric(18,6),
+  add column if not exists stop_loss numeric(18,6),
+  add column if not exists take_profit numeric(18,6),
   add column if not exists expiry_seconds integer not null default 180,
   add column if not exists expires_at timestamptz,
   add column if not exists payout_rate numeric(5,4) not null default 0.80,

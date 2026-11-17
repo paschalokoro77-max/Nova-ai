@@ -25,6 +25,12 @@ import type {
 } from './types.ts';
 import { BrokerRegistry } from './registry.ts';
 import { getSupabaseAdmin } from '../supabaseAdmin.ts';
+import {
+  resolveAccountBucket,
+  type AccountPerformanceBucket,
+  type LearnableTradeRecord,
+} from '../performanceLearner.ts';
+import type { VerifiedBrokerAccountSession } from '../androidCompanion.ts';
 
 export class BrokerConnectionError extends Error {
   readonly statusCode: number;
@@ -125,16 +131,34 @@ export class BrokerConnectionManager {
   private readonly registry: BrokerRegistry;
   private readonly baseDir: string | null;
   private readonly stores = new Map<string, UserBrokerStore>();
+  private readonly hydratedUsers = new Set<string>();
+  private readonly pendingHydrations = new Map<string, Promise<UserBrokerStore>>();
   private readonly vaultKey: Buffer;
+  private lastPersistenceError: string | null = null;
+  private vaultTableUnavailable = false;
 
-  constructor(registry: BrokerRegistry, persistPath: string | null = path.resolve(process.cwd(), '.novatrade-data/state.json')) {
+  constructor(
+    registry: BrokerRegistry,
+    persistPath: string | null = process.env.NODE_ENV === 'production'
+      ? null
+      : path.resolve(process.cwd(), '.novatrade-data/state.json')
+  ) {
     this.registry = registry;
-    this.baseDir = persistPath ? path.join(path.dirname(persistPath), 'brokers') : null;
+    const effectivePath = process.env.NODE_ENV === 'production' ? null : persistPath;
+    this.baseDir = effectivePath ? path.join(path.dirname(effectivePath), 'brokers') : null;
     this.vaultKey = this.loadOrCreateMasterKey();
   }
 
   private loadOrCreateMasterKey(): Buffer {
-    const envSecret = (process.env.BROKER_VAULT_SECRET || process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+    const isProduction = process.env.NODE_ENV === 'production';
+    const vaultSecret = (process.env.BROKER_VAULT_SECRET || '').trim();
+    if (isProduction) {
+      if (!vaultSecret || Buffer.byteLength(vaultSecret, 'utf8') < 32) {
+        throw new Error('BROKER_VAULT_SECRET (minimum 32 bytes) is required in production.');
+      }
+      return crypto.createHash('sha256').update(vaultSecret).digest();
+    }
+    const envSecret = vaultSecret || (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
     if (envSecret) {
       return crypto.createHash('sha256').update(envSecret).digest();
     }
@@ -297,14 +321,323 @@ export class BrokerConnectionManager {
     return store;
   }
 
-  private saveStore(userId: string | undefined, store: UserBrokerStore) {
-    const filePath = this.getStorePath(userId);
-    if (!filePath) return;
+  private sanitizeAccountForVault(acct: StoredAccountInternal): StoredAccountInternal {
+    // Strictly persist only encryptedCredentials (AES-256-GCM ciphertext) — never plaintext passwords/secrets.
+    return {
+      id: acct.id,
+      userId: acct.userId,
+      brokerId: acct.brokerId,
+      label: acct.label,
+      environment: acct.environment === 'real' ? 'real' : 'demo',
+      externalAccountId: acct.externalAccountId,
+      status: acct.status,
+      connected: Boolean(acct.connected),
+      accountType: acct.accountType,
+      balance: acct.balance,
+      equity: acct.equity,
+      currency: acct.currency,
+      encryptedCredentials: acct.encryptedCredentials,
+      maskedCredentialHint: acct.maskedCredentialHint,
+      credentialSource: acct.credentialSource,
+      riskLimits: { ...DEFAULT_ACCOUNT_RISK_LIMITS, ...(acct.riskLimits || {}) },
+      dailyKey: acct.dailyKey,
+      dailyOrdersCount: acct.dailyOrdersCount,
+      dailySimulatedLoss: acct.dailySimulatedLoss,
+      lastCheckedAt: acct.lastCheckedAt,
+      lastSyncedAt: acct.lastSyncedAt,
+      lastError: acct.lastError,
+      createdAt: acct.createdAt,
+      updatedAt: acct.updatedAt,
+    };
+  }
+
+  private isValidEncryptedPayload(payload: unknown): payload is string {
+    if (typeof payload !== 'string' || !payload.trim()) return false;
+    const parts = payload.split('.');
+    return parts.length === 3 && parts.every((p) => p.length > 0);
+  }
+
+  getLastPersistenceError(): string | null {
+    return this.lastPersistenceError;
+  }
+
+  private isMissingTableError(error: { code?: string; message?: string } | null | undefined): boolean {
+    if (!error) return false;
+    const msg = (error.message || '').toLowerCase();
+    return (
+      error.code === 'PGRST205' ||
+      error.code === '42P01' ||
+      msg.includes('schema cache') ||
+      msg.includes('could not find the table') ||
+      msg.includes('does not exist')
+    );
+  }
+
+  private async readVaultRowFromSupabase(uid: string): Promise<{
+    row: {
+      active_account_id?: string | null;
+      auto_execute_broker_demo?: boolean;
+      accounts_json?: unknown;
+      orders_json?: unknown;
+      idempotency_keys_json?: unknown;
+    } | null;
+    error: string | null;
+  }> {
+    const admin = getSupabaseAdmin();
+    if (!admin) return { row: null, error: null };
+
+    if (!this.vaultTableUnavailable) {
+      const { data, error } = await admin
+        .from('broker_vault_state')
+        .select('active_account_id,auto_execute_broker_demo,accounts_json,orders_json,idempotency_keys_json')
+        .eq('user_id', uid)
+        .maybeSingle();
+
+      if (!error) {
+        if (data && typeof data === 'object') {
+          return { row: data as Record<string, unknown>, error: null };
+        }
+        // If broker_vault_state exists but has no row yet, also check fallback row in broker_connections
+      } else if (this.isMissingTableError(error)) {
+        this.vaultTableUnavailable = true;
+      } else {
+        return { row: null, error: error.message };
+      }
+    }
+
+    // Fallback to existing public.broker_connections table (available since 001_complete_platform.sql)
+    const fallback = await admin
+      .from('broker_connections')
+      .select('capabilities')
+      .eq('user_id', uid)
+      .eq('broker_name', '__vault_state__')
+      .maybeSingle();
+
+    if (fallback.error) {
+      if (this.isMissingTableError(fallback.error)) {
+        return { row: null, error: null };
+      }
+      return { row: null, error: fallback.error.message };
+    }
+
+    const caps = (fallback.data as { capabilities?: Record<string, unknown> } | null)?.capabilities;
+    if (caps && typeof caps === 'object' && !Array.isArray(caps)) {
+      return {
+        row: {
+          active_account_id: typeof caps.active_account_id === 'string' ? caps.active_account_id : null,
+          auto_execute_broker_demo: Boolean(caps.auto_execute_broker_demo),
+          accounts_json: caps.accounts_json,
+          orders_json: caps.orders_json,
+          idempotency_keys_json: caps.idempotency_keys_json,
+        },
+        error: null,
+      };
+    }
+    return { row: null, error: null };
+  }
+
+  async ensureHydrated(userId?: string): Promise<UserBrokerStore> {
+    const uid = this.normalizeUserId(userId);
+    const localStore = this.getStore(uid);
+    if (uid === 'local-preview' || this.hydratedUsers.has(uid)) {
+      return localStore;
+    }
+
+    const inflight = this.pendingHydrations.get(uid);
+    if (inflight) return inflight;
+
+    const hydrationPromise = (async (): Promise<UserBrokerStore> => {
+      const admin = getSupabaseAdmin();
+      if (!admin) {
+        this.hydratedUsers.add(uid);
+        return localStore;
+      }
+
+      try {
+        const { row, error } = await this.readVaultRowFromSupabase(uid);
+
+        if (error) {
+          this.lastPersistenceError = `Supabase broker vault read failed: ${error}`;
+          console.warn(`[BrokerConnectionManager] ${this.lastPersistenceError}`);
+          return localStore;
+        }
+
+        if (row) {
+          const rawAccounts = Array.isArray(row.accounts_json) ? (row.accounts_json as StoredAccountInternal[]) : [];
+          const restoredAccounts: StoredAccountInternal[] = [];
+          for (const item of rawAccounts) {
+            if (!item || typeof item !== 'object') continue;
+            if (item.brokerId !== 'mt5' && item.brokerId !== 'iq_option') continue;
+            if (typeof item.id !== 'string' || !item.id.trim()) continue;
+            const safeEnv: BrokerEnvironment = item.environment === 'real' ? 'real' : 'demo';
+            const enc = this.isValidEncryptedPayload(item.encryptedCredentials) ? item.encryptedCredentials : null;
+            restoredAccounts.push(
+              this.sanitizeAccountForVault({
+                ...item,
+                userId: uid,
+                environment: safeEnv,
+                encryptedCredentials: enc,
+              })
+            );
+          }
+
+          // Merge restored accounts with any in-memory accounts so existing connections are never lost
+          if (restoredAccounts.length > 0) {
+            const byId = new Map<string, StoredAccountInternal>();
+            for (const acct of restoredAccounts) {
+              byId.set(acct.id, acct);
+            }
+            for (const memAcct of localStore.accounts) {
+              const isDefaultSeed = memAcct.id.startsWith('mt5-default-') || memAcct.id.startsWith('iq-default-');
+              if (byId.has(memAcct.id)) {
+                const prev = byId.get(memAcct.id)!;
+                if (memAcct.updatedAt > prev.updatedAt) {
+                  byId.set(memAcct.id, memAcct);
+                }
+              } else if (!isDefaultSeed || !restoredAccounts.some((a) => a.brokerId === memAcct.brokerId)) {
+                byId.set(memAcct.id, memAcct);
+              }
+            }
+            localStore.accounts = Array.from(byId.values());
+          }
+
+          if (Array.isArray(row.orders_json)) {
+            const existingOrderIds = new Set(localStore.orders.map((o) => o.id));
+            const restoredOrders = (row.orders_json as BrokerOrderRecord[]).filter(
+              (o) => o && typeof o === 'object' && typeof o.id === 'string' && (o.brokerId === 'mt5' || o.brokerId === 'iq_option')
+            );
+            for (const ord of restoredOrders) {
+              if (!existingOrderIds.has(ord.id)) {
+                localStore.orders.push(ord);
+                existingOrderIds.add(ord.id);
+              }
+            }
+            localStore.orders.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+            if (localStore.orders.length > 250) localStore.orders.length = 250;
+          }
+
+          if (row.idempotency_keys_json && typeof row.idempotency_keys_json === 'object' && !Array.isArray(row.idempotency_keys_json)) {
+            const restoredKeys = row.idempotency_keys_json as Record<string, string>;
+            localStore.seenIdempotencyKeys = { ...restoredKeys, ...localStore.seenIdempotencyKeys };
+          }
+
+          if (
+            !localStore.activeAccountId &&
+            typeof row.active_account_id === 'string' &&
+            localStore.accounts.some((a) => a.id === row.active_account_id)
+          ) {
+            localStore.activeAccountId = row.active_account_id;
+          }
+
+          if (typeof row.auto_execute_broker_demo === 'boolean' && localStore.activeAccountId) {
+            localStore.autoExecuteBrokerDemo = row.auto_execute_broker_demo;
+          }
+        }
+
+        this.hydratedUsers.add(uid);
+        this.lastPersistenceError = null;
+        return localStore;
+      } catch (err) {
+        this.lastPersistenceError = `Supabase broker vault hydration error: ${err instanceof Error ? err.message : 'unknown error'}`;
+        console.warn(`[BrokerConnectionManager] ${this.lastPersistenceError}`);
+        return localStore;
+      } finally {
+        this.pendingHydrations.delete(uid);
+      }
+    })();
+
+    this.pendingHydrations.set(uid, hydrationPromise);
+    return hydrationPromise;
+  }
+
+  private async persistStoreToSupabase(userId: string | undefined, store: UserBrokerStore): Promise<{ ok: boolean; error?: string }> {
+    const uid = this.normalizeUserId(userId);
+    if (uid === 'local-preview') return { ok: true };
+    const admin = getSupabaseAdmin();
+    if (!admin) return { ok: true };
+
     try {
-      fs.mkdirSync(path.dirname(filePath), { recursive: true });
-      fs.writeFileSync(filePath, JSON.stringify(store, null, 2), { mode: 0o600 });
-    } catch {
-      // Non-fatal persistence fallback
+      const sanitizedAccounts = store.accounts.map((a) => this.sanitizeAccountForVault(a));
+      const trimmedOrders = store.orders.slice(0, 250);
+      const keyEntries = Object.entries(store.seenIdempotencyKeys);
+      const trimmedKeys =
+        keyEntries.length > 500
+          ? Object.fromEntries(keyEntries.slice(keyEntries.length - 500))
+          : { ...store.seenIdempotencyKeys };
+      const nowIso = new Date().toISOString();
+
+      const vaultPayload = {
+        active_account_id: store.activeAccountId,
+        auto_execute_broker_demo: Boolean(store.autoExecuteBrokerDemo),
+        accounts_json: sanitizedAccounts,
+        orders_json: trimmedOrders,
+        idempotency_keys_json: trimmedKeys,
+      };
+
+      if (!this.vaultTableUnavailable) {
+        const { error } = await admin.from('broker_vault_state').upsert(
+          {
+            user_id: uid,
+            ...vaultPayload,
+            updated_at: nowIso,
+          },
+          { onConflict: 'user_id' }
+        );
+        if (!error) {
+          this.lastPersistenceError = null;
+          return { ok: true };
+        }
+        if (this.isMissingTableError(error)) {
+          this.vaultTableUnavailable = true;
+        } else {
+          this.lastPersistenceError = `Supabase broker vault write failed: ${error.message}`;
+          console.warn(`[BrokerConnectionManager] ${this.lastPersistenceError}`);
+          return { ok: false, error: error.message };
+        }
+      }
+
+      // Fallback write into existing public.broker_connections table (encrypted AES-256-GCM credentials only)
+      const fallbackWrite = await admin.from('broker_connections').upsert(
+        {
+          user_id: uid,
+          broker_name: '__vault_state__',
+          environment: 'PRACTICE',
+          status: 'DISCONNECTED',
+          account_type: 'ENCRYPTED_VAULT',
+          capabilities: vaultPayload,
+          execution_enabled: false,
+          last_checked_at: nowIso,
+          updated_at: nowIso,
+        },
+        { onConflict: 'user_id,broker_name' }
+      );
+      if (fallbackWrite.error) {
+        this.lastPersistenceError = `Supabase broker vault write failed: ${fallbackWrite.error.message}`;
+        console.warn(`[BrokerConnectionManager] ${this.lastPersistenceError}`);
+        return { ok: false, error: fallbackWrite.error.message };
+      }
+      this.lastPersistenceError = null;
+      return { ok: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'unknown error';
+      this.lastPersistenceError = `Supabase broker vault write exception: ${msg}`;
+      console.warn(`[BrokerConnectionManager] ${this.lastPersistenceError}`);
+      return { ok: false, error: msg };
+    }
+  }
+
+  private saveStore(userId: string | undefined, store: UserBrokerStore, persistRemote = true) {
+    const filePath = this.getStorePath(userId);
+    if (filePath) {
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, JSON.stringify(store, null, 2), { mode: 0o600 });
+      } catch {
+        // Non-fatal local persistence fallback
+      }
+    }
+    if (persistRemote) {
+      void this.persistStoreToSupabase(userId, store);
     }
   }
 
@@ -438,7 +771,7 @@ export class BrokerConnectionManager {
   async listAccounts(
     userId: string
   ): Promise<{ activeAccountId: string | null; autoExecuteBrokerDemo: boolean; accounts: ManagedBrokerAccountPublic[] }> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const list = await Promise.all(store.accounts.map((a) => this.toPublicAccount(a)));
     return {
       activeAccountId: store.activeAccountId,
@@ -459,17 +792,15 @@ export class BrokerConnectionManager {
       riskLimits?: Partial<BrokerAccountRiskLimits>;
     }
   ): Promise<ManagedBrokerAccountPublic> {
-    if (input.environment === 'real') {
-      throw new Error('Real-money broker accounts are locked while live execution is disabled. Use demo/practice environment.');
-    }
     const adapter = this.registry.get(input.brokerId);
     if (!adapter) {
       throw new Error(`Unsupported broker: ${input.brokerId}`);
     }
 
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const now = new Date().toISOString();
     let target = input.accountId ? store.accounts.find((a) => a.id === input.accountId) : undefined;
+    const resolvedEnv: BrokerEnvironment = input.environment === 'real' ? 'real' : 'demo';
 
     if (!target) {
       const creds = input.credentials || {};
@@ -480,8 +811,8 @@ export class BrokerConnectionManager {
         id: crypto.randomUUID(),
         userId,
         brokerId: input.brokerId,
-        label: input.label.trim() || `${adapter.brokerName} Demo`,
-        environment: 'demo',
+        label: input.label.trim() || `${adapter.brokerName} ${resolvedEnv === 'real' ? 'Real' : 'Demo'}`,
+        environment: resolvedEnv,
         externalAccountId: input.externalAccountId?.trim() || creds.accountNumber?.trim() || null,
         status: hasBridge ? 'GATEWAY OFFLINE' : 'NOT CONFIGURED',
         connected: false,
@@ -505,6 +836,9 @@ export class BrokerConnectionManager {
       store.accounts.push(target);
     } else {
       target.label = input.label.trim() || target.label;
+      if (input.environment) {
+        target.environment = input.environment === 'real' ? 'real' : 'demo';
+      }
       if (input.externalAccountId !== undefined) {
         target.externalAccountId = input.externalAccountId?.trim() || null;
       }
@@ -526,28 +860,35 @@ export class BrokerConnectionManager {
       target.updatedAt = now;
     }
 
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     return this.toPublicAccount(target);
   }
 
-  deleteAccount(userId: string, accountId: string): boolean {
-    const store = this.getStore(userId);
+  async deleteAccount(userId: string, accountId: string): Promise<boolean> {
+    const store = await this.ensureHydrated(userId);
     const idx = store.accounts.findIndex((a) => a.id === accountId);
     if (idx === -1) return false;
     store.accounts.splice(idx, 1);
     if (store.activeAccountId === accountId) {
       store.activeAccountId = null;
+      store.autoExecuteBrokerDemo = false;
     }
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     return true;
   }
 
-  selectActiveAccount(userId: string, accountId: string | null): { activeAccountId: string | null; autoExecuteBrokerDemo: boolean } {
-    const store = this.getStore(userId);
+  async selectActiveAccount(
+    userId: string,
+    accountId: string | null
+  ): Promise<{ activeAccountId: string | null; autoExecuteBrokerDemo: boolean }> {
+    const store = await this.ensureHydrated(userId);
     if (accountId === null) {
       store.activeAccountId = null;
       store.autoExecuteBrokerDemo = false;
-      this.saveStore(userId, store);
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
       return { activeAccountId: null, autoExecuteBrokerDemo: false };
     }
     const acct = store.accounts.find((a) => a.id === accountId);
@@ -558,7 +899,8 @@ export class BrokerConnectionManager {
     if (acct.brokerId !== 'mt5' || !acct.connected) {
       store.autoExecuteBrokerDemo = false;
     }
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     return { activeAccountId: acct.id, autoExecuteBrokerDemo: Boolean(store.autoExecuteBrokerDemo) };
   }
 
@@ -571,15 +913,145 @@ export class BrokerConnectionManager {
     return this.getStore(userId).activeAccountId;
   }
 
+  getActiveAccountBucket(userId: string): AccountPerformanceBucket {
+    const store = this.getStore(userId);
+    if (!store.activeAccountId) return 'PAPER_SIMULATOR';
+    const acct = store.accounts.find((a) => a.id === store.activeAccountId);
+    if (!acct) return 'PAPER_SIMULATOR';
+    return resolveAccountBucket(acct.brokerId, acct.environment);
+  }
+
+  getAccountBucket(userId: string, accountId?: string | null): AccountPerformanceBucket {
+    const store = this.getStore(userId);
+    const targetId = accountId ?? store.activeAccountId;
+    if (!targetId) return 'PAPER_SIMULATOR';
+    const acct = store.accounts.find((a) => a.id === targetId);
+    if (!acct) return 'PAPER_SIMULATOR';
+    return resolveAccountBucket(acct.brokerId, acct.environment);
+  }
+
+  resolveVerifiedBrokerSession(
+    userId: string,
+    appName: 'MT5' | 'IQ_OPTION' | 'UNKNOWN'
+  ): VerifiedBrokerAccountSession {
+    if (appName === 'UNKNOWN') {
+      return {
+        verified: false,
+        mode: 'UNKNOWN',
+        source: 'UNVERIFIED',
+        brokerAccountId: null,
+        reason: 'Target trading app could not be verified as MT5 or IQ Option.',
+      };
+    }
+
+    const expectedBrokerId: BrokerId = appName === 'MT5' ? 'mt5' : 'iq_option';
+    const store = this.getStore(userId);
+    const activeAcct = store.activeAccountId ? store.accounts.find((a) => a.id === store.activeAccountId) : undefined;
+    const acct =
+      activeAcct && activeAcct.brokerId === expectedBrokerId && activeAcct.connected
+        ? activeAcct
+        : store.accounts.find((a) => a.brokerId === expectedBrokerId && a.connected);
+
+    if (!acct || !acct.connected) {
+      return {
+        verified: false,
+        mode: 'UNKNOWN',
+        source: 'UNVERIFIED',
+        brokerAccountId: null,
+        reason: `No connected ${appName === 'MT5' ? 'MetaTrader 5 (MT5)' : 'IQ Option'} broker session is active to verify account mode.`,
+      };
+    }
+
+    const rawAccountType = (acct.accountType || '').trim().toUpperCase();
+    if (acct.brokerId === 'mt5') {
+      if (rawAccountType && acct.environment === 'demo' && rawAccountType !== 'DEMO') {
+        return {
+          verified: false,
+          mode: 'UNKNOWN',
+          source: 'UNVERIFIED',
+          brokerAccountId: null,
+          reason: `MT5 session mode conflict: configured environment is DEMO but bridge reported ${rawAccountType}.`,
+        };
+      }
+      if (rawAccountType && acct.environment === 'real' && rawAccountType !== 'REAL') {
+        return {
+          verified: false,
+          mode: 'UNKNOWN',
+          source: 'UNVERIFIED',
+          brokerAccountId: null,
+          reason: `MT5 session mode conflict: configured environment is REAL but bridge reported ${rawAccountType}.`,
+        };
+      }
+      return {
+        verified: true,
+        mode: acct.environment === 'real' ? 'REAL' : 'DEMO',
+        source: 'MT5_BRIDGE',
+        brokerAccountId: acct.id,
+      };
+    }
+
+    if (rawAccountType && acct.environment === 'demo' && rawAccountType !== 'PRACTICE' && rawAccountType !== 'DEMO') {
+      return {
+        verified: false,
+        mode: 'UNKNOWN',
+        source: 'UNVERIFIED',
+        brokerAccountId: null,
+        reason: `IQ Option session mode conflict: configured environment is DEMO but connector reported ${rawAccountType}.`,
+      };
+    }
+    if (rawAccountType && acct.environment === 'real' && rawAccountType !== 'REAL') {
+      return {
+        verified: false,
+        mode: 'UNKNOWN',
+        source: 'UNVERIFIED',
+        brokerAccountId: null,
+        reason: `IQ Option session mode conflict: configured environment is REAL but connector reported ${rawAccountType}.`,
+      };
+    }
+    return {
+      verified: true,
+      mode: acct.environment === 'real' ? 'REAL' : 'PRACTICE',
+      source: 'IQ_CONNECTOR',
+      brokerAccountId: acct.id,
+    };
+  }
+
+  getBrokerHealthSummary(userId: string) {
+    const store = this.getStore(userId);
+    const active = store.activeAccountId ? store.accounts.find((a) => a.id === store.activeAccountId) ?? null : null;
+    const mt5DemoConnected = store.accounts.some((a) => a.brokerId === 'mt5' && a.environment === 'demo' && a.connected);
+    const mt5RealConnected = store.accounts.some((a) => a.brokerId === 'mt5' && a.environment === 'real' && a.connected);
+    const iqDemoConnected = store.accounts.some((a) => a.brokerId === 'iq_option' && a.environment === 'demo' && a.connected);
+    const iqRealConnected = store.accounts.some((a) => a.brokerId === 'iq_option' && a.environment === 'real' && a.connected);
+    return {
+      activeTarget: this.getActiveAccountBucket(userId),
+      activeAccount: active
+        ? {
+            id: active.id,
+            brokerId: active.brokerId,
+            environment: active.environment,
+            connected: active.connected,
+            accountType: active.accountType,
+          }
+        : null,
+      autoBrokerRoutingEnabled: Boolean(store.autoExecuteBrokerDemo && active && active.brokerId === 'mt5' && active.connected),
+      mt5DemoConnected,
+      mt5RealConnected,
+      iqDemoConnected,
+      iqRealConnected,
+    };
+  }
+
   async setAutoBrokerExecutionEnabled(
     userId: string,
     enabled: boolean,
     globalEmergencyStop: boolean
   ): Promise<{ enabled: boolean; activeAccountId: string | null; reason: string }> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     if (!enabled || globalEmergencyStop) {
       store.autoExecuteBrokerDemo = false;
-      this.saveStore(userId, store);
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
       return {
         enabled: false,
         activeAccountId: store.activeAccountId,
@@ -589,49 +1061,50 @@ export class BrokerConnectionManager {
       };
     }
     if (!store.activeAccountId) {
-      throw new Error('Select a connected MetaTrader 5 (MT5) demo account as your Active Execution Target first.');
+      throw new Error('Select a connected MetaTrader 5 (MT5) account as your Active Execution Target first.');
     }
     const acct = store.accounts.find((a) => a.id === store.activeAccountId);
-    if (!acct || acct.environment !== 'demo' || !acct.connected) {
-      throw new Error('Active execution account must be a connected DEMO account.');
+    if (!acct || !acct.connected || (acct.environment !== 'demo' && acct.brokerId !== 'mt5')) {
+      throw new Error('Active execution account must be a connected MT5 account (Demo or Real) or Practice Sandbox.');
     }
     const adapter = this.registry.get(acct.brokerId);
     const caps = adapter ? await adapter.getCapabilities(this.toContext(acct)) : null;
-    if (!caps?.demoOrderPlacementSupported) {
-      throw new Error(`${acct.label} is read-only and cannot receive automatic demo orders.`);
+    const supportsExecution = acct.environment === 'real' ? caps?.liveOrderPlacementSupported : caps?.demoOrderPlacementSupported;
+    if (!supportsExecution) {
+      throw new Error(`${acct.label} is read-only and cannot receive automatic broker orders in ${acct.environment.toUpperCase()} mode.`);
     }
     store.autoExecuteBrokerDemo = true;
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     return {
       enabled: true,
       activeAccountId: acct.id,
-      reason: `Validated AI signals will route guarded demo orders to ${acct.label} while Emergency Stop and risk limits stay clear.`,
+      reason: `Validated AI signals will route guarded ${acct.environment.toUpperCase()} orders to ${acct.label} while Emergency Stop and risk limits stay clear.`,
     };
   }
 
-  updateAccountRiskLimits(userId: string, accountId: string, limits: Partial<BrokerAccountRiskLimits>): BrokerAccountRiskLimits {
-    const store = this.getStore(userId);
+  async updateAccountRiskLimits(
+    userId: string,
+    accountId: string,
+    limits: Partial<BrokerAccountRiskLimits>
+  ): Promise<BrokerAccountRiskLimits> {
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     acct.riskLimits = { ...acct.riskLimits, ...limits };
     acct.updatedAt = new Date().toISOString();
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     return { ...acct.riskLimits };
   }
 
   async connectAccount(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) {
       throw new BrokerConnectionError('Broker account not found.', {
         statusCode: 404,
         connectionStatus: 'NOT CONFIGURED',
-      });
-    }
-    if (acct.environment !== 'demo') {
-      throw new BrokerConnectionError('Real-money broker connections are locked.', {
-        statusCode: 423,
-        connectionStatus: acct.status,
       });
     }
     const adapter = this.registry.get(acct.brokerId);
@@ -657,7 +1130,8 @@ export class BrokerConnectionManager {
       acct.lastCheckedAt = now;
       acct.lastSyncedAt = res.connected ? now : acct.lastSyncedAt;
       acct.updatedAt = now;
-      this.saveStore(userId, store);
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
 
       const statusSnap = await adapter.getStatus(this.toContext(acct));
       void this.syncBrokerSummaryToSupabase(acct, statusSnap);
@@ -710,7 +1184,8 @@ export class BrokerConnectionManager {
       acct.lastError = msg;
       acct.lastCheckedAt = now;
       acct.updatedAt = now;
-      this.saveStore(userId, store);
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
       const publicAccount = await this.toPublicAccount(acct);
       throw new BrokerConnectionError(msg, {
         statusCode,
@@ -721,7 +1196,7 @@ export class BrokerConnectionManager {
   }
 
   async disconnectAccount(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
@@ -737,12 +1212,13 @@ export class BrokerConnectionManager {
       store.activeAccountId = null;
       store.autoExecuteBrokerDemo = false;
     }
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     return this.toPublicAccount(acct);
   }
 
   async checkHealthAndSyncBalance(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
@@ -771,7 +1247,8 @@ export class BrokerConnectionManager {
     if (!acct.connected && store.activeAccountId === acct.id) {
       store.autoExecuteBrokerDemo = false;
     }
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
     void this.syncBrokerSummaryToSupabase(acct, snap);
     return this.toPublicAccount(acct, snap.diagnostics, snap);
   }
@@ -792,7 +1269,7 @@ export class BrokerConnectionManager {
   }
 
   async getAccountQuote(userId: string, accountId: string, symbol: string): Promise<BrokerQuote> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
@@ -809,7 +1286,7 @@ export class BrokerConnectionManager {
     intervalSeconds: number,
     count: number
   ): Promise<{ candles: BrokerCandle[]; source: string; note?: string }> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
@@ -823,7 +1300,7 @@ export class BrokerConnectionManager {
     userId: string,
     accountId: string
   ): Promise<{ supported: boolean; positions: BrokerPosition[]; source: string; note?: string }> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
@@ -839,7 +1316,7 @@ export class BrokerConnectionManager {
   }
 
   async getAccountAssets(userId: string, accountId: string) {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
@@ -862,10 +1339,12 @@ export class BrokerConnectionManager {
     }
   ): Promise<BrokerOrderValidationResult> {
     const cleanSymbol = input.symbol.toUpperCase();
+    const store = await this.ensureHydrated(userId);
+    const acct = store.accounts.find((a) => a.id === input.accountId);
     const fail = (reason: string, compatible = false): BrokerOrderValidationResult => ({
       valid: false,
       compatible,
-      environment: 'demo',
+      environment: acct?.environment ?? 'demo',
       symbol: cleanSymbol,
       mappedSymbol: compatible ? cleanSymbol : null,
       direction: input.direction,
@@ -881,23 +1360,20 @@ export class BrokerConnectionManager {
     if (input.globalEmergencyStop) {
       return fail('Emergency Stop is active. Order validation & execution halted.');
     }
-    const store = this.getStore(userId);
-    const acct = store.accounts.find((a) => a.id === input.accountId);
     if (!acct) {
       return fail('Selected broker account not found.');
     }
     this.rollAccountDay(acct);
-    if (acct.environment !== 'demo') {
-      return fail('Real-money broker orders are locked. Demo/Practice environment only.');
-    }
     const adapter = this.registry.get(acct.brokerId);
     if (!adapter) {
       return fail('Broker adapter not installed.');
     }
     const ctx = this.toContext(acct);
     const caps = await adapter.getCapabilities(ctx);
-    if (!caps.demoOrderPlacementSupported) {
-      return fail(`${adapter.brokerName} is read-only or unconfigured for demo order placement.`);
+    const supportsExecution =
+      acct.environment === 'real' ? caps.liveOrderPlacementSupported : caps.demoOrderPlacementSupported;
+    if (!supportsExecution) {
+      return fail(`${adapter.brokerName} is read-only or unconfigured for ${acct.environment.toUpperCase()} order placement.`);
     }
     const compat = adapter.checkInstrumentCompatibility(cleanSymbol, input.assetClass, input.orderType, ctx);
     if (!compat.compatible || !compat.mappedSymbol) {
@@ -921,12 +1397,12 @@ export class BrokerConnectionManager {
       return fail(`Daily loss limit ($${limits.maxDailyLoss}) reached on ${acct.label}.`, true);
     }
     if (!acct.connected) {
-      return fail(`${acct.label} is not connected. Connect the demo session to run terminal validation.`, true);
+      return fail(`${acct.label} is not connected. Connect the ${acct.environment.toUpperCase()} session to run terminal validation.`, true);
     }
 
     if (adapter.validateOrder) {
       const orderReq: BrokerOrderRequest = {
-        environment: 'demo',
+        environment: acct.environment,
         symbol: cleanSymbol,
         mappedSymbol: compat.mappedSymbol,
         assetClass: input.assetClass,
@@ -943,7 +1419,7 @@ export class BrokerConnectionManager {
     return {
       valid: true,
       compatible: true,
-      environment: 'demo',
+      environment: acct.environment,
       symbol: cleanSymbol,
       mappedSymbol: compat.mappedSymbol,
       direction: input.direction,
@@ -977,19 +1453,16 @@ export class BrokerConnectionManager {
       throw new Error('Emergency Stop is active. All broker and paper order execution is halted.');
     }
 
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === input.accountId);
     if (!acct) {
       throw new Error('Selected broker account not found.');
     }
     this.rollAccountDay(acct);
 
-    // 1. Validate account environment & connection
-    if (acct.environment !== 'demo') {
-      throw new Error('Real-money broker orders are locked. Demo/Practice environment only.');
-    }
+    // 1. Validate account connection (execution destination strictly follows the user's selected account & environment)
     if (!acct.connected) {
-      throw new Error(`${acct.label} is not connected. Connect the demo session first.`);
+      throw new Error(`${acct.label} is not connected. Connect the ${acct.environment.toUpperCase()} session first.`);
     }
 
     // 2. Duplicate-order protection via explicit idempotencyKey + short 8s (account, symbol, direction) window
@@ -1036,8 +1509,10 @@ export class BrokerConnectionManager {
     if (!adapter) throw new Error('Broker adapter not installed.');
     const ctx = this.toContext(acct);
     const caps = await adapter.getCapabilities(ctx);
-    if (!caps.demoOrderPlacementSupported || !adapter.placeOrder) {
-      throw new Error(`${adapter.brokerName} is read-only or does not support order placement.`);
+    const supportsExecution =
+      acct.environment === 'real' ? caps.liveOrderPlacementSupported : caps.demoOrderPlacementSupported;
+    if (!supportsExecution || !adapter.placeOrder) {
+      throw new Error(`${adapter.brokerName} is read-only or does not support ${acct.environment.toUpperCase()} order placement.`);
     }
 
     const compat = adapter.checkInstrumentCompatibility(input.symbol, input.assetClass, input.orderType, ctx);
@@ -1078,7 +1553,7 @@ export class BrokerConnectionManager {
     }
 
     const orderPayload: BrokerOrderRequest = {
-      environment: 'demo',
+      environment: acct.environment,
       symbol: input.symbol,
       mappedSymbol: compat.mappedSymbol,
       assetClass: input.assetClass,
@@ -1098,7 +1573,7 @@ export class BrokerConnectionManager {
       }
     }
 
-    // 5. Execute sandbox/demo order on broker adapter
+    // 5. Execute order on broker adapter (Demo or Real for MT5)
     const placement = await adapter.placeOrder(ctx, orderPayload);
 
     const record: BrokerOrderRecord = {
@@ -1107,7 +1582,7 @@ export class BrokerConnectionManager {
       accountId: acct.id,
       brokerId: acct.brokerId,
       brokerName: adapter.brokerName,
-      environment: 'demo',
+      environment: acct.environment,
       symbol: input.symbol.toUpperCase(),
       mappedSymbol: placement.mappedSymbol,
       direction: input.direction,
@@ -1131,13 +1606,14 @@ export class BrokerConnectionManager {
     store.orders.unshift(record);
     if (store.orders.length > 250) store.orders.length = 250;
     store.seenIdempotencyKeys[idempotencyKey] = record.id;
-    this.saveStore(userId, store);
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
 
     return { order: record, placement };
   }
 
   async reconcileOrders(userId: string, accountId?: string): Promise<{ updatedCount: number; orders: BrokerOrderRecord[] }> {
-    const store = this.getStore(userId);
+    const store = await this.ensureHydrated(userId);
     let updatedCount = 0;
 
     for (const ord of store.orders) {
@@ -1165,23 +1641,123 @@ export class BrokerConnectionManager {
       }
     }
 
-    if (updatedCount > 0) this.saveStore(userId, store);
+    if (updatedCount > 0) {
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
+    }
     return {
       updatedCount,
       orders: accountId ? store.orders.filter((o) => o.accountId === accountId) : store.orders,
     };
   }
 
-  async syncAccountTradeHistory(userId: string, accountId: string): Promise<BrokerTradeHistoryResult> {
+  getSettledOrderLearnables(userId: string, accountId?: string): LearnableTradeRecord[] {
     const store = this.getStore(userId);
+    const out: LearnableTradeRecord[] = [];
+    for (const ord of store.orders) {
+      if (accountId && ord.accountId !== accountId) continue;
+      if (ord.status !== 'CLOSED' && ord.status !== 'FILLED') continue;
+      if (typeof ord.realizedPnl !== 'number' || !Number.isFinite(ord.realizedPnl) || ord.realizedPnl === 0) continue;
+      const acct = store.accounts.find((a) => a.id === ord.accountId);
+      const brokerId = acct?.brokerId ?? ord.brokerId;
+      const env = acct?.environment ?? ord.environment;
+      const signalId = ord.idempotencyKey?.startsWith('auto-') ? ord.idempotencyKey.slice(5) : undefined;
+      out.push({
+        id: `broker-order:${ord.brokerId}:${ord.environment}:${ord.brokerOrderId || ord.id}`,
+        brokerOrderId: `${ord.brokerId}:${ord.brokerOrderId || ord.id}`,
+        signalId,
+        symbol: ord.symbol,
+        timeframe: '5m',
+        direction: ord.direction,
+        amount: Math.max(1, ord.amount),
+        payoutRate: 0.8,
+        entryPrice: ord.filledPrice ?? ord.entryPrice,
+        exitPrice: null,
+        status: ord.realizedPnl > 0 ? 'CLOSED_WIN' : 'CLOSED_LOSS',
+        pnl: Number(ord.realizedPnl.toFixed(2)),
+        signalScore: null,
+        settledBy: 'broker-reconciliation',
+        createdAt: ord.createdAt,
+        closedAt: ord.reconciledAt || ord.createdAt,
+        accountBucket: resolveAccountBucket(brokerId, env),
+      });
+    }
+    return out;
+  }
+
+  private extractHistoryLearnables(
+    acct: StoredAccountInternal,
+    trades: Array<Record<string, unknown>>
+  ): LearnableTradeRecord[] {
+    const out: LearnableTradeRecord[] = [];
+    const bucket = resolveAccountBucket(acct.brokerId, acct.environment);
+    for (let i = 0; i < trades.length; i++) {
+      const item = trades[i];
+      if (!item || typeof item !== 'object') continue;
+      const rawPnl = item.pnl ?? item.profit;
+      const pnl = typeof rawPnl === 'number' ? rawPnl : Number(rawPnl);
+      if (!Number.isFinite(pnl) || pnl === 0) continue;
+      const symbol = String(item.symbol || item.active || '').toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+      if (!symbol) continue;
+
+      const rawId = item.ticket ?? item.order_id ?? item.orderId ?? item.id ?? `${i}-${item.closed_at || item.time || ''}`;
+      const extId = String(rawId).trim();
+      if (!extId) continue;
+
+      const rawDir = String(item.direction ?? item.side ?? item.type ?? 'CALL').toUpperCase();
+      const direction: 'CALL' | 'PUT' =
+        rawDir === 'PUT' || rawDir === 'SELL' || rawDir === '1' ? 'PUT' : 'CALL';
+      const rawAmt = Number(item.amount ?? item.stake ?? item.volume ?? item.invest ?? 100);
+      const amount = Number.isFinite(rawAmt) && rawAmt > 0 ? rawAmt : 100;
+      const entryRaw = item.entryPrice ?? item.entry_price ?? item.open_price ?? item.openPrice;
+      const exitRaw = item.exitPrice ?? item.exit_price ?? item.close_price ?? item.closePrice;
+      const entryPrice = typeof entryRaw === 'number' && Number.isFinite(entryRaw) ? entryRaw : null;
+      const exitPrice = typeof exitRaw === 'number' && Number.isFinite(exitRaw) ? exitRaw : null;
+      const closedRaw = item.closedAt ?? item.closed_at ?? item.close_time ?? item.time;
+      const closedAt =
+        typeof closedRaw === 'number'
+          ? new Date(closedRaw > 1e12 ? closedRaw : closedRaw * 1000).toISOString()
+          : typeof closedRaw === 'string' && closedRaw
+            ? closedRaw
+            : new Date().toISOString();
+
+      out.push({
+        id: `broker-hist:${acct.brokerId}:${acct.environment}:${extId}`,
+        brokerOrderId: `${acct.brokerId}:${extId}`,
+        symbol,
+        timeframe: '5m',
+        direction,
+        amount,
+        payoutRate: 0.8,
+        entryPrice,
+        exitPrice,
+        status: pnl > 0 ? 'CLOSED_WIN' : 'CLOSED_LOSS',
+        pnl: Number(pnl.toFixed(2)),
+        signalScore: null,
+        settledBy: 'broker-history-sync',
+        createdAt: closedAt,
+        closedAt,
+        accountBucket: bucket,
+      });
+    }
+    return out;
+  }
+
+  async syncAccountTradeHistory(
+    userId: string,
+    accountId: string
+  ): Promise<BrokerTradeHistoryResult & { learnedRecords: LearnableTradeRecord[] }> {
+    const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
     if (!adapter) throw new Error('Broker adapter missing.');
     const res = await adapter.getTradeHistory(this.toContext(acct));
     acct.lastSyncedAt = new Date().toISOString();
-    this.saveStore(userId, store);
-    return res;
+    this.saveStore(userId, store, false);
+    await this.persistStoreToSupabase(userId, store);
+    const learnedRecords = res.supported ? this.extractHistoryLearnables(acct, res.trades) : [];
+    return { ...res, learnedRecords };
   }
 
   listOrders(userId: string, accountId?: string): BrokerOrderRecord[] {

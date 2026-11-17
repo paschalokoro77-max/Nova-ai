@@ -21,7 +21,7 @@ import type {
 const MT5_LIMITATIONS = [
   'Uses the official MetaTrader5 Python SDK hosted inside novatrade-ai/mt5-connector on a Windows machine/VPS running the MetaTrader 5 Desktop Terminal (terminal64.exe).',
   'MetaQuotes official Python wheels run only on Windows x64; a Linux cloud container cannot open MT5 IPC directly without the Windows bridge.',
-  'Bridge connections are restricted strictly to ACCOUNT_TRADE_MODE_DEMO; REAL accounts are disconnected and rejected fail-closed.',
+  'Supports both DEMO and REAL accounts matching the environment configured on your connected MT5 terminal account (enforces mt5.order_check() pre-flight validation).',
   'Binary fixed-expiry options are not supported on MetaTrader 5 (executes MARKET and LIMIT spot/CFD orders).',
 ];
 
@@ -61,6 +61,19 @@ function validateBridgeUrl(rawUrl: string): {
   } catch {
     return { valid: false, normalized: null, host: null, isLocalhost: false, warning: 'MT5 bridge URL is malformed.' };
   }
+}
+
+export function parseMt5BridgeConfig(rawUrl = process.env.MT5_BRIDGE_URL || '', bridgeToken = process.env.MT5_BRIDGE_TOKEN || '') {
+  const urlInfo = validateBridgeUrl(rawUrl);
+  return {
+    configured: Boolean(rawUrl.trim()),
+    urlValid: urlInfo.valid,
+    normalizedUrl: urlInfo.normalized,
+    targetHost: urlInfo.host,
+    isLocalhost: urlInfo.isLocalhost,
+    tokenConfigured: Boolean(bridgeToken.trim()),
+    warning: urlInfo.warning,
+  };
 }
 
 export class MetaTrader5Adapter implements BrokerAdapter {
@@ -137,20 +150,20 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       authorisedApiVerified: false,
       connectorConfigured: cfg.valid,
       demoSupported: true,
-      realAccountSupported: false,
+      realAccountSupported: true,
       orderExecutionSupported: cfg.valid,
       marketDataSupported: cfg.valid,
       accountSyncSupported: cfg.valid,
       positionsSyncSupported: cfg.valid,
       historySupported: cfg.valid,
       demoOrderPlacementSupported: cfg.valid,
-      liveOrderPlacementSupported: false,
+      liveOrderPlacementSupported: cfg.valid,
       supportedAssetClasses: ['FOREX', 'COMMODITY', 'CFD'],
       supportedOrderTypes: ['MARKET', 'LIMIT'],
-      environment: cfg.valid ? 'demo' : null,
+      environment: cfg.valid ? (ctx?.environment ?? 'demo') : null,
       message: cfg.valid
-        ? `Official MetaTrader 5 Python bridge configured (${cfg.host}) for DEMO synchronization, market quotes/candles, open positions, pre-flight order_check(), and guarded demo execution.`
-        : 'Official MetaTrader 5 Python bridge ready (`novatrade-ai/mt5-connector`). Start it on Windows alongside your MT5 Demo terminal and configure the Bridge URL to connect.',
+        ? `Official MetaTrader 5 Python bridge configured (${cfg.host}) for DEMO and REAL account synchronization, market quotes/candles, open positions, pre-flight order_check(), and guarded execution.`
+        : 'Official MetaTrader 5 Python bridge ready (`novatrade-ai/mt5-connector`). Start it on Windows alongside your MT5 terminal (Demo or Real) and configure the Bridge URL to connect.',
       credentialFields: [
         {
           key: 'accountNumber',
@@ -225,6 +238,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       const latencyMs = Date.now() - started;
       const tradeMode = String(health.tradeMode || 'DEMO').toUpperCase();
       const isDemo = tradeMode === 'DEMO';
+      const isSupportedTradeMode = tradeMode === 'DEMO' || tradeMode === 'REAL';
 
       let balance: number | null = null;
       let equity: number | null = null;
@@ -244,7 +258,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
         ...caps,
         authorisedApiVerified: Boolean(health.connected),
         connected: Boolean(health.connected),
-        executionEnabled: isDemo && Boolean(health.connected),
+        executionEnabled: isSupportedTradeMode && Boolean(health.connected),
         accountType: health.connected ? `${tradeMode} (${health.server || cfg.serverName || 'MT5'})` : null,
         balance,
         equity,
@@ -254,7 +268,9 @@ export class MetaTrader5Adapter implements BrokerAdapter {
         message: health.connected
           ? isDemo
             ? `Connected to official MT5 Python DEMO bridge (${cfg.host}, ${latencyMs}ms).`
-            : `Connected to official MT5 ${tradeMode} account (${cfg.host}, ${latencyMs}ms). Real-money order execution is locked.`
+            : isSupportedTradeMode
+              ? `Connected to official MT5 ${tradeMode} account (${cfg.host}, ${latencyMs}ms).`
+              : `Connected to MT5 ${tradeMode} account (${cfg.host}, ${latencyMs}ms); unsupported trade mode for execution.`
           : `MT5 bridge reachable (${latencyMs}ms); terminal session not connected yet.`,
         limitations: MT5_LIMITATIONS,
         diagnostics: {
@@ -290,9 +306,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
   }
 
   async connect(ctx?: BrokerAccountContext) {
-    if (ctx?.environment === 'real') {
-      throw new Error('MetaTrader 5 REAL accounts are blocked. Connect only a DEMO terminal account.');
-    }
+    const targetEnv = ctx?.environment === 'real' ? 'real' : 'demo';
     const cfg = this.resolveConfig(ctx);
     const res = await this.requestBridge<{
       connected?: boolean;
@@ -308,7 +322,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       {
         method: 'POST',
         body: JSON.stringify({
-          environment: 'demo',
+          environment: targetEnv,
           login: cfg.login || undefined,
           password: cfg.password || undefined,
           server: cfg.serverName || 'MetaQuotes-Demo',
@@ -316,8 +330,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       },
       ctx
     );
-    const tradeMode = String(res.tradeMode || 'DEMO').toUpperCase();
-    const isDemo = tradeMode === 'DEMO';
+    const tradeMode = String(res.tradeMode || targetEnv.toUpperCase()).toUpperCase();
     return {
       connected: Boolean(res.connected),
       accountType: res.accountType || `${tradeMode} (${res.server || cfg.serverName || 'MT5'})`,
@@ -326,9 +339,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       currency: res.currency || 'USD',
       externalAccountId: res.login ? String(res.login) : cfg.login || null,
       message: res.connected
-        ? isDemo
-          ? 'Connected to official MetaTrader 5 DEMO Python bridge.'
-          : `Connected to official MetaTrader 5 ${tradeMode} account (inspection mode; real trading locked).`
+        ? `Connected to official MetaTrader 5 ${tradeMode} Python bridge.`
         : 'MT5 bridge did not authenticate terminal.',
     };
   }
@@ -474,7 +485,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
     const assetClass: BrokerAssetClass = order.assetClass || 'FOREX';
     const compat = this.checkInstrumentCompatibility(order.symbol, assetClass, order.orderType);
 
-    if (order.environment !== 'demo' || ctx.environment !== 'demo') {
+    if (order.environment !== ctx.environment) {
       return {
         valid: false,
         compatible: false,
@@ -487,8 +498,8 @@ export class MetaTrader5Adapter implements BrokerAdapter {
         normalizedVolume: null,
         estimatedMargin: null,
         freeMargin: null,
-        reason: 'MT5 live orders are locked. DEMO environment only.',
-        source: 'MT5_SAFETY_LOCK',
+        reason: `Environment mismatch: order targets ${order.environment.toUpperCase()} but account ${ctx.label} is configured as ${ctx.environment.toUpperCase()}.`,
+        source: 'MT5_ENVIRONMENT_GUARD',
       };
     }
 
@@ -496,7 +507,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       return {
         valid: false,
         compatible: false,
-        environment: 'demo',
+        environment: ctx.environment,
         symbol: compat.symbol,
         mappedSymbol: null,
         direction: order.direction,
@@ -516,7 +527,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       return {
         valid: false,
         compatible: true,
-        environment: 'demo',
+        environment: ctx.environment,
         symbol: compat.symbol,
         mappedSymbol: compat.mappedSymbol,
         direction: order.direction,
@@ -545,7 +556,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       {
         method: 'POST',
         body: JSON.stringify({
-          environment: 'demo',
+          environment: ctx.environment,
           symbol: compat.mappedSymbol,
           side: order.direction === 'CALL' ? 'BUY' : 'SELL',
           orderType: order.orderType,
@@ -560,7 +571,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
     return {
       valid: Boolean(res.valid),
       compatible: res.compatible !== false,
-      environment: 'demo',
+      environment: ctx.environment,
       symbol: compat.symbol,
       mappedSymbol: res.mappedSymbol || compat.mappedSymbol,
       direction: order.direction,
@@ -576,8 +587,10 @@ export class MetaTrader5Adapter implements BrokerAdapter {
   }
 
   async placeOrder(ctx: BrokerAccountContext, order: BrokerOrderRequest): Promise<BrokerOrderPlacementResult> {
-    if (order.environment !== 'demo' || ctx.environment !== 'demo') {
-      throw new Error('MT5 live orders are locked. DEMO environment only.');
+    if (order.environment !== ctx.environment) {
+      throw new Error(
+        `Environment mismatch: order targets ${order.environment.toUpperCase()} but account ${ctx.label} is ${ctx.environment.toUpperCase()}.`
+      );
     }
     const assetClass: BrokerAssetClass = order.assetClass || 'FOREX';
     const compat = this.checkInstrumentCompatibility(order.symbol, assetClass, order.orderType);
@@ -597,7 +610,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       {
         method: 'POST',
         body: JSON.stringify({
-          environment: 'demo',
+          environment: ctx.environment,
           symbol: compat.mappedSymbol,
           side: order.direction === 'CALL' ? 'BUY' : 'SELL',
           orderType: order.orderType,
@@ -619,7 +632,7 @@ export class MetaTrader5Adapter implements BrokerAdapter {
       filledPrice: typeof res.filledPrice === 'number' ? res.filledPrice : null,
       filledUnits: finalLots,
       rawStatus,
-      message: res.message || `MT5 Demo order routed (${finalLots} lots on ${compat.mappedSymbol}).`,
+      message: res.message || `MT5 ${ctx.environment.toUpperCase()} order routed (${finalLots} lots on ${compat.mappedSymbol}).`,
       submittedAt: new Date().toISOString(),
     };
   }

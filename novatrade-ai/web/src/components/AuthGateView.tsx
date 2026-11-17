@@ -30,6 +30,7 @@ export function AuthGateView({ themePreference, systemPrefersDark, onChangeTheme
   const [notice, setNotice] = useState<string | null>(null);
 
   const callbackUrl = getAuthCallbackUrl();
+  const isProdBuild = import.meta.env.PROD;
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -38,6 +39,9 @@ export function AuthGateView({ themePreference, systemPrefersDark, onChangeTheme
     setBusy(true);
     try {
       if (!isSupabaseConfigured) {
+        if (isProdBuild) {
+          throw new Error('Production deployment requires live Supabase authentication credentials.');
+        }
         if (mode === 'recovery') {
           setNotice('Password recovery requires your Supabase project URL and publishable key.');
           return;

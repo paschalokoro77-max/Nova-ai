@@ -139,7 +139,11 @@ export class IQOptionAdapter implements BrokerAdapter {
   }
 
   private getHeaders(ctx?: BrokerAccountContext): Record<string, string> {
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+      'x-iq-mode': requestedMode,
+    };
     const token = (ctx?.credentials.bridgeToken || process.env.IQ_CONNECTOR_TOKEN || '').trim();
     if (token) headers['x-connector-token'] = token;
     return headers;
@@ -202,7 +206,7 @@ export class IQOptionAdapter implements BrokerAdapter {
       authorisedApiVerified: false,
       connectorConfigured: cfg.urlValid,
       demoSupported: cfg.urlValid,
-      realAccountSupported: false,
+      realAccountSupported: cfg.urlValid,
       orderExecutionSupported: false,
       marketDataSupported: cfg.urlValid,
       accountSyncSupported: cfg.urlValid,
@@ -212,12 +216,12 @@ export class IQOptionAdapter implements BrokerAdapter {
       liveOrderPlacementSupported: false,
       supportedAssetClasses: ['FOREX', 'CRYPTO', 'BINARY'],
       supportedOrderTypes: ['BINARY_FIXED_EXPIRY'],
-      environment: cfg.urlValid ? 'demo' : null,
+      environment: cfg.urlValid ? (ctx?.environment === 'real' ? 'real' : 'demo') : null,
       message: !cfg.configured
-        ? 'IQ_CONNECTOR_URL is not set. Configure a private iq-connector instance for PRACTICE read-only diagnostics.'
+        ? 'IQ_CONNECTOR_URL is not set. Configure a private iq-connector instance for Demo or Real diagnostics.'
         : !cfg.urlValid
           ? cfg.warnings[0] || 'IQ_CONNECTOR_URL is malformed.'
-          : `IQ Option PRACTICE read-only connector configured (${cfg.targetHost}). Order execution remains locked.`,
+          : `IQ Option ${ctx?.environment === 'real' ? 'REAL' : 'PRACTICE'} read-only connector configured (${cfg.targetHost}). Order execution remains locked.`,
       credentialFields: [
         {
           key: 'email',
@@ -274,48 +278,73 @@ export class IQOptionAdapter implements BrokerAdapter {
     }
 
     const started = Date.now();
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
     try {
       const health = await this.requestConnector<{
         connected?: boolean;
         mode?: string;
+        accountType?: string;
+        modeVerified?: boolean;
         credentialsConfigured?: boolean;
         lastError?: string | null;
       }>('/health', {}, ctx);
       const latencyMs = Date.now() - started;
 
       let balance: number | null = null;
-      let accountType: string | null = health.connected ? 'PRACTICE' : null;
+      let accountType: string | null = health.connected ? health.accountType || health.mode || requestedMode : null;
       let currency: string | null = null;
+      let modeVerificationError: string | null = null;
 
       if (health.connected) {
         try {
           const acct = await this.requestConnector<{
             accountType?: string;
+            mode?: string;
+            modeVerified?: boolean;
             balance?: number;
             currency?: string;
           }>('/account', {}, ctx);
-          balance = typeof acct.balance === 'number' ? acct.balance : null;
-          accountType = acct.accountType || 'PRACTICE';
-          currency = acct.currency || 'USD';
-        } catch {
-          // Keep health connected state even if /account fails transiently
+          const reportedMode = String(acct.accountType || acct.mode || accountType || 'PRACTICE').toUpperCase();
+          if (requestedMode === 'REAL' && (acct.modeVerified === false || reportedMode !== 'REAL')) {
+            modeVerificationError = `IQ Option connector could not verify REAL account mode (reported ${reportedMode}).`;
+            accountType = null;
+            balance = null;
+          } else {
+            balance = typeof acct.balance === 'number' ? acct.balance : null;
+            accountType = reportedMode;
+            currency = acct.currency || 'USD';
+          }
+        } catch (acctErr) {
+          if (requestedMode === 'REAL') {
+            modeVerificationError =
+              acctErr instanceof Error ? acctErr.message : 'IQ Option REAL account verification failed.';
+            accountType = null;
+            balance = null;
+          }
         }
       }
 
+      if (requestedMode === 'REAL' && health.connected && health.modeVerified === false) {
+        modeVerificationError =
+          modeVerificationError ||
+          `IQ Option connector could not verify REAL mode (mode=${health.mode || 'UNVERIFIED'}).`;
+      }
+
+      const verifiedConnected = Boolean(health.connected) && !modeVerificationError;
       const diagnostics: BrokerConnectorDiagnostics = {
         ...baseDiagnostics,
         reachable: true,
-        authenticated: Boolean(health.connected),
+        authenticated: verifiedConnected,
         credentialsConfigured:
           typeof health.credentialsConfigured === 'boolean' ? health.credentialsConfigured : null,
         latencyMs,
-        lastConnectorError: health.lastError ?? null,
+        lastConnectorError: modeVerificationError || health.lastError || null,
       };
 
       const warningSuffix = cfg.warnings.length > 0 ? ` (${cfg.warnings[0]})` : '';
       return {
         ...caps,
-        connected: Boolean(health.connected),
+        connected: verifiedConnected,
         executionEnabled: false,
         accountType,
         balance,
@@ -323,11 +352,13 @@ export class IQOptionAdapter implements BrokerAdapter {
         currency,
         connectorUrlConfigured: true,
         lastCheckedAt: checkedAt,
-        message: health.connected
-          ? `Connected to IQ Option connector (${accountType || 'PRACTICE'} read-only, ${latencyMs}ms). Order execution locked.${warningSuffix}`
-          : health.credentialsConfigured
-            ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || 'click Connect to initiate PRACTICE session'}).${warningSuffix}`
-            : `IQ connector reachable (${latencyMs}ms), but IQ_EMAIL / IQ_PASSWORD are not set on the connector host.${warningSuffix}`,
+        message: modeVerificationError
+          ? modeVerificationError
+          : verifiedConnected
+            ? `Connected to IQ Option connector (${accountType || requestedMode} read-only, ${latencyMs}ms). Order execution locked.${warningSuffix}`
+            : health.credentialsConfigured
+              ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || `click Connect to initiate ${requestedMode} session`}).${warningSuffix}`
+              : `IQ connector reachable (${latencyMs}ms), but IQ_EMAIL / IQ_PASSWORD are not set on the connector host.${warningSuffix}`,
         limitations: IQ_LIMITATIONS,
         diagnostics,
       };
@@ -358,42 +389,78 @@ export class IQOptionAdapter implements BrokerAdapter {
   }
 
   async connect(ctx?: BrokerAccountContext) {
-    if (ctx?.environment === 'real') {
-      throw new Error('IQ Option real accounts are locked. Only PRACTICE read-only diagnostics are permitted.');
-    }
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
     const creds = ctx?.credentials || {};
-    const res = await this.requestConnector<{ connected?: boolean; accountType?: string; mode?: string }>(
+    const res = await this.requestConnector<{
+      connected?: boolean;
+      accountType?: string;
+      mode?: string;
+      modeVerified?: boolean;
+      detail?: string;
+    }>(
       '/connect',
       {
         method: 'POST',
         body: JSON.stringify({
           email: creds.email || undefined,
           password: creds.apiSecret || undefined,
+          mode: requestedMode,
         }),
       },
       ctx
     );
+
+    const reportedMode = String(res.accountType || res.mode || '').toUpperCase();
+    if (
+      requestedMode === 'REAL' &&
+      (res.modeVerified === false || (reportedMode && reportedMode !== 'REAL'))
+    ) {
+      return {
+        connected: false,
+        accountType: reportedMode || null,
+        balance: null,
+        equity: null,
+        currency: null,
+        externalAccountId: null,
+        message:
+          res.detail ||
+          `IQ Option connector could not verify REAL account mode (reported ${reportedMode || 'UNVERIFIED'}); refusing to mask PRACTICE as REAL.`,
+      };
+    }
+
     let balance: number | null = null;
     let currency: string | null = 'USD';
+    let confirmedAccountType = reportedMode || requestedMode;
     if (res.connected) {
       try {
         const acct = await this.getBalance(ctx);
         balance = acct.balance;
         currency = acct.currency;
-      } catch {
-        // Optional balance read after connect
+        confirmedAccountType = acct.accountType;
+      } catch (err) {
+        if (requestedMode === 'REAL') {
+          return {
+            connected: false,
+            accountType: null,
+            balance: null,
+            equity: null,
+            currency: null,
+            externalAccountId: null,
+            message: err instanceof Error ? err.message : 'IQ Option REAL mode balance verification failed.',
+          };
+        }
       }
     }
     return {
       connected: Boolean(res.connected),
-      accountType: res.accountType || res.mode || 'PRACTICE',
+      accountType: confirmedAccountType,
       balance,
       equity: balance,
       currency,
-      externalAccountId: 'iq-practice',
+      externalAccountId: requestedMode === 'REAL' ? 'iq-real' : 'iq-practice',
       message: res.connected
-        ? 'Authenticated with IQ Option connector in PRACTICE read-only mode. Order placement remains disabled.'
-        : 'IQ Option connector did not confirm an active session.',
+        ? `Authenticated with IQ Option connector in ${confirmedAccountType} read-only mode. Order placement remains disabled.`
+        : res.detail || 'IQ Option connector did not confirm an active session.',
     };
   }
 
@@ -407,16 +474,26 @@ export class IQOptionAdapter implements BrokerAdapter {
   }
 
   async getBalance(ctx?: BrokerAccountContext) {
-    const acct = await this.requestConnector<{ balance?: number; accountType?: string; currency?: string; source?: string }>(
-      '/account',
-      {},
-      ctx
-    );
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
+    const acct = await this.requestConnector<{
+      balance?: number;
+      accountType?: string;
+      mode?: string;
+      modeVerified?: boolean;
+      currency?: string;
+      source?: string;
+    }>('/account', {}, ctx);
+    const reportedMode = String(acct.accountType || acct.mode || 'PRACTICE').toUpperCase();
+    if (requestedMode === 'REAL' && (acct.modeVerified === false || reportedMode !== 'REAL')) {
+      throw new Error(
+        `IQ Option REAL mode verification failed (connector reported ${reportedMode}). Refusing to treat PRACTICE balance as REAL.`
+      );
+    }
     const bal = typeof acct.balance === 'number' ? acct.balance : null;
     return {
       balance: bal,
       equity: bal,
-      accountType: acct.accountType || 'PRACTICE',
+      accountType: reportedMode,
       currency: acct.currency || 'USD',
       source: acct.source || 'IQ_OPTION_UNOFFICIAL',
     };
@@ -531,11 +608,24 @@ export class IQOptionAdapter implements BrokerAdapter {
         note: cfg.warnings[0] || 'IQ_CONNECTOR_URL is not configured.',
       };
     }
-    const res = await this.requestConnector<BrokerTradeHistoryResult>('/history', {}, ctx);
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
+    const res = await this.requestConnector<BrokerTradeHistoryResult & { mode?: string; modeVerified?: boolean }>(
+      '/history',
+      {},
+      ctx
+    );
+    if (
+      requestedMode === 'REAL' &&
+      (res.modeVerified === false || (res.mode && String(res.mode).toUpperCase() !== 'REAL'))
+    ) {
+      throw new Error(
+        `IQ Option REAL history verification failed (connector reported ${res.mode || 'UNVERIFIED'}).`
+      );
+    }
     return {
       supported: Boolean(res.supported),
       trades: Array.isArray(res.trades) ? res.trades : [],
-      note: res.note || 'Retrieved from IQ Option connector.',
+      note: res.note || `Retrieved from IQ Option connector (${requestedMode}).`,
     };
   }
 }

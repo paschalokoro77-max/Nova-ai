@@ -31,10 +31,10 @@ jobs:
           cd novatrade-ai/android-companion
           chmod +x gradlew
 
-      - name: Build Debug APK with Gradle
+      - name: Run Unit Tests and Build Debug APK with Gradle
         run: |
           cd novatrade-ai/android-companion
-          ./gradlew assembleDebug --no-daemon
+          ./gradlew testDebugUnitTest assembleDebug --no-daemon
 
       - name: Verify APK Exists
         run: |
@@ -45,3 +45,4 @@ jobs:
         with:
           name: android-companion-debug-apk
           path: novatrade-ai/android-companion/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

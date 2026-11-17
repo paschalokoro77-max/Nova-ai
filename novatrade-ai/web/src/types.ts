@@ -2,6 +2,7 @@ export type Timeframe = '1m' | '5m' | '15m' | '1h';
 export type OperatingMode = 'signals' | 'assisted' | 'automatic';
 export type StrategyProfile = 'conservative' | 'balanced' | 'momentum';
 export type ThemePreference = 'light' | 'dark' | 'system';
+export type DashboardAccountSource = 'paper' | 'mt5' | 'iq_option';
 
 export type NavSection =
   | 'overview'
@@ -122,8 +123,12 @@ export interface SignalRecord {
   bearishScore: number;
   entryPrice: number | null;
   suggestedExpirySeconds: number;
+  requestedExpirySeconds?: number;
+  effectiveExpirySeconds?: number;
+  expiryAdjusted?: boolean;
+  expiryAdjustmentReason?: string | null;
   provider: string;
-  marketStatus?: 'OPEN' | 'DELAYED_OR_CLOSED' | 'UNAVAILABLE';
+  marketStatus?: 'LIVE' | 'DELAYED' | 'MARKET_CLOSED' | 'OPEN' | 'DELAYED_OR_CLOSED' | 'UNAVAILABLE';
   isStale?: boolean;
   timestamp: string;
   indicators: IndicatorSnapshot | null;
@@ -148,7 +153,7 @@ export interface CandleFeedResponse {
   currentPrice: number | null;
   priceChangePct: number | null;
   provider: string;
-  marketStatus: 'OPEN' | 'DELAYED_OR_CLOSED' | 'UNAVAILABLE';
+  marketStatus: 'LIVE' | 'DELAYED' | 'MARKET_CLOSED' | 'OPEN' | 'DELAYED_OR_CLOSED' | 'UNAVAILABLE';
   fetchedAt: string;
   lastBarAt: string | null;
   latencyMs: number;
@@ -172,10 +177,18 @@ export interface ScannerRow {
   timeframe: Timeframe;
   direction: 'CALL' | 'PUT' | 'WAIT';
   score: number;
+  rawDirectionalConfidence?: number;
+  actionableConfidence?: number;
+  confidenceState?: 'STALE_OR_UNAVAILABLE' | 'WEAK_SETUP_WAIT' | 'STRONG_SETUP_ACTIONABLE';
+  zeroConfidenceReason?: string | null;
   suggestedExpirySeconds: number;
+  requestedExpirySeconds?: number;
+  effectiveExpirySeconds?: number;
+  expiryAdjusted?: boolean;
+  expiryAdjustmentReason?: string | null;
   entryPrice: number | null;
   provider: string;
-  marketStatus?: 'OPEN' | 'DELAYED_OR_CLOSED' | 'UNAVAILABLE';
+  marketStatus?: 'LIVE' | 'DELAYED' | 'MARKET_CLOSED' | 'OPEN' | 'DELAYED_OR_CLOSED' | 'UNAVAILABLE';
   isStale?: boolean;
   trend: string;
   rsi14: number | null;
@@ -199,7 +212,12 @@ export interface PaperTrade {
   payoutRate: number;
   entryPrice: number | null;
   exitPrice: number | null;
+  stopLoss?: number | null;
+  takeProfit?: number | null;
   expirySeconds: number;
+  requestedExpirySeconds?: number;
+  expiryAdjusted?: boolean;
+  expiryAdjustmentReason?: string | null;
   expiresAt: string | null;
   status: string;
   pnl: number | null;
@@ -219,6 +237,9 @@ export interface AssistedProposal {
   recommendedAmount: number;
   entryPrice: number | null;
   expirySeconds: number;
+  requestedExpirySeconds?: number;
+  expiryAdjusted?: boolean;
+  expiryAdjustmentReason?: string | null;
   reasons: string[];
   status: 'PENDING_APPROVAL' | 'APPROVED' | 'REJECTED';
   createdAt: string;
@@ -550,6 +571,37 @@ export interface HealthStatus {
   geminiConfigured: boolean;
   iqConnectorConfigured: boolean;
   iqConnectorUrlValid?: boolean;
+  executionCapabilities?: {
+    paperSimulation: boolean;
+    mt5BridgeConfigured: boolean;
+    mt5DemoRoutingSupported: boolean;
+    mt5RealRoutingSupported: boolean;
+    iqOptionInspectionSupported: boolean;
+    iqOptionOrderExecutionSupported: boolean;
+  };
+  execution?: {
+    paperSimulation: { supported: boolean; active: boolean };
+    mt5Demo: { supported: boolean; bridgeConfigured: boolean; connected: boolean; active: boolean };
+    mt5Real: { supported: boolean; bridgeConfigured: boolean; connected: boolean; active: boolean };
+    iqOption: {
+      inspectionSupported: boolean;
+      orderExecutionSupported: boolean;
+      demoConnected: boolean;
+      realConnected: boolean;
+      active: boolean;
+      selectedEnvironment: 'demo' | 'real' | null;
+    };
+    autoBrokerRoutingEnabled: boolean;
+    activeTarget: 'PAPER_SIMULATOR' | 'MT5_DEMO' | 'MT5_REAL' | 'IQ_OPTION_DEMO' | 'IQ_OPTION_REAL';
+    activeAccount: {
+      id: string;
+      brokerId: 'mt5' | 'iq_option';
+      label: string;
+      environment: 'demo' | 'real';
+      connected: boolean;
+      accountType: string | null;
+    } | null;
+  };
 }
 
 export interface UserProfile {
@@ -638,6 +690,8 @@ export interface AndroidActionQueueItem {
   stakeOrVolume: number;
   expirySeconds: number;
   accountModeVerified: 'DEMO' | 'PRACTICE' | 'REAL' | 'UNKNOWN';
+  accountModeVerificationSource?: 'BROKER_SESSION' | 'MT5_BRIDGE' | 'IQ_CONNECTOR' | 'UNVERIFIED';
+  verifiedBrokerAccountId?: string | null;
   status:
     | 'PENDING_USER_APPROVAL'
     | 'AUTHORIZED'
@@ -645,7 +699,7 @@ export interface AndroidActionQueueItem {
     | 'EXECUTED_REPORTED'
     | 'REJECTED'
     | 'BLOCKED_RISK'
-    | 'BLOCKED_REAL_MONEY_LOCK'
+    | 'BLOCKED_UNVERIFIED_ACCOUNT'
     | 'EXPIRED';
   reason: string;
   expiresAt: string | null;

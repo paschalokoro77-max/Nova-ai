@@ -50,6 +50,7 @@ import type {
   BrokerStatusSnapshot,
   Candle,
   CandleFeedResponse,
+  DashboardAccountSource,
   HealthStatus,
   InstrumentCompatibilityResult,
   ManagedBrokerAccountPublic,
@@ -215,6 +216,7 @@ export default function App() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
   const [mode, setMode] = useState<OperatingMode>('signals');
   const [autoArmed, setAutoArmed] = useState(false);
+  const [autoStatus, setAutoStatus] = useState<string>('WAITING FOR OPPORTUNITY');
   const [riskStatus, setRiskStatus] = useState<RiskStatus | null>(null);
   const [aiSettings, setAiSettings] = useState<AiSettings | null>(null);
   const [brokerStatus, setBrokerStatus] = useState<BrokerStatusSnapshot | null>(null);
@@ -223,6 +225,17 @@ export default function App() {
   const [activeBrokerAccountId, setActiveBrokerAccountId] = useState<string | null>(null);
   const [autoBrokerExecution, setAutoBrokerExecution] = useState(false);
   const [brokerOrders, setBrokerOrders] = useState<BrokerOrderRecord[]>([]);
+  const [dashboardSource, setDashboardSource] = useState<DashboardAccountSource>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('novatrade_dashboard_source');
+      if (stored === 'paper' || stored === 'mt5' || stored === 'iq_option') {
+        return stored;
+      }
+    }
+    return 'paper';
+  });
+  const [mt5Positions, setMt5Positions] = useState<BrokerPosition[]>([]);
+  const [mt5PositionsLoading, setMt5PositionsLoading] = useState(false);
   const [androidDevices, setAndroidDevices] = useState<AndroidDevicePublic[]>([]);
   const [androidAnalyses, setAndroidAnalyses] = useState<AndroidScreenAnalysisRecord[]>([]);
   const [androidActions, setAndroidActions] = useState<AndroidActionQueueItem[]>([]);
@@ -277,21 +290,15 @@ export default function App() {
   // Auth & persistent session initialization
   useEffect(() => {
     if (!isSupabaseConfigured || !supabase) {
+      if (import.meta.env.PROD) {
+        localStorage.removeItem(LOCAL_PROFILE_KEY);
+        setProfile(null);
+        setAuthReady(true);
+        return;
+      }
       try {
         const saved = localStorage.getItem(LOCAL_PROFILE_KEY);
-        if (saved) {
-          setProfile(JSON.parse(saved) as UserProfile);
-        } else {
-          setProfile({
-            id: 'local-research-session',
-            email: 'research@novatrade.local',
-            displayName: 'Research Workspace',
-            role: 'trader',
-            preferredCurrency: 'USD',
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
-            authMode: 'local-preview',
-          });
-        }
+        setProfile(saved ? (JSON.parse(saved) as UserProfile) : null);
       } catch {
         setProfile(null);
       }
@@ -355,7 +362,7 @@ export default function App() {
         apiRequest<{ assets: AssetDefinition[] }>('/api/market/assets', { headers: authHeaders }),
         apiRequest<RiskStatus>('/api/risk/status', { headers: authHeaders }),
         apiRequest<{ settings: AiSettings }>('/api/ai/settings', { headers: authHeaders }),
-        apiRequest<{ armed: boolean }>('/api/auto-paper/status', { headers: authHeaders }),
+        apiRequest<{ armed: boolean; status?: string }>('/api/auto-paper/status', { headers: authHeaders }),
         apiRequest<BrokerStatusSnapshot>('/api/broker/status', { headers: authHeaders }),
         apiRequest<{ brokers: BrokerCatalogItem[] }>('/api/brokers/catalog', { headers: authHeaders }),
         apiRequest<{
@@ -386,6 +393,7 @@ export default function App() {
       setRiskStatus(riskRes);
       setAiSettings(aiRes.settings);
       setAutoArmed(autoRes.armed);
+      setAutoStatus(autoRes.status || 'WAITING FOR OPPORTUNITY');
       setBrokerStatus(brokerRes ?? null);
       setBrokerCatalog(Array.isArray(catalogRes?.brokers) ? catalogRes.brokers : []);
       setBrokerAccounts(Array.isArray(accountsRes?.accounts) ? accountsRes.accounts.filter(Boolean) : []);
@@ -436,7 +444,8 @@ export default function App() {
     setCandleError(null);
     try {
       const res = await apiRequest<CandleFeedResponse>(
-        `/api/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&limit=140`
+        `/api/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${timeframe}&limit=140`,
+        { headers: authHeaders }
       );
       setCandleFeed(res);
     } catch (err) {
@@ -445,7 +454,7 @@ export default function App() {
     } finally {
       setCandleLoading(false);
     }
-  }, []);
+  }, [authHeaders]);
 
   useEffect(() => {
     if (!profile) return;
@@ -879,15 +888,17 @@ export default function App() {
     accountId?: string;
     brokerId: BrokerId;
     label: string;
+    environment?: 'demo' | 'real';
     externalAccountId?: string | null;
     credentials: Record<string, string>;
   }): Promise<ManagedBrokerAccountPublic> {
     setBusy(true);
     try {
+      const targetEnv = input.brokerId === 'mt5' && input.environment === 'real' ? 'real' : 'demo';
       const res = await apiRequest<{ account?: ManagedBrokerAccountPublic; error?: string; message?: string }>('/api/brokers/accounts', {
         method: 'POST',
         headers: authHeaders,
-        body: JSON.stringify({ ...input, environment: 'demo' }),
+        body: JSON.stringify({ ...input, environment: targetEnv }),
       });
       const account = res?.account;
       if (!account || typeof account !== 'object' || !account.id) {
@@ -895,7 +906,11 @@ export default function App() {
           sanitizeErrorMessage(res?.error ?? res?.message, 'Unable to save broker account: invalid server response.')
         );
       }
-      pushToast('success', 'Broker Account Saved', `${account.label || input.label || 'Broker Account'} saved securely (demo-only).`);
+      pushToast(
+        'success',
+        'Broker Account Saved',
+        `${account.label || input.label || 'Broker Account'} saved securely (${account.environment.toUpperCase()}).`
+      );
       await refreshPlatformState();
       return account;
     } finally {
@@ -926,10 +941,13 @@ export default function App() {
         body: JSON.stringify({ accountId }),
       });
       setActiveBrokerAccountId(accountId);
+      const selected = accountId ? brokerAccounts.find((a) => a.id === accountId) : null;
       pushToast(
         'info',
         'Execution Target Updated',
-        accountId ? 'Routed manual/sandbox orders to selected demo broker account.' : 'Switched back to NovaTrade Paper Simulator.'
+        accountId
+          ? `Routed orders to ${selected ? `${selected.label} (${selected.environment.toUpperCase()})` : 'selected broker account'}.`
+          : 'Switched back to NovaTrade Paper Simulator.'
       );
       await refreshPlatformState();
     } catch (err) {
@@ -1222,12 +1240,13 @@ export default function App() {
   ) {
     setBusy(true);
     try {
+      const targetEnv = brokerAccounts.find((a) => a.id === accountId)?.environment || 'demo';
       const res = await apiRequest<{ order: BrokerOrderRecord; duplicatePrevented?: boolean }>('/api/brokers/orders', {
         method: 'POST',
         headers: authHeaders,
         body: JSON.stringify({
           accountId,
-          environment: 'demo',
+          environment: targetEnv,
           symbol,
           direction,
           orderType,
@@ -1240,12 +1259,12 @@ export default function App() {
       });
       pushToast(
         res.duplicatePrevented ? 'warning' : 'success',
-        res.duplicatePrevented ? 'Duplicate Order Prevented' : `Demo ${direction} Sent`,
+        res.duplicatePrevented ? 'Duplicate Order Prevented' : `${targetEnv === 'real' ? 'Real' : 'Demo'} ${direction} Sent`,
         `${res.order.brokerName}: ${res.order.mappedSymbol} (${res.order.status})`
       );
       await refreshPlatformState();
     } catch (err) {
-      pushToast('error', 'Broker Demo Order Blocked', err instanceof Error ? err.message : 'Order validation failed.');
+      pushToast('error', 'Broker Order Blocked', err instanceof Error ? err.message : 'Order validation failed.');
     } finally {
       setBusy(false);
     }
@@ -1262,7 +1281,7 @@ export default function App() {
       setAutoBrokerExecution(res.enabled);
       pushToast(
         res.enabled ? 'info' : 'warning',
-        res.enabled ? 'Auto MT5 Demo Routing Armed' : 'Auto MT5 Demo Routing Disarmed',
+        res.enabled ? 'Auto MT5 Routing Armed' : 'Auto MT5 Routing Disarmed',
         res.reason
       );
       await refreshPlatformState();
@@ -1280,12 +1299,13 @@ export default function App() {
     amount: number,
     orderType: BrokerOrderType
   ): Promise<BrokerOrderValidationResult> {
+    const targetEnv = brokerAccounts.find((a) => a.id === accountId)?.environment || 'demo';
     const res = await apiRequest<{ validation: BrokerOrderValidationResult }>('/api/brokers/orders/validate', {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({
         accountId,
-        environment: 'demo',
+        environment: targetEnv,
         symbol,
         direction,
         orderType,
@@ -1331,6 +1351,155 @@ export default function App() {
       { headers: authHeaders }
     );
   }
+
+  const handleSelectDashboardSource = useCallback((source: DashboardAccountSource) => {
+    setDashboardSource(source);
+    try {
+      localStorage.setItem('novatrade_dashboard_source', source);
+    } catch {
+      // Ignore storage errors
+    }
+    void apiRequest('/api/dashboard/source', {
+      method: 'PUT',
+      headers: authHeaders,
+      body: JSON.stringify({ source }),
+    }).catch(() => {
+      // Graceful background sync
+    });
+  }, [authHeaders]);
+
+  // Detected MT5 account and mode
+  const mt5Account = useMemo(() => {
+    return (
+      brokerAccounts.find((a) => a.brokerId === 'mt5' && a.connected) ||
+      brokerAccounts.find((a) => a.brokerId === 'mt5') ||
+      null
+    );
+  }, [brokerAccounts]);
+
+  const mt5AccountMode: 'DEMO' | 'REAL' | 'DISCONNECTED' = useMemo(() => {
+    if (!mt5Account || !mt5Account.connected) return 'DISCONNECTED';
+    const env = (mt5Account.environment || '').toLowerCase();
+    const type = (mt5Account.accountType || '').toLowerCase();
+    if (env === 'real' || type === 'real') return 'REAL';
+    return 'DEMO';
+  }, [mt5Account]);
+
+  const mt5AccountModeLabel =
+    mt5AccountMode === 'DISCONNECTED'
+      ? mt5Account
+        ? 'Disconnected'
+        : 'Not Configured'
+      : mt5AccountMode;
+
+  // Detected IQ Option account and mode
+  const iqAccount = useMemo(() => {
+    return (
+      brokerAccounts.find((a) => a.brokerId === 'iq_option' && a.connected) ||
+      brokerAccounts.find((a) => a.brokerId === 'iq_option') ||
+      null
+    );
+  }, [brokerAccounts]);
+
+  const iqAccountMode: 'PRACTICE' | 'REAL' | 'DISCONNECTED' = useMemo(() => {
+    const isConnected = Boolean((iqAccount && iqAccount.connected) || brokerStatus?.connected);
+    if (!isConnected) return 'DISCONNECTED';
+    const env = (iqAccount?.environment || brokerStatus?.environment || '').toLowerCase();
+    const type = (iqAccount?.accountType || brokerStatus?.accountType || '').toUpperCase();
+    if (env === 'real' || type === 'REAL') return 'REAL';
+    return 'PRACTICE';
+  }, [iqAccount, brokerStatus]);
+
+  const iqAccountModeLabel =
+    iqAccountMode === 'DISCONNECTED'
+      ? iqAccount || brokerStatus?.connectorConfigured
+        ? 'Disconnected'
+        : 'Not Configured'
+      : iqAccountMode;
+
+  // MT5 and IQ Option specific order segmentation and metrics
+  const mt5Orders = useMemo(() => {
+    return brokerOrders.filter((o) => o.brokerId === 'mt5');
+  }, [brokerOrders]);
+
+  const todayMt5Orders = useMemo(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    return mt5Orders.filter((o) => (o.createdAt || '').slice(0, 10) === today);
+  }, [mt5Orders]);
+
+  const mt5TodayPnl = useMemo(() => {
+    return todayMt5Orders.reduce((acc, o) => acc + (typeof o.realizedPnl === 'number' ? o.realizedPnl : 0), 0);
+  }, [todayMt5Orders]);
+
+  const { mt5Wins, mt5Losses, mt5WinRatePct } = useMemo(() => {
+    let wins = 0;
+    let losses = 0;
+    for (const o of mt5Orders) {
+      if (typeof o.realizedPnl === 'number') {
+        if (o.realizedPnl > 0) wins += 1;
+        else if (o.realizedPnl < 0) losses += 1;
+      }
+    }
+    const total = wins + losses;
+    return {
+      mt5Wins: wins,
+      mt5Losses: losses,
+      mt5WinRatePct: total > 0 ? Math.round((wins / total) * 100) : null,
+    };
+  }, [mt5Orders]);
+
+  const iqOrders = useMemo(() => {
+    return brokerOrders.filter((o) => o.brokerId === 'iq_option');
+  }, [brokerOrders]);
+
+  const todayIqOrders = useMemo(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    return iqOrders.filter((o) => (o.createdAt || '').slice(0, 10) === today);
+  }, [iqOrders]);
+
+  const iqTodayPnl = useMemo(() => {
+    return todayIqOrders.reduce((acc, o) => acc + (typeof o.realizedPnl === 'number' ? o.realizedPnl : 0), 0);
+  }, [todayIqOrders]);
+
+  const { iqWins, iqLosses, iqWinRatePct } = useMemo(() => {
+    let wins = 0;
+    let losses = 0;
+    for (const o of iqOrders) {
+      if (typeof o.realizedPnl === 'number') {
+        if (o.realizedPnl > 0) wins += 1;
+        else if (o.realizedPnl < 0) losses += 1;
+      }
+    }
+    const total = wins + losses;
+    return {
+      iqWins: wins,
+      iqLosses: losses,
+      iqWinRatePct: total > 0 ? Math.round((wins / total) * 100) : null,
+    };
+  }, [iqOrders]);
+
+  // Automatically fetch MT5 positions when MT5 dashboard is active
+  useEffect(() => {
+    if (dashboardSource === 'mt5' && mt5Account?.id && mt5Account.connected) {
+      let cancelled = false;
+      setMt5PositionsLoading(true);
+      handleFetchBrokerPositions(mt5Account.id)
+        .then((res) => {
+          if (!cancelled && Array.isArray(res?.positions)) {
+            setMt5Positions(res.positions);
+          }
+        })
+        .catch((err) => {
+          console.warn('Failed to fetch MT5 positions for dashboard:', err);
+        })
+        .finally(() => {
+          if (!cancelled) setMt5PositionsLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [dashboardSource, mt5Account?.id, mt5Account?.connected]);
 
   async function handleSignOut() {
     if (isSupabaseConfigured) {
@@ -1792,16 +1961,21 @@ export default function App() {
             </div>
           )}
 
-          {/* OVERVIEW */}
+          {/* OVERVIEW (ACCOUNT-AWARE DASHBOARD) */}
           {activeNav === 'overview' && (
             <div className="space-y-6">
+              {/* Top Title & Actions */}
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
                   <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-white">
-                    NovaTrade Command Overview
+                    Command Overview
                   </h2>
                   <p className="mt-0.5 text-sm text-slate-600 dark:text-slate-400">
-                    Live quantitative market intelligence, paper simulation portfolio, and server-side risk controls.
+                    {dashboardSource === 'paper'
+                      ? 'Simulated execution portfolio, live quantitative market intelligence, and server-side risk controls.'
+                      : dashboardSource === 'mt5'
+                        ? 'MetaTrader 5 broker dashboard with live balance, equity, open positions, and order history.'
+                        : 'IQ Option connector dashboard with account balance, practice/real mode detection, and market synchronization.'}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -1822,191 +1996,825 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 6 Summary KPI Cards */}
-              <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
-                <div className={`${CARD_SURFACE} p-4`}>
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>Account Balance</span>
-                    <Wallet className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
-                    ${(analytics?.currentVirtualBalance ?? 10000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500">Paper virtual equity</p>
-                </div>
-
-                <div className={`${CARD_SURFACE} p-4`}>
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>Today&apos;s P&amp;L</span>
-                    <TrendingUp className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <p
-                    className={`mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums ${
-                      (analytics?.todayPnl ?? 0) >= 0
-                        ? 'text-emerald-600 dark:text-emerald-400'
-                        : 'text-red-600 dark:text-red-400'
-                    }`}
-                  >
-                    {(analytics?.todayPnl ?? 0) >= 0 ? '+' : ''}
-                    ${(analytics?.todayPnl ?? 0).toFixed(2)}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500">{analytics?.todayTrades ?? 0} settled today</p>
-                </div>
-
-                <div className={`${CARD_SURFACE} p-4`}>
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>Total Trades</span>
-                    <Activity className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
-                    {analytics?.totalTrades ?? 0}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500">{activeTrades.length} active open</p>
-                </div>
-
-                <div className={`${CARD_SURFACE} p-4`}>
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>Win Rate</span>
-                    <Target className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
-                    {analytics?.winRatePct != null ? `${analytics.winRatePct}%` : '—'}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500">
-                    {analytics?.wins ?? 0}W / {analytics?.losses ?? 0}L settled
-                  </p>
-                </div>
-
-                <div className={`${CARD_SURFACE} p-4`}>
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>Active Signals</span>
-                    <Radar className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-blue-600 dark:text-indigo-400">
-                    {actionableSignalsCount}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500">{signals.length} total scanned</p>
-                </div>
-
-                <div className={`${CARD_SURFACE} p-4`}>
-                  <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
-                    <span>AI Status</span>
-                    <Bot className="h-3.5 w-3.5 text-slate-400" />
-                  </div>
-                  <p
-                    className={`mt-2 text-xl sm:text-2xl font-semibold ${
-                      !riskStatus?.allowed
-                        ? 'text-red-600 dark:text-red-400'
-                        : autoArmed
-                          ? 'text-emerald-600 dark:text-emerald-400'
-                          : 'text-blue-600 dark:text-indigo-400'
-                    }`}
-                  >
-                    {!riskStatus?.allowed ? 'Risk Halted' : autoArmed ? 'Autonomous' : mode.toUpperCase()}
-                  </p>
-                  <p className="mt-1 text-[11px] text-slate-500 truncate">
-                    {health?.scheduler.lastCycleSummary || `Interval ${aiSettings?.scanIntervalSeconds ?? 60}s`}
-                  </p>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                <div className={`lg:col-span-2 ${CARD_SURFACE} p-5`}>
-                  <div className="flex items-center justify-between mb-3">
-                    <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Paper Equity Performance</h3>
-                    <button
-                      type="button"
-                      onClick={() => setActiveNav('analytics')}
-                      className="text-xs font-medium text-blue-600 dark:text-indigo-400 hover:underline"
-                    >
-                      Daily / Weekly / Monthly Analytics
-                    </button>
-                  </div>
-                  <EquityChart points={analytics?.equityCurve || []} />
-                </div>
-
-                <div className={`${CARD_SURFACE} p-5 flex flex-col justify-between`}>
-                  <div>
-                    <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Quick Automation Control</h3>
-                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-                      Server-side autonomous scheduler monitors {aiSettings?.enabledAssets.length ?? 6} enabled assets every{' '}
-                      {aiSettings?.scanIntervalSeconds ?? 60}s and settles expired paper positions automatically.
-                    </p>
-                  </div>
-                  <div className="space-y-2.5 mt-4">
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => setConfirmState({ type: 'arm-auto', payload: !autoArmed })}
-                      className={`w-full min-h-11 rounded-xl py-2.5 px-4 text-xs font-semibold text-white transition-colors ${
-                        autoArmed ? 'bg-amber-600 hover:bg-amber-500' : 'bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500'
-                      }`}
-                    >
-                      {autoArmed ? 'Pause Automatic Mode' : 'Arm Automatic Mode'}
-                    </button>
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={handleRunAutoCycleNow}
-                      className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
-                    >
-                      Trigger Autonomous Cycle Now
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveNav('paper-trading')}
-                      className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
-                    >
-                      Open Paper Trading Desk
-                    </button>
-                  </div>
-                </div>
-              </div>
-
-              <div className={`${CARD_SURFACE} p-5`}>
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Latest Quantitative Signals</h3>
+              {/* THREE Dashboard Account Selections (Account-Aware Dashboard) */}
+              <div className="flex flex-wrap items-center justify-between gap-3 p-1.5 rounded-xl border border-slate-200/90 dark:border-slate-800 bg-slate-100/90 dark:bg-[#070C17]">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {/* 1. Paper Trading */}
                   <button
                     type="button"
-                    onClick={() => setActiveNav('signals')}
-                    className="text-xs font-medium text-blue-600 dark:text-indigo-400 hover:underline"
+                    onClick={() => handleSelectDashboardSource('paper')}
+                    className={`min-h-10 px-4 py-2 text-xs font-semibold rounded-lg transition-all flex items-center gap-2 ${
+                      dashboardSource === 'paper'
+                        ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm border border-slate-200/80 dark:border-slate-700'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border border-transparent'
+                    }`}
                   >
-                    View All ({signals.length})
+                    <span>1. Paper Trading</span>
+                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-200/70 dark:bg-slate-700/60 text-slate-700 dark:text-slate-300">
+                      Simulated
+                    </span>
+                  </button>
+
+                  {/* 2. MetaTrader 5 */}
+                  <button
+                    type="button"
+                    onClick={() => handleSelectDashboardSource('mt5')}
+                    className={`min-h-10 px-4 py-2 text-xs font-semibold rounded-lg transition-all flex items-center gap-2 ${
+                      dashboardSource === 'mt5'
+                        ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm border border-slate-200/80 dark:border-slate-700'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border border-transparent'
+                    }`}
+                  >
+                    <span>2. MetaTrader 5</span>
+                    <span
+                      className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                        mt5AccountMode === 'REAL'
+                          ? 'bg-amber-100 dark:bg-amber-950/70 text-amber-800 dark:text-amber-300 border border-amber-300/50 dark:border-amber-800/50'
+                          : mt5AccountMode === 'DEMO'
+                            ? 'bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300 border border-emerald-300/50 dark:border-emerald-800/50'
+                            : 'bg-slate-200/60 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
+                      }`}
+                    >
+                      {mt5AccountModeLabel}
+                    </span>
+                  </button>
+
+                  {/* 3. IQ Option */}
+                  <button
+                    type="button"
+                    onClick={() => handleSelectDashboardSource('iq_option')}
+                    className={`min-h-10 px-4 py-2 text-xs font-semibold rounded-lg transition-all flex items-center gap-2 ${
+                      dashboardSource === 'iq_option'
+                        ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-sm border border-slate-200/80 dark:border-slate-700'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white border border-transparent'
+                    }`}
+                  >
+                    <span>3. IQ Option</span>
+                    <span
+                      className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                        iqAccountMode === 'REAL'
+                          ? 'bg-amber-100 dark:bg-amber-950/70 text-amber-800 dark:text-amber-300 border border-amber-300/50 dark:border-amber-800/50'
+                          : iqAccountMode === 'PRACTICE'
+                            ? 'bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300 border border-emerald-300/50 dark:border-emerald-800/50'
+                            : 'bg-slate-200/60 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
+                      }`}
+                    >
+                      {iqAccountModeLabel}
+                    </span>
                   </button>
                 </div>
-                {signals.length === 0 ? (
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    No signals generated yet. Open Live Markets or AI Scanner to evaluate live candles.
-                  </p>
-                ) : (
-                  <div className="divide-y divide-slate-200/80 dark:divide-slate-800">
-                    {signals.slice(0, 5).map((s) => (
-                      <div key={s.id} className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
-                        <div className="flex items-center gap-3">
-                          <span
-                            className={`font-semibold ${
-                              s.direction === 'CALL'
-                                ? 'text-emerald-600 dark:text-emerald-400'
-                                : s.direction === 'PUT'
-                                  ? 'text-red-600 dark:text-red-400'
-                                  : 'text-amber-600 dark:text-amber-400'
-                            }`}
-                          >
-                            {s.direction}
-                          </span>
-                          <span className="font-semibold text-slate-900 dark:text-white">{s.symbol}</span>
-                          <span className="text-slate-500 dark:text-slate-400">
-                            {s.timeframe} · {s.provider}
-                          </span>
+
+                <div className="text-[11px] text-slate-500 dark:text-slate-400 px-2 flex items-center gap-2">
+                  <span>Dashboard Source:</span>
+                  <span className="font-semibold text-slate-800 dark:text-slate-200">
+                    {dashboardSource === 'paper'
+                      ? 'Paper Trading (Simulated)'
+                      : dashboardSource === 'mt5'
+                        ? `MetaTrader 5 · ${mt5AccountModeLabel}`
+                        : `IQ Option · ${iqAccountModeLabel}`}
+                  </span>
+                </div>
+              </div>
+
+              {/* ========================================================================= */}
+              {/* SOURCE 1: PAPER TRADING DASHBOARD */}
+              {/* ========================================================================= */}
+              {dashboardSource === 'paper' && (
+                <>
+                  {/* 6 Summary KPI Cards for Paper Trading */}
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Account Balance</span>
+                        <Wallet className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        ${(analytics?.currentVirtualBalance ?? 10000).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Paper virtual equity</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Today&apos;s P&amp;L</span>
+                        <TrendingUp className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p
+                        className={`mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums ${
+                          (analytics?.todayPnl ?? 0) >= 0
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-red-600 dark:text-red-400'
+                        }`}
+                      >
+                        {(analytics?.todayPnl ?? 0) >= 0 ? '+' : ''}
+                        ${(analytics?.todayPnl ?? 0).toFixed(2)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">{analytics?.todayTrades ?? 0} settled today</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Total Trades</span>
+                        <Activity className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {analytics?.totalTrades ?? 0}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">{activeTrades.length} active open</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Win Rate</span>
+                        <Target className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {analytics?.winRatePct != null ? `${analytics.winRatePct}%` : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {analytics?.wins ?? 0}W / {analytics?.losses ?? 0}L settled
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Active Signals</span>
+                        <Radar className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-blue-600 dark:text-indigo-400">
+                        {actionableSignalsCount}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">{signals.length} total scanned</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>AI Status</span>
+                        <Bot className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p
+                        className={`mt-2 text-xl sm:text-2xl font-semibold ${
+                          !riskStatus?.allowed
+                            ? 'text-red-600 dark:text-red-400'
+                            : autoArmed
+                              ? 'text-emerald-600 dark:text-emerald-400'
+                              : 'text-blue-600 dark:text-indigo-400'
+                        }`}
+                      >
+                        {!riskStatus?.allowed ? 'RISK PAUSED' : autoArmed ? (autoStatus || 'WAITING FOR OPPORTUNITY') : mode.toUpperCase()}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500 truncate">
+                        {health?.scheduler.lastCycleSummary || `Interval ${aiSettings?.scanIntervalSeconds ?? 60}s`}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    <div className={`lg:col-span-2 ${CARD_SURFACE} p-5`}>
+                      <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Paper Equity Performance</h3>
+                        <button
+                          type="button"
+                          onClick={() => setActiveNav('analytics')}
+                          className="text-xs font-medium text-blue-600 dark:text-indigo-400 hover:underline"
+                        >
+                          Daily / Weekly / Monthly Analytics
+                        </button>
+                      </div>
+                      <EquityChart points={analytics?.equityCurve || []} />
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-5 flex flex-col justify-between`}>
+                      <div>
+                        <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Quick Automation Control</h3>
+                        <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+                          Server-side autonomous scheduler monitors {aiSettings?.enabledAssets.length ?? 6} enabled assets every{' '}
+                          {aiSettings?.scanIntervalSeconds ?? 60}s and settles expired paper positions automatically.
+                        </p>
+                      </div>
+                      <div className="space-y-2.5 mt-4">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => setConfirmState({ type: 'arm-auto', payload: !autoArmed })}
+                          className={`w-full min-h-11 rounded-xl py-2.5 px-4 text-xs font-semibold text-white transition-colors ${
+                            autoArmed ? 'bg-amber-600 hover:bg-amber-500' : 'bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500'
+                          }`}
+                        >
+                          {autoArmed ? 'Pause Automatic Mode' : 'Arm Automatic Mode'}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={handleRunAutoCycleNow}
+                          className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
+                        >
+                          Trigger Autonomous Cycle Now
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setActiveNav('paper-trading')}
+                          className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
+                        >
+                          Open Paper Trading Desk
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className={`${CARD_SURFACE} p-5`}>
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Latest Quantitative Signals</h3>
+                      <button
+                        type="button"
+                        onClick={() => setActiveNav('signals')}
+                        className="text-xs font-medium text-blue-600 dark:text-indigo-400 hover:underline"
+                      >
+                        View All ({signals.length})
+                      </button>
+                    </div>
+                    {signals.length === 0 ? (
+                      <p className="text-xs text-slate-500 dark:text-slate-400">
+                        No signals generated yet. Open Live Markets or AI Scanner to evaluate live candles.
+                      </p>
+                    ) : (
+                      <div className="divide-y divide-slate-200/80 dark:divide-slate-800">
+                        {signals.slice(0, 5).map((s) => (
+                          <div key={s.id} className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div className="flex items-center gap-3">
+                              <span
+                                className={`font-semibold ${
+                                  s.direction === 'CALL'
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : s.direction === 'PUT'
+                                      ? 'text-red-600 dark:text-red-400'
+                                      : 'text-amber-600 dark:text-amber-400'
+                                }`}
+                              >
+                                {s.direction}
+                              </span>
+                              <span className="font-semibold text-slate-900 dark:text-white">{s.symbol}</span>
+                              <span className="text-slate-500 dark:text-slate-400">
+                                {s.timeframe} · {s.provider}
+                              </span>
+                            </div>
+                            <div className="font-mono tabular-nums text-slate-600 dark:text-slate-300">
+                              Confidence {s.confidenceScore ?? s.score}/100 · {new Date(s.timestamp).toLocaleTimeString()}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {/* ========================================================================= */}
+              {/* SOURCE 2: METATRADER 5 DASHBOARD */}
+              {/* ========================================================================= */}
+              {dashboardSource === 'mt5' && (
+                <>
+                  {/* 6 Summary KPI Cards for MetaTrader 5 (Strictly MT5 Data) */}
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>MT5 Balance</span>
+                        <Wallet className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {mt5Account?.balance != null
+                          ? `$${mt5Account.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                          : mt5Account?.connected
+                            ? '$0.00'
+                            : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {mt5Account?.connected ? `Connected ${mt5AccountMode} Balance (${mt5Account.currency || 'USD'})` : 'Account not connected'}
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>MT5 Equity</span>
+                        <TrendingUp className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {(mt5Account?.equity ?? mt5Account?.balance) != null
+                          ? `$${(mt5Account?.equity ?? mt5Account?.balance)!.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                          : mt5Account?.connected
+                            ? '$0.00'
+                            : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {mt5Account?.connected ? `Live Equity (${mt5Account.currency || 'USD'})` : 'No active equity'}
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Today&apos;s MT5 P&amp;L</span>
+                        <Activity className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p
+                        className={`mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums ${
+                          mt5TodayPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+                        }`}
+                      >
+                        {mt5TodayPnl >= 0 ? '+' : ''}${mt5TodayPnl.toFixed(2)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">{todayMt5Orders.length} MT5 orders today</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Total MT5 Orders</span>
+                        <Target className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {mt5Orders.length}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">{mt5Positions.length} open broker positions</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>MT5 Win Rate</span>
+                        <Target className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {mt5WinRatePct != null ? `${mt5WinRatePct}%` : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {mt5Wins}W / {mt5Losses}L settled
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Bridge Status</span>
+                        <Cable className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p
+                        className={`mt-2 text-xl sm:text-2xl font-semibold ${
+                          mt5Account?.connected ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'
+                        }`}
+                      >
+                        {mt5Account?.connected ? 'CONNECTED' : 'DISCONNECTED'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500 truncate">
+                        Mode: {mt5AccountModeLabel}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* MT5 Connection State Handling */}
+                  {!mt5Account?.connected ? (
+                    <div className={`${CARD_SURFACE} p-6 text-center space-y-3`}>
+                      <div className="mx-auto w-12 h-12 rounded-2xl bg-blue-50 dark:bg-indigo-950/40 flex items-center justify-center text-blue-600 dark:text-indigo-400">
+                        <Cable className="h-6 w-6" />
+                      </div>
+                      <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                        MetaTrader 5 is Not Connected
+                      </h3>
+                      <p className="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto leading-relaxed">
+                        Connect your MT5 account (Demo or Real) in the Broker Connections tab to inspect live account balances, monitor open positions, and review broker order executions.
+                      </p>
+                      <div className="pt-2">
+                        <button
+                          type="button"
+                          onClick={() => setActiveNav('brokers')}
+                          className="min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 px-5 py-2 text-xs font-semibold text-white shadow-sm transition-colors"
+                        >
+                          Configure MT5 in Broker Connections
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {/* MT5 Open Positions & Action Panel */}
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className={`lg:col-span-2 ${CARD_SURFACE} p-5 space-y-4`}>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                                Open MetaTrader 5 Positions ({mt5Positions.length})
+                              </h3>
+                              <p className="text-xs text-slate-500 dark:text-slate-400">
+                                Live broker positions synchronized from connected {mt5AccountMode} account.
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (mt5Account?.id) {
+                                  setMt5PositionsLoading(true);
+                                  handleFetchBrokerPositions(mt5Account.id)
+                                    .then((res) => {
+                                      if (res?.positions) setMt5Positions(res.positions);
+                                    })
+                                    .finally(() => setMt5PositionsLoading(false));
+                                }
+                              }}
+                              disabled={mt5PositionsLoading}
+                              className="text-xs font-medium text-blue-600 dark:text-indigo-400 hover:underline inline-flex items-center gap-1"
+                            >
+                              <RefreshCw className={`h-3 w-3 ${mt5PositionsLoading ? 'animate-spin' : ''}`} />
+                              Refresh Positions
+                            </button>
+                          </div>
+
+                          {mt5Positions.length === 0 ? (
+                            <div className="py-8 text-center text-xs text-slate-500 dark:text-slate-400">
+                              {mt5PositionsLoading ? 'Synchronizing broker positions...' : 'No open positions on connected MetaTrader 5 account.'}
+                            </div>
+                          ) : (
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-xs">
+                                <thead>
+                                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 text-left">
+                                    <th className="py-2 font-medium">Symbol</th>
+                                    <th className="py-2 font-medium">Type</th>
+                                    <th className="py-2 font-medium">Volume</th>
+                                    <th className="py-2 font-medium">Open Price</th>
+                                    <th className="py-2 font-medium">Current</th>
+                                    <th className="py-2 font-medium text-right">Profit / Loss</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100 dark:divide-slate-800/60 font-mono tabular-nums">
+                                  {mt5Positions.map((pos) => (
+                                    <tr key={pos.ticket} className="text-slate-800 dark:text-slate-200">
+                                      <td className="py-2.5 font-sans font-semibold text-slate-900 dark:text-white">{pos.symbol}</td>
+                                      <td className={`py-2.5 font-bold ${pos.side === 'BUY' ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>
+                                        {pos.side}
+                                      </td>
+                                      <td className="py-2.5">{pos.volume}</td>
+                                      <td className="py-2.5">{pos.openPrice.toFixed(5)}</td>
+                                      <td className="py-2.5">{pos.currentPrice != null ? pos.currentPrice.toFixed(5) : '—'}</td>
+                                      <td className={`py-2.5 text-right font-bold ${(pos.profit ?? 0) >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}`}>
+                                        {(pos.profit ?? 0) >= 0 ? '+' : ''}${(pos.profit ?? 0).toFixed(2)}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
                         </div>
-                        <div className="font-mono tabular-nums text-slate-600 dark:text-slate-300">
-                          Confidence {s.confidenceScore ?? s.score}/100 · {new Date(s.timestamp).toLocaleTimeString()}
+
+                        {/* MT5 Account Controls & Routing Summary */}
+                        <div className={`${CARD_SURFACE} p-5 flex flex-col justify-between`}>
+                          <div>
+                            <div className="flex items-center justify-between">
+                              <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Account Details</h3>
+                              <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300">
+                                {mt5AccountMode}
+                              </span>
+                            </div>
+                            <div className="mt-3 space-y-2 text-xs text-slate-600 dark:text-slate-400">
+                              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800">
+                                <span>Account Label</span>
+                                <span className="font-semibold text-slate-900 dark:text-white">{mt5Account.label}</span>
+                              </div>
+                              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800">
+                                <span>Account ID</span>
+                                <span className="font-mono">{mt5Account.externalAccountId || 'Default'}</span>
+                              </div>
+                              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800">
+                                <span>Currency</span>
+                                <span>{mt5Account.currency || 'USD'}</span>
+                              </div>
+                              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800">
+                                <span>Daily Loss Limit</span>
+                                <span className="font-mono">${mt5Account.riskLimits.maxDailyLoss}</span>
+                              </div>
+                              <div className="flex justify-between py-1 border-b border-slate-100 dark:border-slate-800">
+                                <span>Execution Target</span>
+                                <span className={activeBrokerAccountId === mt5Account.id ? 'font-bold text-emerald-600 dark:text-emerald-400' : 'text-slate-500'}>
+                                  {activeBrokerAccountId === mt5Account.id ? 'Active Routed Target' : 'Paper Simulator Active'}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="space-y-2.5 mt-4 pt-3 border-t border-slate-100 dark:border-slate-800">
+                            {activeBrokerAccountId !== mt5Account.id ? (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleSelectActiveBrokerAccount(mt5Account.id)}
+                                className="w-full min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 py-2.5 px-4 text-xs font-semibold text-white transition-colors"
+                              >
+                                Route Engine to MT5 ({mt5AccountMode})
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleSelectActiveBrokerAccount(null)}
+                                className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
+                              >
+                                Revert Engine to Paper Simulator
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleSyncBrokerAccount(mt5Account.id)}
+                              className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
+                            >
+                              Sync Balance &amp; History Now
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setActiveNav('brokers')}
+                              className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
+                            >
+                              Open Broker Connections Workspace
+                            </button>
+                          </div>
                         </div>
                       </div>
-                    ))}
+
+                      {/* MT5 Order History */}
+                      <div className={`${CARD_SURFACE} p-5`}>
+                        <div className="flex items-center justify-between mb-3">
+                          <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                            MetaTrader 5 Order History ({mt5Orders.length})
+                          </h3>
+                          <span className="text-xs text-slate-500 dark:text-slate-400">
+                            Strictly broker-executed MT5 trades
+                          </span>
+                        </div>
+                        {mt5Orders.length === 0 ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 py-4">
+                            No MT5 broker orders recorded yet. Routed orders and external MT5 trade settlements will appear here.
+                          </p>
+                        ) : (
+                          <div className="divide-y divide-slate-200/80 dark:divide-slate-800">
+                            {mt5Orders.slice(0, 10).map((ord: BrokerOrderRecord) => (
+                              <div key={ord.id} className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                                <div className="flex items-center gap-3">
+                                  <span
+                                    className={`font-semibold ${
+                                      ord.direction === 'CALL'
+                                        ? 'text-emerald-600 dark:text-emerald-400'
+                                        : 'text-red-600 dark:text-red-400'
+                                    }`}
+                                  >
+                                    {ord.direction}
+                                  </span>
+                                  <span className="font-semibold text-slate-900 dark:text-white">{ord.symbol}</span>
+                                  <span className="text-slate-500 dark:text-slate-400 font-mono">
+                                    ${ord.amount} · {ord.status}
+                                  </span>
+                                </div>
+                                <div className="font-mono tabular-nums text-slate-600 dark:text-slate-300 flex items-center gap-3">
+                                  {ord.realizedPnl != null && (
+                                    <span className={ord.realizedPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400 font-bold' : 'text-red-600 dark:text-red-400 font-bold'}>
+                                      {ord.realizedPnl >= 0 ? '+' : ''}${ord.realizedPnl.toFixed(2)}
+                                    </span>
+                                  )}
+                                  <span>{new Date(ord.createdAt).toLocaleTimeString()}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+
+              {/* ========================================================================= */}
+              {/* SOURCE 3: IQ OPTION DASHBOARD */}
+              {/* ========================================================================= */}
+              {dashboardSource === 'iq_option' && (
+                <>
+                  {/* 6 Summary KPI Cards for IQ Option (Strictly IQ Option Data) */}
+                  <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-4">
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>IQ Option Balance</span>
+                        <Wallet className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {(iqAccount?.balance ?? brokerStatus?.balance) != null
+                          ? `$${(iqAccount?.balance ?? brokerStatus?.balance)!.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                          : (brokerStatus?.connected || iqAccount?.connected)
+                            ? '$0.00'
+                            : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {iqAccountMode === 'DISCONNECTED' ? 'Account not connected' : `Connected ${iqAccountMode} Balance (${iqAccount?.currency ?? brokerStatus?.currency ?? 'USD'})`}
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>IQ Option Equity</span>
+                        <TrendingUp className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {(iqAccount?.equity ?? brokerStatus?.equity ?? iqAccount?.balance ?? brokerStatus?.balance) != null
+                          ? `$${(iqAccount?.equity ?? brokerStatus?.equity ?? iqAccount?.balance ?? brokerStatus?.balance)!.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                          : (brokerStatus?.connected || iqAccount?.connected)
+                            ? '$0.00'
+                            : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {iqAccountMode === 'DISCONNECTED' ? 'No active equity' : `Synced Equity (${iqAccount?.currency ?? brokerStatus?.currency ?? 'USD'})`}
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Today&apos;s IQ P&amp;L</span>
+                        <Activity className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p
+                        className={`mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums ${
+                          iqTodayPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+                        }`}
+                      >
+                        {iqTodayPnl >= 0 ? '+' : ''}${iqTodayPnl.toFixed(2)}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">{todayIqOrders.length} IQ orders today</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Total IQ Orders</span>
+                        <Target className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {iqOrders.length}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Practice &amp; Real records</p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>IQ Win Rate</span>
+                        <Target className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                        {iqWinRatePct != null ? `${iqWinRatePct}%` : '—'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {iqWins}W / {iqLosses}L settled
+                      </p>
+                    </div>
+
+                    <div className={`${CARD_SURFACE} p-4`}>
+                      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
+                        <span>Connector Status</span>
+                        <Cable className="h-3.5 w-3.5 text-slate-400" />
+                      </div>
+                      <p
+                        className={`mt-2 text-xl sm:text-2xl font-semibold ${
+                          brokerStatus?.connected || iqAccount?.connected ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'
+                        }`}
+                      >
+                        {brokerStatus?.connected || iqAccount?.connected ? 'CONNECTED' : 'DISCONNECTED'}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500 truncate">
+                        Mode: {iqAccountModeLabel}
+                      </p>
+                    </div>
                   </div>
-                )}
-              </div>
+
+                  {/* IQ Option Connection State Handling */}
+                  {!(brokerStatus?.connected || iqAccount?.connected) ? (
+                    <div className={`${CARD_SURFACE} p-6 text-center space-y-3`}>
+                      <div className="mx-auto w-12 h-12 rounded-2xl bg-amber-50 dark:bg-amber-950/40 flex items-center justify-center text-amber-600 dark:text-amber-400">
+                        <Cable className="h-6 w-6" />
+                      </div>
+                      <h3 className="text-base font-semibold text-slate-900 dark:text-white">
+                        IQ Option is Not Connected
+                      </h3>
+                      <p className="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto leading-relaxed">
+                        Connect the IQ Option connector in Broker Connections to synchronize your Practice or Real balance, inspect open assets, and monitor market feeds.
+                      </p>
+                      <div className="pt-2">
+                        <button
+                          type="button"
+                          onClick={() => setActiveNav('brokers')}
+                          className="min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 px-5 py-2 text-xs font-semibold text-white shadow-sm transition-colors"
+                        >
+                          Configure IQ Option in Broker Connections
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      {/* IQ Option Status Grid */}
+                      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                        <div className={`lg:col-span-2 ${CARD_SURFACE} p-5 space-y-4`}>
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                                IQ Option Synchronization &amp; Execution Policy
+                              </h3>
+                              <p className="text-xs text-slate-500 dark:text-slate-400">
+                                Mode: <strong className="text-slate-900 dark:text-white">{iqAccountMode}</strong> · Balance verified from connector.
+                              </p>
+                            </div>
+                            <span className="text-[10px] font-mono px-2 py-1 rounded bg-amber-100 dark:bg-amber-950/80 text-amber-800 dark:text-amber-300 font-bold border border-amber-300/40">
+                              EXECUTION LOCKED (HTTP 423)
+                            </span>
+                          </div>
+
+                          <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#070C17] border border-slate-200/80 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 space-y-2">
+                            <p>
+                              <strong>Read-Only Market &amp; Balance Mode:</strong> The IQ Option connector is connected in{' '}
+                              <span className="font-semibold text-slate-900 dark:text-white">{iqAccountMode}</span> mode.
+                              Real-money order placement through the unofficial connector is locked to protect your capital.
+                            </p>
+                            <p>
+                              To test automated strategy execution safely, switch to <strong>1. Paper Trading</strong> above or route execution through the verified <strong>2. MetaTrader 5</strong> bridge.
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* IQ Option Controls */}
+                        <div className={`${CARD_SURFACE} p-5 flex flex-col justify-between`}>
+                          <div>
+                            <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Connector Controls</h3>
+                            <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
+                              Manage connector credentials, practice/real selection, and token lifecycle in the broker settings.
+                            </p>
+                          </div>
+                          <div className="space-y-2.5 mt-4">
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={refreshPlatformState}
+                              className="w-full min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 py-2.5 px-4 text-xs font-semibold text-white transition-colors"
+                            >
+                              Refresh Balance &amp; Status
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setActiveNav('brokers')}
+                              className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
+                            >
+                              Open Broker Connections Workspace
+                            </button>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* IQ Option Order History */}
+                      <div className={`${CARD_SURFACE} p-5`}>
+                        <div className="flex items-center justify-between mb-3">
+                          <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
+                            IQ Option Order History ({iqOrders.length})
+                          </h3>
+                          <span className="text-xs text-slate-500 dark:text-slate-400">
+                            Strictly IQ Option records
+                          </span>
+                        </div>
+                        {iqOrders.length === 0 ? (
+                          <p className="text-xs text-slate-500 dark:text-slate-400 py-4">
+                            No IQ Option orders recorded yet. Synchronized broker trades will appear here.
+                          </p>
+                        ) : (
+                          <div className="divide-y divide-slate-200/80 dark:divide-slate-800">
+                            {iqOrders.slice(0, 10).map((ord: BrokerOrderRecord) => (
+                              <div key={ord.id} className="py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                                <div className="flex items-center gap-3">
+                                  <span
+                                    className={`font-semibold ${
+                                      ord.direction === 'CALL'
+                                        ? 'text-emerald-600 dark:text-emerald-400'
+                                        : 'text-red-600 dark:text-red-400'
+                                    }`}
+                                  >
+                                    {ord.direction}
+                                  </span>
+                                  <span className="font-semibold text-slate-900 dark:text-white">{ord.symbol}</span>
+                                  <span className="text-slate-500 dark:text-slate-400 font-mono">
+                                    ${ord.amount} · {ord.status}
+                                  </span>
+                                </div>
+                                <div className="font-mono tabular-nums text-slate-600 dark:text-slate-300 flex items-center gap-3">
+                                  {ord.realizedPnl != null && (
+                                    <span className={ord.realizedPnl >= 0 ? 'text-emerald-600 dark:text-emerald-400 font-bold' : 'text-red-600 dark:text-red-400 font-bold'}>
+                                      {ord.realizedPnl >= 0 ? '+' : ''}${ord.realizedPnl.toFixed(2)}
+                                    </span>
+                                  )}
+                                  <span>{new Date(ord.createdAt).toLocaleTimeString()}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
             </div>
           )}
 
@@ -2116,7 +2924,7 @@ export default function App() {
                           Provider: {candleFeed?.provider || 'Checking...'} · Status:{' '}
                           <span
                             className={
-                              candleFeed?.marketStatus === 'OPEN'
+                              candleFeed?.marketStatus === 'OPEN' || candleFeed?.marketStatus === 'LIVE'
                                 ? 'text-emerald-600 dark:text-emerald-400 font-medium'
                                 : 'text-amber-600 dark:text-amber-400 font-medium'
                             }
@@ -2160,146 +2968,192 @@ export default function App() {
                   </div>
 
                   {/* Quantitative Breakdown */}
-                  <div className={`${CARD_SURFACE} p-5 space-y-4`}>
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <p className="text-xs text-slate-500 dark:text-slate-400">Quantitative Decision & Confidence Breakdown</p>
-                        <div className="mt-1 flex items-center gap-3">
-                          <span
-                            className={`text-2xl font-bold ${
-                              currentAnalysis?.direction === 'CALL'
-                                ? 'text-emerald-600 dark:text-emerald-400'
-                                : currentAnalysis?.direction === 'PUT'
-                                  ? 'text-red-600 dark:text-red-400'
-                                  : 'text-amber-600 dark:text-amber-400'
-                            }`}
-                          >
-                            {currentAnalysis?.direction || 'WAIT'}
-                          </span>
-                          <div className="text-xs font-mono tabular-nums space-y-0.5">
+                  {(() => {
+                    const activeAnalysis =
+                      currentAnalysis &&
+                      currentAnalysis.symbol === selectedSymbol &&
+                      currentAnalysis.timeframe === selectedTimeframe
+                        ? currentAnalysis
+                        : signals.find((s) => s.symbol === selectedSymbol && s.timeframe === selectedTimeframe) ??
+                          signals.find((s) => s.symbol === selectedSymbol) ??
+                          null;
+                    const displayedActionable =
+                      activeAnalysis != null
+                        ? activeAnalysis.actionableConfidence ?? activeAnalysis.confidenceScore ?? activeAnalysis.score ?? 0
+                        : null;
+                    const displayedRaw =
+                      activeAnalysis != null
+                        ? activeAnalysis.rawDirectionalConfidence ??
+                          Math.max(
+                            activeAnalysis.bullishScore || 0,
+                            activeAnalysis.bearishScore || 0,
+                            activeAnalysis.confidenceScore || 0,
+                            activeAnalysis.score || 0
+                          )
+                        : null;
+
+                    return (
+                      <div className={`${CARD_SURFACE} p-5 space-y-4`}>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="text-xs text-slate-500 dark:text-slate-400">Quantitative Decision & Confidence Breakdown</p>
+                            <div className="mt-1 flex items-center gap-3">
+                              <span
+                                className={`text-2xl font-bold ${
+                                  activeAnalysis?.direction === 'CALL'
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : activeAnalysis?.direction === 'PUT'
+                                      ? 'text-red-600 dark:text-red-400'
+                                      : 'text-amber-600 dark:text-amber-400'
+                                }`}
+                              >
+                                {activeAnalysis?.direction || 'WAIT'}
+                              </span>
+                              <div className="text-xs font-mono tabular-nums space-y-0.5">
+                                <div>
+                                  <span className="text-slate-500">Actionable Conf:</span>{' '}
+                                  <strong className="text-slate-900 dark:text-white">
+                                    {displayedActionable != null ? `${displayedActionable}/100` : '—/100'}
+                                  </strong>
+                                </div>
+                                <div>
+                                  <span className="text-slate-500">Raw Directional:</span>{' '}
+                                  <span className="text-slate-600 dark:text-slate-400">
+                                    {displayedRaw != null ? `${displayedRaw}/100` : '—/100'}
+                                  </span>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                          <div className="text-right text-xs text-slate-500 dark:text-slate-400 space-y-0.5">
                             <div>
-                              <span className="text-slate-500">Actionable Conf:</span>{' '}
-                              <strong className="text-slate-900 dark:text-white">
-                                {currentAnalysis?.actionableConfidence ?? currentAnalysis?.confidenceScore ?? currentAnalysis?.score ?? 0}/100
+                              Effective Expiry:{' '}
+                              <strong className="font-mono text-slate-900 dark:text-white">
+                                {(() => {
+                                  const eff = activeAnalysis?.effectiveExpirySeconds ?? activeAnalysis?.suggestedExpirySeconds ?? 180;
+                                  return `${Math.round(eff / 60)}m (${eff}s)`;
+                                })()}
                               </strong>
                             </div>
+                            {activeAnalysis?.expiryAdjusted && activeAnalysis.requestedExpirySeconds != null && (
+                              <div className="text-[11px] text-amber-600 dark:text-amber-400 font-medium">
+                                Requested {activeAnalysis.requestedExpirySeconds}s → adjusted to {activeAnalysis.effectiveExpirySeconds}s ({activeAnalysis.timeframe} fit)
+                              </div>
+                            )}
                             <div>
-                              <span className="text-slate-500">Raw Directional:</span>{' '}
-                              <span className="text-slate-600 dark:text-slate-400">
-                                {currentAnalysis?.rawDirectionalConfidence ?? Math.max(currentAnalysis?.rawDirectionalConfidence ?? 0, currentAnalysis?.bullishScore || 0, currentAnalysis?.bearishScore || 0, currentAnalysis?.confidenceScore || 0, currentAnalysis?.score || 0)}/100
+                              Feed Updated:{' '}
+                              <span className="font-mono text-slate-700 dark:text-slate-300">
+                                {activeAnalysis?.feedLastUpdateAt ? new Date(activeAnalysis.feedLastUpdateAt).toLocaleTimeString() : '—'}
+                              </span>
+                            </div>
+                            <div>
+                              Risk:{' '}
+                              <span className="font-semibold text-slate-800 dark:text-slate-200">
+                                {activeAnalysis?.riskAssessment?.level || 'MODERATE'}
                               </span>
                             </div>
                           </div>
                         </div>
-                      </div>
-                      <div className="text-right text-xs text-slate-500 dark:text-slate-400 space-y-0.5">
-                        <div>
-                          Suggested Expiry:{' '}
-                          <strong className="font-mono text-slate-900 dark:text-white">
-                            {Math.round((currentAnalysis?.suggestedExpirySeconds || 180) / 60)}m
-                          </strong>
-                        </div>
-                        <div>
-                          Feed Updated:{' '}
-                          <span className="font-mono text-slate-700 dark:text-slate-300">
-                            {currentAnalysis?.feedLastUpdateAt ? new Date(currentAnalysis.feedLastUpdateAt).toLocaleTimeString() : '—'}
-                          </span>
-                        </div>
-                        <div>
-                          Risk:{' '}
-                          <span className="font-semibold text-slate-800 dark:text-slate-200">
-                            {currentAnalysis?.riskAssessment?.level || 'MODERATE'}
-                          </span>
-                        </div>
-                      </div>
-                    </div>
 
-                    {/* Confidence State & Exact Reason banner */}
-                    {(currentAnalysis?.actionableConfidence === 0 || currentAnalysis?.isStale) && (
-                      <div className="rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
-                        <div className="flex items-center gap-1.5 font-semibold">
-                          <span>Confidence Locked to 0 (State: {currentAnalysis?.confidenceState || 'STALE_OR_UNAVAILABLE'})</span>
-                        </div>
-                        <p className="text-[11px] opacity-90">
-                          <strong>Reason:</strong> {currentAnalysis?.zeroConfidenceReason || currentAnalysis?.reasons?.[0] || 'Market data unavailable or setup weak.'}
-                        </p>
-                        {currentAnalysis?.isStale && (
-                          <p className="text-[10px] text-red-600 dark:text-red-400 font-medium">
-                            Warning: Market feed is delayed or closed. Delayed prices are not represented as live executable prices.
-                          </p>
+                        {!activeAnalysis && (
+                          <div className="rounded-xl bg-slate-50 dark:bg-slate-900/50 border border-slate-200 dark:border-slate-800 p-3 text-xs text-slate-600 dark:text-slate-300">
+                            No quantitative analysis calculated yet for <strong>{selectedSymbol}</strong> ({selectedTimeframe}). Click{' '}
+                            <strong>Run Quantitative Analysis</strong> to compute RSI, MACD, EMA, Bollinger, and confidence scores from live OHLCV data.
+                          </div>
                         )}
-                      </div>
-                    )}
 
-                    {currentAnalysis?.indicators && (
-                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 border-t border-slate-200/80 dark:border-slate-800 pt-4 text-xs">
-                        <div>
-                          <span className="text-slate-500">Trend</span>
-                          <p className="mt-0.5 font-medium text-slate-900 dark:text-white">{currentAnalysis.indicators.trend}</p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">RSI (14)</span>
-                          <p className="mt-0.5 font-mono tabular-nums text-slate-900 dark:text-white">{currentAnalysis.indicators.rsi14}</p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">MACD Hist</span>
-                          <p className="mt-0.5 font-mono tabular-nums text-slate-900 dark:text-white">
-                            {currentAnalysis.indicators.macdHistogram.toFixed(6)}
-                          </p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">Volatility</span>
-                          <p className="mt-0.5 font-medium text-slate-900 dark:text-white">
-                            {currentAnalysis.indicators.volatilityRegime} ({currentAnalysis.indicators.atrPct}%)
-                          </p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">EMA 9 / 21 / 50</span>
-                          <p className="mt-0.5 font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                            {currentAnalysis.indicators.ema9.toFixed(4)} / {currentAnalysis.indicators.ema21.toFixed(4)}
-                          </p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">Bollinger %B</span>
-                          <p className="mt-0.5 font-mono tabular-nums text-slate-700 dark:text-slate-300">
-                            {currentAnalysis.indicators.bbPercentB} ({currentAnalysis.indicators.bbBandwidthPct}%)
-                          </p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">Nearest Support</span>
-                          <p className="mt-0.5 font-mono tabular-nums text-emerald-600 dark:text-emerald-400">
-                            {currentAnalysis.indicators.nearestSupport.toFixed(selectedAssetMeta.decimals)}
-                          </p>
-                        </div>
-                        <div>
-                          <span className="text-slate-500">Nearest Resistance</span>
-                          <p className="mt-0.5 font-mono tabular-nums text-red-600 dark:text-red-400">
-                            {currentAnalysis.indicators.nearestResistance.toFixed(selectedAssetMeta.decimals)}
-                          </p>
-                        </div>
-                      </div>
-                    )}
-
-                    {currentAnalysis && (
-                      <div className="border-t border-slate-200/80 dark:border-slate-800 pt-3 space-y-2">
-                        <ul className="space-y-1 text-xs text-slate-700 dark:text-slate-300 list-disc pl-4">
-                          {currentAnalysis.reasons.map((r, i) => (
-                            <li key={i}>{r}</li>
-                          ))}
-                        </ul>
-                        {currentAnalysis.aiExplanation?.summary && (
-                          <div className="rounded-xl border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50/70 dark:bg-indigo-950/30 p-3 text-xs">
-                            <p className="font-semibold text-indigo-700 dark:text-indigo-300">Gemini Analyst Commentary</p>
-                            <p className="mt-1 text-slate-700 dark:text-slate-300 leading-relaxed">{currentAnalysis.aiExplanation.summary}</p>
-                            {currentAnalysis.aiExplanation.riskNote && (
-                              <p className="mt-1 text-slate-500 dark:text-slate-400">{currentAnalysis.aiExplanation.riskNote}</p>
+                        {/* Confidence State & Exact Reason banner */}
+                        {activeAnalysis && (activeAnalysis.actionableConfidence === 0 || activeAnalysis.isStale || activeAnalysis.zeroConfidenceReason) && (
+                          <div className="rounded-xl bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/50 p-3 text-xs text-amber-800 dark:text-amber-300 space-y-1">
+                            <div className="flex items-center gap-1.5 font-semibold">
+                              <span>
+                                {(displayedRaw ?? 0) > 0 && activeAnalysis.actionableConfidence === 0
+                                  ? `Actionable Execution Locked to 0 (Raw Directional Confluence: ${displayedRaw}/100 · State: ${activeAnalysis.confidenceState || 'STALE_OR_UNAVAILABLE'})`
+                                  : `Confidence Unavailable (State: ${activeAnalysis.confidenceState || 'STALE_OR_UNAVAILABLE'})`}
+                              </span>
+                            </div>
+                            <p className="text-[11px] opacity-90">
+                              <strong>Reason:</strong> {activeAnalysis.zeroConfidenceReason || activeAnalysis.reasons?.[0] || 'Market data unavailable or invalid.'}
+                            </p>
+                            {activeAnalysis.isStale && (
+                              <p className="text-[10px] text-red-600 dark:text-red-400 font-medium">
+                                Warning: Market feed is delayed or closed. Delayed prices are not represented as live executable prices.
+                              </p>
                             )}
                           </div>
                         )}
-                        <p className="text-[11px] text-slate-500">{currentAnalysis.warning}</p>
+
+                        {activeAnalysis?.indicators && (
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 border-t border-slate-200/80 dark:border-slate-800 pt-4 text-xs">
+                            <div>
+                              <span className="text-slate-500">Trend</span>
+                              <p className="mt-0.5 font-medium text-slate-900 dark:text-white">{activeAnalysis.indicators.trend}</p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">RSI (14)</span>
+                              <p className="mt-0.5 font-mono tabular-nums text-slate-900 dark:text-white">{activeAnalysis.indicators.rsi14}</p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">MACD Hist</span>
+                              <p className="mt-0.5 font-mono tabular-nums text-slate-900 dark:text-white">
+                                {activeAnalysis.indicators.macdHistogram.toFixed(6)}
+                              </p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">Volatility</span>
+                              <p className="mt-0.5 font-medium text-slate-900 dark:text-white">
+                                {activeAnalysis.indicators.volatilityRegime} ({activeAnalysis.indicators.atrPct}%)
+                              </p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">EMA 9 / 21 / 50</span>
+                              <p className="mt-0.5 font-mono tabular-nums text-slate-700 dark:text-slate-300">
+                                {activeAnalysis.indicators.ema9.toFixed(4)} / {activeAnalysis.indicators.ema21.toFixed(4)}
+                              </p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">Bollinger %B</span>
+                              <p className="mt-0.5 font-mono tabular-nums text-slate-700 dark:text-slate-300">
+                                {activeAnalysis.indicators.bbPercentB} ({activeAnalysis.indicators.bbBandwidthPct}%)
+                              </p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">Nearest Support</span>
+                              <p className="mt-0.5 font-mono tabular-nums text-emerald-600 dark:text-emerald-400">
+                                {activeAnalysis.indicators.nearestSupport.toFixed(selectedAssetMeta.decimals)}
+                              </p>
+                            </div>
+                            <div>
+                              <span className="text-slate-500">Nearest Resistance</span>
+                              <p className="mt-0.5 font-mono tabular-nums text-red-600 dark:text-red-400">
+                                {activeAnalysis.indicators.nearestResistance.toFixed(selectedAssetMeta.decimals)}
+                              </p>
+                            </div>
+                          </div>
+                        )}
+
+                        {activeAnalysis && (
+                          <div className="border-t border-slate-200/80 dark:border-slate-800 pt-3 space-y-2">
+                            <ul className="space-y-1 text-xs text-slate-700 dark:text-slate-300 list-disc pl-4">
+                              {activeAnalysis.reasons.map((r, i) => (
+                                <li key={i}>{r}</li>
+                              ))}
+                            </ul>
+                            {activeAnalysis.aiExplanation?.summary && (
+                              <div className="rounded-xl border border-indigo-200 dark:border-indigo-500/25 bg-indigo-50/70 dark:bg-indigo-950/30 p-3 text-xs">
+                                <p className="font-semibold text-indigo-700 dark:text-indigo-300">Gemini Analyst Commentary</p>
+                                <p className="mt-1 text-slate-700 dark:text-slate-300 leading-relaxed">{activeAnalysis.aiExplanation.summary}</p>
+                                {activeAnalysis.aiExplanation.riskNote && (
+                                  <p className="mt-1 text-slate-500 dark:text-slate-400">{activeAnalysis.aiExplanation.riskNote}</p>
+                                )}
+                              </div>
+                            )}
+                            <p className="text-[11px] text-slate-500">{activeAnalysis.warning}</p>
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
+                    );
+                  })()}
                 </div>
 
                 {/* Right Column: Modes & Quick Paper Ticket */}
@@ -2388,7 +3242,7 @@ export default function App() {
                             <Bot className="h-4 w-4 text-blue-600 dark:text-indigo-400" /> Mode C: Autonomous Paper
                           </span>
                           <span className={autoArmed ? 'text-emerald-600 dark:text-emerald-400 font-semibold' : 'text-amber-600 dark:text-amber-400 font-semibold'}>
-                            {autoArmed ? 'ARMED' : 'PAUSED'}
+                            {autoArmed ? (autoStatus || 'ARMED') : 'PAUSED'}
                           </span>
                         </div>
                         <p className="text-slate-600 dark:text-slate-400 leading-relaxed">

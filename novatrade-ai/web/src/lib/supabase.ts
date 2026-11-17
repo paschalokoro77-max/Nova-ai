@@ -444,19 +444,29 @@ export async function fetchUserWorkspaceFromSupabase(userId: string): Promise<{
       : undefined;
 
     const signals: SignalRecord[] | undefined = Array.isArray(signalsRes.data)
-      ? signalsRes.data.map((row) => ({
-          id: row.id,
-          symbol: row.symbol,
-          timeframe: row.timeframe || '1m',
-          direction: row.direction,
-          score: Number(row.score ?? 0),
-          confidenceScore: Number(row.score ?? 0),
-          bullishScore: Number(row.score ?? 0),
-          bearishScore: 0,
-          entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
-          suggestedExpirySeconds: Number(row.suggested_expiry_seconds ?? 180),
-          provider: row.data_source || 'supabase-archive',
-          timestamp: row.created_at,
+      ? signalsRes.data.map((row) => {
+          const storedScore = Number(row.score ?? 0);
+          const dir: 'CALL' | 'PUT' | 'WAIT' = row.direction === 'CALL' || row.direction === 'PUT' ? row.direction : 'WAIT';
+          return {
+            id: row.id,
+            symbol: row.symbol,
+            timeframe: row.timeframe || '1m',
+            direction: dir,
+            score: storedScore,
+            confidenceScore: storedScore,
+            rawDirectionalConfidence: storedScore,
+            actionableConfidence: storedScore,
+            confidenceState: dir === 'WAIT' ? 'WEAK_SETUP_WAIT' : 'STRONG_SETUP_ACTIONABLE',
+            zeroConfidenceReason:
+              storedScore === 0
+                ? 'Archived signal recorded 0/100; run a fresh quantitative analysis for live indicator confidence.'
+                : null,
+            bullishScore: dir === 'PUT' ? 0 : storedScore,
+            bearishScore: dir === 'PUT' ? storedScore : 0,
+            entryPrice: row.entry_price != null ? Number(row.entry_price) : null,
+            suggestedExpirySeconds: Number(row.suggested_expiry_seconds ?? 180),
+            provider: row.data_source || 'supabase-archive',
+            timestamp: row.created_at,
           indicators: row.indicators || null,
           supportingIndicators: null,
           riskAssessment: row.risk_assessment || null,
@@ -480,10 +490,11 @@ export async function fetchUserWorkspaceFromSupabase(userId: string): Promise<{
           },
           reasons: Array.isArray(row.reasons) ? row.reasons : [],
           warning: 'Loaded from Supabase history.',
-          aiExplanation: row.ai_explanation
-            ? { available: true, model: 'gemini-2.5-flash', summary: row.ai_explanation, riskNote: null }
-            : null,
-        }))
+            aiExplanation: row.ai_explanation
+              ? { available: true, model: 'gemini-2.5-flash', summary: row.ai_explanation, riskNote: null }
+              : null,
+          };
+        })
       : undefined;
 
     const activity: ActivityEvent[] | undefined = Array.isArray(activityRes.data)

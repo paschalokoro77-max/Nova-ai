@@ -29,8 +29,10 @@ create table if not exists public.paper_trades (
   symbol text not null,
   direction text not null check (direction in ('CALL','PUT')),
   amount numeric(14,2) not null check (amount > 0),
-  status text not null default 'SIMULATED_NOT_EXECUTED' check (status in ('SIMULATED_NOT_EXECUTED','CLOSED_WIN','CLOSED_LOSS','CANCELLED')),
+  status text not null default 'SIMULATED_NOT_EXECUTED',
   result_amount numeric(14,2),
+  stop_loss numeric(18,6),
+  take_profit numeric(18,6),
   created_at timestamptz not null default now(),
   closed_at timestamptz
 );

@@ -100,8 +100,8 @@ class MainActivity : AppCompatActivity() {
             val pairingCode = binding.inputPairingCode.text?.toString()?.trim().orEmpty()
             val deviceName = binding.inputDeviceName.text?.toString()?.trim().orEmpty()
 
-            if (!serverUrl.startsWith("http://") && !serverUrl.startsWith("https://")) {
-                CompanionRuntimeState.setStatusMessage("Enter a valid NovaTrade server URL (https://...).")
+            if (!NovaTradeApiClient.isAllowedServerUrl(serverUrl)) {
+                CompanionRuntimeState.setStatusMessage("HTTPS (https://...) is required for NovaTrade server connections.")
                 return@setOnClickListener
             }
             if (pairingCode.length < 4) {

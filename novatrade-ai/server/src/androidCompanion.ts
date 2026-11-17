@@ -93,8 +93,18 @@ export type AndroidActionStatus =
   | 'EXECUTED_REPORTED'
   | 'REJECTED'
   | 'BLOCKED_RISK'
-  | 'BLOCKED_REAL_MONEY_LOCK'
+  | 'BLOCKED_UNVERIFIED_ACCOUNT'
   | 'EXPIRED';
+
+export type AndroidAccountModeVerificationSource = 'BROKER_SESSION' | 'MT5_BRIDGE' | 'IQ_CONNECTOR' | 'UNVERIFIED';
+
+export interface VerifiedBrokerAccountSession {
+  verified: boolean;
+  mode: AndroidAccountMode;
+  source: AndroidAccountModeVerificationSource;
+  brokerAccountId: string | null;
+  reason?: string;
+}
 
 export interface AndroidActionQueueItem {
   id: string;
@@ -109,6 +119,8 @@ export interface AndroidActionQueueItem {
   stakeOrVolume: number;
   expirySeconds: number;
   accountModeVerified: AndroidAccountMode;
+  accountModeVerificationSource: AndroidAccountModeVerificationSource;
+  verifiedBrokerAccountId: string | null;
   status: AndroidActionStatus;
   reason: string;
   expiresAt: string | null;
@@ -179,10 +191,17 @@ function toPublicDevice(d: AndroidDeviceInternal): AndroidDevicePublic {
 export class AndroidCompanionManager {
   private readonly persistDir: string | null;
   private readonly stores = new Map<string, AndroidUserStore>();
+  private readonly hydratedHistoryUsers = new Set<string>();
+  private lastPersistenceError: string | null = null;
 
   constructor(statePersistPath: string | null) {
-    this.persistDir = statePersistPath ? path.join(path.dirname(statePersistPath), 'android') : null;
+    const effectivePath = process.env.NODE_ENV === 'production' ? null : statePersistPath;
+    this.persistDir = effectivePath ? path.join(path.dirname(effectivePath), 'android') : null;
     this.preloadPersistedStores();
+  }
+
+  getLastPersistenceError(): string | null {
+    return this.lastPersistenceError;
   }
 
   private getStorePath(userId: string): string | null {
@@ -681,12 +700,122 @@ export class AndroidCompanionManager {
     return true;
   }
 
-  listAnalyses(userId: string): AndroidScreenAnalysisRecord[] {
+  private async ensureUserHistoryLoaded(userId: string): Promise<void> {
+    if (!userId || userId === 'local-preview' || this.hydratedHistoryUsers.has(userId)) return;
+    const admin = getSupabaseAdmin();
+    if (!admin) return;
+    try {
+      const [analysesRes, actionsRes] = await Promise.all([
+        admin
+          .from('android_screen_analyses')
+          .select('*')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .limit(50),
+        admin
+          .from('android_action_queue')
+          .select('*')
+          .eq('user_id', userId)
+          .order('created_at', { ascending: false })
+          .limit(60),
+      ]);
+      if (analysesRes.error || actionsRes.error) {
+        const msg = analysesRes.error?.message || actionsRes.error?.message || 'Supabase history load failed';
+        this.lastPersistenceError = msg;
+        console.error('[AndroidCompanionManager] Failed to load Android history from Supabase:', msg);
+        return;
+      }
+      const store = this.getOrInitStore(userId);
+      if (Array.isArray(analysesRes.data) && analysesRes.data.length > 0) {
+        const seenA = new Set(store.analyses.map((a) => a.id));
+        for (const row of analysesRes.data as Array<Record<string, any>>) {
+          if (!row.id || seenA.has(row.id)) continue;
+          const qcc = (row.quant_cross_check || {}) as Record<string, any>;
+          const rawExt = (row.raw_extraction || {}) as Record<string, any>;
+          store.analyses.push({
+            id: String(row.id),
+            userId: String(row.user_id),
+            deviceId: row.device_id ? String(row.device_id) : null,
+            appPackage: String(row.app_package || 'unknown'),
+            appName: (row.app_name || 'UNKNOWN') as AndroidTradingAppName,
+            detectedSymbol: row.detected_symbol ? String(row.detected_symbol) : null,
+            normalizedSymbol: row.normalized_symbol ? String(row.normalized_symbol) : null,
+            detectedTimeframe: row.detected_timeframe ? String(row.detected_timeframe) : null,
+            detectedPrice: row.detected_price != null ? Number(row.detected_price) : null,
+            detectedAccountMode: (row.detected_account_mode || 'UNKNOWN') as AndroidAccountMode,
+            detectedBalance: row.detected_balance != null ? Number(row.detected_balance) : null,
+            detectedCurrency: row.detected_currency ? String(row.detected_currency) : null,
+            chartTrend: (row.chart_trend || 'UNCLEAR') as AndroidScreenAnalysisRecord['chartTrend'],
+            visionSummary: String(row.vision_summary || ''),
+            riskWarning: row.risk_warning ? String(row.risk_warning) : null,
+            recommendedAction: (row.recommended_action || 'WAIT') as 'CALL' | 'PUT' | 'WAIT',
+            confidenceScore: Number(row.confidence_score ?? 0),
+            signalId: row.signal_id ? String(row.signal_id) : null,
+            quantDirection: qcc.direction ?? null,
+            quantScore: qcc.score != null ? Number(qcc.score) : null,
+            quantProvider: qcc.provider ?? null,
+            alignmentStatus: (qcc.alignmentStatus || 'VISION_ONLY') as AndroidScreenAnalysisRecord['alignmentStatus'],
+            candlestickObservations: Array.isArray(rawExt.candlestickObservations) ? rawExt.candlestickObservations : [],
+            tradeButtonsVisible: Boolean(rawExt.tradeButtonsVisible),
+            detectedActionLabels: Array.isArray(rawExt.detectedActionLabels) ? rawExt.detectedActionLabels : [],
+            createdAt: String(row.created_at),
+          });
+        }
+        store.analyses.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        if (store.analyses.length > 50) store.analyses.length = 50;
+      }
+      if (Array.isArray(actionsRes.data) && actionsRes.data.length > 0) {
+        const seenQ = new Set(store.actions.map((a) => a.id));
+        for (const row of actionsRes.data as Array<Record<string, any>>) {
+          if (!row.id || seenQ.has(row.id)) continue;
+          const rawStatus = String(row.status || 'PENDING_USER_APPROVAL');
+          const status: AndroidActionStatus =
+            rawStatus === 'BLOCKED_REAL_MONEY_LOCK'
+              ? 'BLOCKED_RISK'
+              : (rawStatus as AndroidActionStatus);
+          store.actions.push({
+            id: String(row.id),
+            userId: String(row.user_id),
+            deviceId: row.device_id ? String(row.device_id) : null,
+            screenAnalysisId: row.screen_analysis_id ? String(row.screen_analysis_id) : null,
+            appPackage: String(row.app_package || 'unknown'),
+            appName: (row.app_name || 'UNKNOWN') as AndroidTradingAppName,
+            operatingMode: (row.operating_mode || 'assisted') as OperatingMode,
+            symbol: String(row.symbol || 'UNKNOWN'),
+            direction: row.direction === 'PUT' ? 'PUT' : 'CALL',
+            stakeOrVolume: Number(row.stake_or_volume ?? 0),
+            expirySeconds: Number(row.expiry_seconds ?? 180),
+            accountModeVerified: (row.account_mode_verified || 'UNKNOWN') as AndroidAccountMode,
+            accountModeVerificationSource: (row.account_mode_verification_source || 'UNVERIFIED') as AndroidAccountModeVerificationSource,
+            verifiedBrokerAccountId: row.verified_broker_account_id ? String(row.verified_broker_account_id) : null,
+            status,
+            reason: String(row.reason || ''),
+            expiresAt: row.expires_at ? String(row.expires_at) : null,
+            approvedAt: row.approved_at ? String(row.approved_at) : null,
+            executedAt: row.executed_at ? String(row.executed_at) : null,
+            deviceAckNote: row.device_ack_note ? String(row.device_ack_note) : null,
+            createdAt: String(row.created_at),
+          });
+        }
+        store.actions.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        if (store.actions.length > 60) store.actions.length = 60;
+      }
+      this.hydratedHistoryUsers.add(userId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Android history hydration exception';
+      this.lastPersistenceError = msg;
+      console.error('[AndroidCompanionManager] History hydration exception:', msg);
+    }
+  }
+
+  async listAnalyses(userId: string): Promise<AndroidScreenAnalysisRecord[]> {
+    await this.ensureUserHistoryLoaded(userId);
     const store = this.getOrInitStore(userId);
     return store.analyses;
   }
 
-  listActions(userId: string): AndroidActionQueueItem[] {
+  async listActions(userId: string): Promise<AndroidActionQueueItem[]> {
+    await this.ensureUserHistoryLoaded(userId);
     const store = this.getOrInitStore(userId);
     this.expireStaleActions(store);
     return store.actions;
@@ -708,7 +837,7 @@ export class AndroidCompanionManager {
 
     const admin = getSupabaseAdmin();
     if (admin && userId !== 'local-preview') {
-      void admin
+      const { error } = await admin
         .from('android_devices')
         .update({
           last_seen_at: dev.lastSeenAt,
@@ -716,8 +845,13 @@ export class AndroidCompanionManager {
           permissions: dev.permissions,
           updated_at: dev.updatedAt,
         })
-        .eq('id', dev.id)
-        .then(() => undefined, () => undefined);
+        .eq('id', dev.id);
+      if (error) {
+        this.lastPersistenceError = `Failed to persist Android device heartbeat: ${error.message}`;
+        console.error('[AndroidCompanionManager]', this.lastPersistenceError);
+        throw new Error(this.lastPersistenceError);
+      }
+      this.lastPersistenceError = null;
     }
 
     return toPublicDevice(dev);
@@ -773,54 +907,57 @@ export class AndroidCompanionManager {
       createdAt: new Date().toISOString(),
     };
 
+    const admin = getSupabaseAdmin();
+    if (admin && input.userId !== 'local-preview') {
+      const { error } = await admin.from('android_screen_analyses').insert({
+        id: record.id,
+        user_id: record.userId,
+        device_id: record.deviceId,
+        app_package: record.appPackage,
+        app_name: record.appName,
+        detected_symbol: record.detectedSymbol,
+        normalized_symbol: record.normalizedSymbol,
+        detected_timeframe: record.detectedTimeframe,
+        detected_price: record.detectedPrice,
+        detected_account_mode: record.detectedAccountMode,
+        detected_balance: record.detectedBalance,
+        detected_currency: record.detectedCurrency,
+        chart_trend: record.chartTrend,
+        vision_summary: record.visionSummary,
+        risk_warning: record.riskWarning,
+        recommended_action: record.recommendedAction,
+        confidence_score: record.confidenceScore,
+        signal_id: record.signalId,
+        quant_cross_check: quantSignal
+          ? {
+              direction: quantSignal.direction,
+              score: quantSignal.score,
+              provider: quantSignal.provider,
+              alignmentStatus,
+            }
+          : {},
+        raw_extraction: {
+          candlestickObservations: record.candlestickObservations,
+          tradeButtonsVisible: record.tradeButtonsVisible,
+          detectedActionLabels: record.detectedActionLabels,
+        },
+        created_at: record.createdAt,
+      });
+      if (error) {
+        this.lastPersistenceError = `Failed to persist Android screen analysis: ${error.message}`;
+        console.error('[AndroidCompanionManager]', this.lastPersistenceError);
+        throw new Error(this.lastPersistenceError);
+      }
+      this.lastPersistenceError = null;
+    }
+
     store.analyses.unshift(record);
     if (store.analyses.length > 50) store.analyses.length = 50;
     this.saveStore(input.userId);
-
-    const admin = getSupabaseAdmin();
-    if (admin && input.userId !== 'local-preview') {
-      await admin
-        .from('android_screen_analyses')
-        .insert({
-          id: record.id,
-          user_id: record.userId,
-          device_id: record.deviceId,
-          app_package: record.appPackage,
-          app_name: record.appName,
-          detected_symbol: record.detectedSymbol,
-          normalized_symbol: record.normalizedSymbol,
-          detected_timeframe: record.detectedTimeframe,
-          detected_price: record.detectedPrice,
-          detected_account_mode: record.detectedAccountMode,
-          detected_balance: record.detectedBalance,
-          detected_currency: record.detectedCurrency,
-          chart_trend: record.chartTrend,
-          vision_summary: record.visionSummary,
-          risk_warning: record.riskWarning,
-          recommended_action: record.recommendedAction,
-          confidence_score: record.confidenceScore,
-          signal_id: record.signalId,
-          quant_cross_check: quantSignal
-            ? {
-                direction: quantSignal.direction,
-                score: quantSignal.score,
-                provider: quantSignal.provider,
-                alignmentStatus,
-              }
-            : {},
-          raw_extraction: {
-            candlestickObservations: record.candlestickObservations,
-            tradeButtonsVisible: record.tradeButtonsVisible,
-            detectedActionLabels: record.detectedActionLabels,
-          },
-          created_at: record.createdAt,
-        })
-        .then(() => undefined, () => undefined);
-    }
     return record;
   }
 
-  queueActionFromScreen(input: {
+  async queueActionFromScreen(input: {
     userId: string;
     deviceId: string | null;
     analysis: AndroidScreenAnalysisRecord;
@@ -828,20 +965,40 @@ export class AndroidCompanionManager {
     stakeOrVolume: number;
     expirySeconds: number;
     riskStatus: RiskStatus;
-  }): AndroidActionQueueItem | null {
+    verifiedBrokerSession?: VerifiedBrokerAccountSession;
+  }): Promise<AndroidActionQueueItem | null> {
     if (input.analysis.recommendedAction !== 'CALL' && input.analysis.recommendedAction !== 'PUT') {
       return null;
     }
     const store = this.getOrInitStore(input.userId);
     this.expireStaleActions(store);
+
+    const session = input.verifiedBrokerSession;
+    const isVerified = Boolean(
+      session?.verified &&
+        session.source !== 'UNVERIFIED' &&
+        (session.mode === 'DEMO' || session.mode === 'PRACTICE' || session.mode === 'REAL')
+    );
+    const accountModeVerified: AndroidAccountMode = isVerified ? session!.mode : 'UNKNOWN';
+    const accountModeVerificationSource: AndroidAccountModeVerificationSource = isVerified
+      ? session!.source
+      : 'UNVERIFIED';
+    const verifiedBrokerAccountId: string | null = isVerified ? session!.brokerAccountId : null;
+
     let status: AndroidActionStatus = 'PENDING_USER_APPROVAL';
     let reason = 'Queued from Android screen analysis. Requires explicit user approval in Assisted mode.';
     if (!input.riskStatus.allowed) {
       status = 'BLOCKED_RISK';
       reason = `Blocked by risk guard: ${input.riskStatus.reasons.join(' ')}`;
-    } else if (input.analysis.detectedAccountMode === 'REAL') {
-      status = 'BLOCKED_REAL_MONEY_LOCK';
-      reason = 'Real-money Android screen execution is locked. Switch mobile app to DEMO / PRACTICE to queue executable approvals.';
+    } else if (accountModeVerified === 'REAL' || input.analysis.detectedAccountMode === 'REAL') {
+      status = 'BLOCKED_RISK';
+      reason =
+        'Real-money Android screen execution is locked. Switch mobile app and active broker session to DEMO / PRACTICE to queue executable approvals.';
+    } else if (!isVerified) {
+      status = 'BLOCKED_UNVERIFIED_ACCOUNT';
+      reason =
+        session?.reason ||
+        'Broker account mode is UNVERIFIED. Connect and verify a DEMO / PRACTICE broker account before queuing executable Android approvals.';
     } else if (input.operatingMode === 'automatic') {
       status = 'PENDING_USER_APPROVAL';
       reason = 'Unattended Android screen execution is disabled in Phase 1. Requires manual approval.';
@@ -860,7 +1017,9 @@ export class AndroidCompanionManager {
       direction: input.analysis.recommendedAction,
       stakeOrVolume: Number(input.stakeOrVolume.toFixed(2)),
       expirySeconds: input.expirySeconds,
-      accountModeVerified: input.analysis.detectedAccountMode,
+      accountModeVerified,
+      accountModeVerificationSource,
+      verifiedBrokerAccountId,
       status,
       reason,
       expiresAt: status === 'PENDING_USER_APPROVAL' ? new Date(now.getTime() + 5 * 60 * 1000).toISOString() : null,
@@ -870,79 +1029,167 @@ export class AndroidCompanionManager {
       createdAt: now.toISOString(),
     };
 
+    const persisted = await this.persistActionToSupabase(item);
+    if (!persisted.ok) {
+      throw new Error(`Failed to persist Android queued action: ${persisted.error}`);
+    }
+
     store.actions.unshift(item);
     if (store.actions.length > 60) store.actions.length = 60;
     this.saveStore(input.userId);
-    this.persistActionToSupabase(item);
     return item;
   }
 
-  approveAction(
+  async approveAction(
     userId: string,
     actionId: string,
-    riskStatus: RiskStatus
-  ): { ok: boolean; action?: AndroidActionQueueItem; error?: string; statusCode?: number } {
+    riskStatus: RiskStatus,
+    verifiedBrokerSession?: VerifiedBrokerAccountSession
+  ): Promise<{ ok: boolean; action?: AndroidActionQueueItem; error?: string; statusCode?: number }> {
+    await this.ensureUserHistoryLoaded(userId);
     const store = this.getOrInitStore(userId);
     this.expireStaleActions(store);
     const action = store.actions.find((a) => a.id === actionId);
     if (!action || action.status !== 'PENDING_USER_APPROVAL') {
       return { ok: false, error: 'Pending Android assisted action not found or expired.', statusCode: 404 };
     }
+
+    const prevStatus = action.status;
+    const prevReason = action.reason;
+    const prevApprovedAt = action.approvedAt;
+    const prevExpiresAt = action.expiresAt;
+    const prevMode = action.accountModeVerified;
+    const prevSource = action.accountModeVerificationSource;
+    const prevAcctId = action.verifiedBrokerAccountId;
+
+    if (verifiedBrokerSession) {
+      if (verifiedBrokerSession.verified && verifiedBrokerSession.source !== 'UNVERIFIED') {
+        action.accountModeVerified = verifiedBrokerSession.mode;
+        action.accountModeVerificationSource = verifiedBrokerSession.source;
+        action.verifiedBrokerAccountId = verifiedBrokerSession.brokerAccountId;
+      } else {
+        action.accountModeVerified = 'UNKNOWN';
+        action.accountModeVerificationSource = 'UNVERIFIED';
+        action.verifiedBrokerAccountId = null;
+      }
+    }
+
     if (!riskStatus.allowed) {
       action.status = 'BLOCKED_RISK';
       action.reason = `Blocked by risk guard: ${riskStatus.reasons.join(' ')}`;
+      const persisted = await this.persistActionToSupabase(action);
+      if (!persisted.ok) {
+        action.status = prevStatus;
+        action.reason = prevReason;
+        return { ok: false, error: `Supabase persistence error: ${persisted.error}`, statusCode: 500 };
+      }
       this.saveStore(userId);
-      this.persistActionToSupabase(action);
       return { ok: false, error: action.reason, statusCode: 409 };
     }
+
     if (action.accountModeVerified === 'REAL') {
-      action.status = 'BLOCKED_REAL_MONEY_LOCK';
-      action.reason = 'Real-money Android execution is locked. Only DEMO/PRACTICE accounts can be authorized.';
+      action.status = 'BLOCKED_RISK';
+      action.reason = 'Real-money Android execution is locked. Only verified DEMO/PRACTICE accounts can be authorized.';
+      const persisted = await this.persistActionToSupabase(action);
+      if (!persisted.ok) {
+        action.status = prevStatus;
+        action.reason = prevReason;
+        return { ok: false, error: `Supabase persistence error: ${persisted.error}`, statusCode: 500 };
+      }
       this.saveStore(userId);
-      this.persistActionToSupabase(action);
       return { ok: false, error: action.reason, statusCode: 423 };
+    }
+
+    if (
+      (action.accountModeVerified !== 'DEMO' && action.accountModeVerified !== 'PRACTICE') ||
+      action.accountModeVerificationSource === 'UNVERIFIED'
+    ) {
+      action.status = 'BLOCKED_UNVERIFIED_ACCOUNT';
+      action.reason =
+        verifiedBrokerSession?.reason ||
+        'Cannot authorize Android action: broker account mode is UNVERIFIED. Connect a DEMO or PRACTICE broker session first.';
+      const persisted = await this.persistActionToSupabase(action);
+      if (!persisted.ok) {
+        action.status = prevStatus;
+        action.reason = prevReason;
+        action.accountModeVerified = prevMode;
+        action.accountModeVerificationSource = prevSource;
+        action.verifiedBrokerAccountId = prevAcctId;
+        return { ok: false, error: `Supabase persistence error: ${persisted.error}`, statusCode: 500 };
+      }
+      this.saveStore(userId);
+      return { ok: false, error: action.reason, statusCode: 409 };
     }
 
     const now = new Date();
     action.status = 'AUTHORIZED';
     action.approvedAt = now.toISOString();
     action.expiresAt = new Date(now.getTime() + 30 * 1000).toISOString();
-    action.reason = 'Authorized by user for demo/paper workflow (Phase 1 safe tracking).';
+    action.reason = `Authorized by user for verified ${action.accountModeVerified} workflow (${action.accountModeVerificationSource}).`;
+
+    const persisted = await this.persistActionToSupabase(action);
+    if (!persisted.ok) {
+      action.status = prevStatus;
+      action.reason = prevReason;
+      action.approvedAt = prevApprovedAt;
+      action.expiresAt = prevExpiresAt;
+      action.accountModeVerified = prevMode;
+      action.accountModeVerificationSource = prevSource;
+      action.verifiedBrokerAccountId = prevAcctId;
+      return { ok: false, error: `Failed to persist Android authorization to Supabase: ${persisted.error}`, statusCode: 500 };
+    }
+
     this.saveStore(userId);
-    this.persistActionToSupabase(action);
     return { ok: true, action };
   }
 
-  rejectAction(userId: string, actionId: string, reason = 'Rejected by user.'): AndroidActionQueueItem | null {
+  async rejectAction(userId: string, actionId: string, reason = 'Rejected by user.'): Promise<AndroidActionQueueItem | null> {
+    await this.ensureUserHistoryLoaded(userId);
     const store = this.getOrInitStore(userId);
     const action = store.actions.find((a) => a.id === actionId);
     if (!action || (action.status !== 'PENDING_USER_APPROVAL' && action.status !== 'AUTHORIZED')) {
       return null;
     }
+    const prevStatus = action.status;
+    const prevReason = action.reason;
     action.status = 'REJECTED';
     action.reason = reason;
+    const persisted = await this.persistActionToSupabase(action);
+    if (!persisted.ok) {
+      action.status = prevStatus;
+      action.reason = prevReason;
+      throw new Error(`Failed to persist Android action rejection: ${persisted.error}`);
+    }
     this.saveStore(userId);
-    this.persistActionToSupabase(action);
     return action;
   }
 
-  blockAllPendingOnEmergencyStop(userId: string) {
+  async blockAllPendingOnEmergencyStop(userId: string): Promise<void> {
+    await this.ensureUserHistoryLoaded(userId);
     const store = this.getOrInitStore(userId);
     let changed = false;
     for (const action of store.actions) {
       if (action.status === 'PENDING_USER_APPROVAL' || action.status === 'AUTHORIZED') {
         action.status = 'BLOCKED_RISK';
         action.reason = 'Emergency stop engaged by user.';
+        const persisted = await this.persistActionToSupabase(action);
+        if (!persisted.ok) {
+          throw new Error(`Failed to persist Emergency Stop block to Supabase: ${persisted.error}`);
+        }
         changed = true;
-        this.persistActionToSupabase(action);
       }
     }
     if (changed) this.saveStore(userId);
   }
 
-  pollAuthorizedActionsForDevice(userId: string, deviceId: string, emergencyStop: boolean): AndroidActionQueueItem[] {
+  async pollAuthorizedActionsForDevice(
+    userId: string,
+    deviceId: string,
+    emergencyStop: boolean
+  ): Promise<AndroidActionQueueItem[]> {
+    await this.ensureUserHistoryLoaded(userId);
     if (emergencyStop) {
-      this.blockAllPendingOnEmergencyStop(userId);
+      await this.blockAllPendingOnEmergencyStop(userId);
       return [];
     }
     const store = this.getOrInitStore(userId);
@@ -951,43 +1198,67 @@ export class AndroidCompanionManager {
       (a) =>
         a.deviceId === deviceId &&
         a.status === 'AUTHORIZED' &&
-        a.accountModeVerified !== 'REAL'
+        (a.accountModeVerified === 'DEMO' || a.accountModeVerified === 'PRACTICE') &&
+        a.accountModeVerificationSource !== 'UNVERIFIED'
     );
+    const dispatched: AndroidActionQueueItem[] = [];
     for (const act of authorized) {
+      const prevStatus = act.status;
       act.status = 'DISPATCHED_TO_DEVICE';
-      this.persistActionToSupabase(act);
+      const persisted = await this.persistActionToSupabase(act);
+      if (!persisted.ok) {
+        act.status = prevStatus;
+        throw new Error(`Failed to persist Android action dispatch to Supabase: ${persisted.error}`);
+      }
+      dispatched.push(act);
     }
-    if (authorized.length > 0) this.saveStore(userId);
-    return authorized;
+    if (dispatched.length > 0) this.saveStore(userId);
+    return dispatched;
   }
 
-  acknowledgeDeviceAction(
+  async acknowledgeDeviceAction(
     userId: string,
     deviceId: string,
     actionId: string,
     outcome: 'EXECUTED_REPORTED' | 'REJECTED' | 'EXPIRED',
     note?: string
-  ): AndroidActionQueueItem | null {
+  ): Promise<AndroidActionQueueItem | null> {
+    await this.ensureUserHistoryLoaded(userId);
     const store = this.getOrInitStore(userId);
     this.expireStaleActions(store);
     const action = store.actions.find((a) => a.id === actionId && a.deviceId === deviceId);
     if (!action) return null;
     if (action.accountModeVerified === 'REAL') return null;
+    if (
+      outcome === 'EXECUTED_REPORTED' &&
+      ((action.accountModeVerified !== 'DEMO' && action.accountModeVerified !== 'PRACTICE') ||
+        action.accountModeVerificationSource === 'UNVERIFIED')
+    ) {
+      return null;
+    }
     if (action.status !== 'AUTHORIZED' && action.status !== 'DISPATCHED_TO_DEVICE') return null;
+    const prevStatus = action.status;
+    const prevExec = action.executedAt;
+    const prevNote = action.deviceAckNote;
     action.status = outcome;
     action.executedAt = new Date().toISOString();
     action.deviceAckNote = note ? note.slice(0, 240) : null;
+    const persisted = await this.persistActionToSupabase(action);
+    if (!persisted.ok) {
+      action.status = prevStatus;
+      action.executedAt = prevExec;
+      action.deviceAckNote = prevNote;
+      throw new Error(`Failed to persist Android action acknowledgement to Supabase: ${persisted.error}`);
+    }
     this.saveStore(userId);
-    this.persistActionToSupabase(action);
     return action;
   }
 
-  private persistActionToSupabase(action: AndroidActionQueueItem) {
+  private async persistActionToSupabase(action: AndroidActionQueueItem): Promise<{ ok: boolean; error?: string }> {
     const admin = getSupabaseAdmin();
-    if (!admin || action.userId === 'local-preview') return;
-    void admin
-      .from('android_action_queue')
-      .upsert(
+    if (!admin || action.userId === 'local-preview') return { ok: true };
+    try {
+      const { error } = await admin.from('android_action_queue').upsert(
         {
           id: action.id,
           user_id: action.userId,
@@ -1001,6 +1272,8 @@ export class AndroidCompanionManager {
           stake_or_volume: action.stakeOrVolume,
           expiry_seconds: action.expirySeconds,
           account_mode_verified: action.accountModeVerified,
+          account_mode_verification_source: action.accountModeVerificationSource,
+          verified_broker_account_id: action.verifiedBrokerAccountId,
           status: action.status,
           reason: action.reason,
           expires_at: action.expiresAt,
@@ -1010,7 +1283,19 @@ export class AndroidCompanionManager {
           created_at: action.createdAt,
         },
         { onConflict: 'id' }
-      )
-      .then(() => undefined, () => undefined);
+      );
+      if (error) {
+        this.lastPersistenceError = error.message;
+        console.error('[AndroidCompanionManager] Supabase android_action_queue write failed:', error.message);
+        return { ok: false, error: error.message };
+      }
+      this.lastPersistenceError = null;
+      return { ok: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Supabase write exception';
+      this.lastPersistenceError = msg;
+      console.error('[AndroidCompanionManager] Supabase android_action_queue write exception:', msg);
+      return { ok: false, error: msg };
+    }
   }
 }

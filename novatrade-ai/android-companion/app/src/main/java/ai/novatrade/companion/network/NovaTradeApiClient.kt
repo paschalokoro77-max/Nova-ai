@@ -231,6 +231,7 @@ class NovaTradeApiClient {
         payload: JSONObject?
     ): Result<JSONObject> {
         return try {
+            validateServerUrl(url)
             val builder = Request.Builder().url(url)
             if (!token.isNullOrBlank()) {
                 builder.addHeader("Authorization", "Bearer $token")
@@ -261,7 +262,35 @@ class NovaTradeApiClient {
         }
     }
 
-    private fun normalizeBase(baseUrl: String): String = baseUrl.trim().trimEnd('/')
+    private fun normalizeBase(baseUrl: String): String {
+        val cleaned = baseUrl.trim().trimEnd('/')
+        validateServerUrl(cleaned)
+        return cleaned
+    }
+
+    companion object {
+        fun isAllowedServerUrl(rawUrl: String): Boolean {
+            return try {
+                validateServerUrl(rawUrl.trim())
+                true
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        fun validateServerUrl(rawUrl: String) {
+            val uri = java.net.URI(rawUrl)
+            val scheme = uri.scheme?.lowercase().orEmpty()
+            val host = uri.host?.lowercase().orEmpty()
+            if (scheme == "https" && host.isNotBlank()) {
+                return
+            }
+            val isLocalDev = scheme == "http" && (host == "localhost" || host == "127.0.0.1" || host == "10.0.2.2")
+            if (!isLocalDev) {
+                throw IllegalArgumentException("HTTPS (https://) is required for NovaTrade Android Companion connections.")
+            }
+        }
+    }
 
     private fun JSONObject.optNullableString(key: String): String? {
         if (isNull(key)) return null

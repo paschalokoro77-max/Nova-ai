@@ -54,7 +54,7 @@ export class BrokerRegistry {
         isPreparedAdapterOnly: caps.isPreparedAdapterOnly,
         status,
         description: caps.message,
-        realExecutionEnabled: false,
+        realExecutionEnabled: Boolean(caps.realAccountSupported && caps.liveOrderPlacementSupported),
         capabilities: caps,
       };
     });

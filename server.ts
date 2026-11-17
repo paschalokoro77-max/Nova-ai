@@ -1,16 +1,29 @@
 import 'dotenv/config';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import express from 'express';
 import cors from 'cors';
-import { createNovaTradeRouter } from './novatrade-ai/server/src/app.ts';
+import { createCorsOriginHandler, createNovaTradeRouter } from './novatrade-ai/server/src/app.ts';
+import { validateProductionEnvironment } from './novatrade-ai/server/src/supabaseAdmin.ts';
 
 const PORT = Number(process.env.PORT || 3000);
-const isProduction = process.env.NODE_ENV === 'production';
 
-async function startServer() {
+export interface FullStackAppOptions {
+  isProduction?: boolean;
+  distDir?: string;
+  routerOptions?: Parameters<typeof createNovaTradeRouter>[0];
+}
+
+export async function createFullStackApp(options: FullStackAppOptions = {}) {
+  const isProduction = options.isProduction ?? process.env.NODE_ENV === 'production';
+  if (isProduction) {
+    validateProductionEnvironment();
+  }
+
   const app = express();
-  app.use(cors({ origin: true }));
+  app.set('trust proxy', 1);
+  app.use(cors({ origin: createCorsOriginHandler(isProduction) }));
   const standardJson = express.json({ limit: '150kb' });
   app.use((req, res, next) => {
     if (req.path === '/api/android/screen/analyze') {
@@ -20,12 +33,14 @@ async function startServer() {
     standardJson(req, res, next);
   });
 
-  const { router } = createNovaTradeRouter({
-    persistPath: path.resolve(process.cwd(), '.novatrade-data/state.json'),
+  const routerBundle = createNovaTradeRouter({
+    persistPath: isProduction ? null : path.resolve(process.cwd(), '.novatrade-data/state.json'),
     enableScheduler: true,
+    ...options.routerOptions,
   });
 
-  app.use('/api', router);
+  app.get('/health', routerBundle.handleHealthRequest);
+  app.use('/api', routerBundle.router);
   app.use('/api', (req, res) => {
     res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
   });
@@ -49,21 +64,43 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
-    if (fs.existsSync(distDir)) {
-      app.use(express.static(distDir));
-      app.get('/{*splat}', (_req, res) => {
-        res.sendFile(path.join(distDir, 'index.html'));
-      });
+    const distDir = options.distDir ?? path.resolve(process.cwd(), 'dist');
+    const indexHtmlPath = path.join(distDir, 'index.html');
+    if (!fs.existsSync(distDir) || !fs.existsSync(indexHtmlPath)) {
+      throw new Error(
+        `Production build assets missing: dist/index.html not found at ${indexHtmlPath}. Run 'npm run build' before starting production server.`
+      );
     }
+    app.use(express.static(distDir, { index: 'index.html' }));
+    // Express 4 compatible SPA fallback (never swallows /api/* or missing static asset files)
+    app.get('*', (req, res, next) => {
+      if (req.path === '/api' || req.path.startsWith('/api/')) {
+        return next();
+      }
+      if (req.path.startsWith('/assets/') || /\.[a-z0-9]{2,8}$/i.test(req.path)) {
+        return res.status(404).json({ error: `Asset not found: ${req.path}` });
+      }
+      return res.sendFile(indexHtmlPath);
+    });
   }
 
+  return { app, ...routerBundle };
+}
+
+async function startServer() {
+  const { app } = await createFullStackApp();
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`NovaTrade AI full-stack runtime listening on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start NovaTrade AI server:', err);
-  process.exit(1);
-});
+const isMainModule =
+  typeof process.argv[1] === 'string' &&
+  path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+
+if (isMainModule) {
+  startServer().catch((err) => {
+    console.error('Failed to start NovaTrade AI server:', err);
+    process.exit(1);
+  });
+}

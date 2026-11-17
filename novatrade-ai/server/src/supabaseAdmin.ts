@@ -25,6 +25,35 @@ export function getSupabaseServerConfig() {
   };
 }
 
+export function validateProductionEnvironment(): void {
+  const cfg = getSupabaseServerConfig();
+  const issues: string[] = [];
+
+  if (!cfg.urlValid) {
+    issues.push('SUPABASE_URL (or VITE_SUPABASE_URL) must be a valid HTTP/HTTPS URL');
+  }
+  if (!cfg.anonKey) {
+    issues.push('SUPABASE_ANON_KEY (or VITE_SUPABASE_ANON_KEY) is required');
+  }
+  if (!cfg.serviceRoleConfigured) {
+    issues.push('SUPABASE_SERVICE_ROLE_KEY is required');
+  }
+
+  const bridgeSecret = (process.env.ANDROID_BRIDGE_SECRET || '').trim();
+  if (!bridgeSecret || Buffer.byteLength(bridgeSecret, 'utf8') < 32) {
+    issues.push('ANDROID_BRIDGE_SECRET must be set to at least 32 bytes');
+  }
+
+  const vaultSecret = (process.env.BROKER_VAULT_SECRET || '').trim();
+  if (!vaultSecret || Buffer.byteLength(vaultSecret, 'utf8') < 32) {
+    issues.push('BROKER_VAULT_SECRET must be set to at least 32 bytes');
+  }
+
+  if (issues.length > 0) {
+    throw new Error(`Production environment validation failed: ${issues.join('; ')}`);
+  }
+}
+
 export function getSupabaseAdmin(): SupabaseClient | null {
   const cfg = getSupabaseServerConfig();
   const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
@@ -64,6 +93,19 @@ export async function verifySupabaseBearerToken(authHeader?: string): Promise<{ 
   }
 }
 
+export interface MissingColumnReport {
+  table: string;
+  columns: string[];
+  migration: string;
+  error: string;
+}
+
+export interface TableRlsDiagnostic {
+  rlsProtected: boolean;
+  anonBlocked: boolean;
+  error: string | null;
+}
+
 export interface SupabaseSchemaDiagnostics {
   clientConfigured: boolean;
   serverConfigured: boolean;
@@ -74,7 +116,18 @@ export interface SupabaseSchemaDiagnostics {
   migration001Applied: boolean;
   migration002Applied: boolean;
   migration003Applied: boolean;
+  migration004Applied: boolean;
+  migration005Applied: boolean;
+  migration006Applied: boolean;
+  migration007Applied: boolean;
+  migration008Applied: boolean;
+  migration009Applied: boolean;
   tables: Record<string, { exists: boolean; error: string | null }>;
+  missingTables: string[];
+  missingColumns: MissingColumnReport[];
+  missingFunctions: string[];
+  rlsPolicies: Record<string, TableRlsDiagnostic>;
+  migrationsSummary: Record<string, { applied: boolean; detail: string }>;
   eligibleAutoWorkspacesCount: number;
   checkedAt: string;
 }
@@ -146,14 +199,102 @@ const MIGRATION_003_CHECKS: Array<{ name: string; table: string; columns: string
   {
     name: 'android_action_queue',
     table: 'android_action_queue',
-    columns: 'id,user_id,device_id,symbol,direction,status,account_mode_verified',
+    columns: 'id,user_id,device_id,symbol,direction,status,account_mode_verified,account_mode_verification_source,verified_broker_account_id',
   },
 ];
+
+const MIGRATION_006_CHECKS: Array<{ name: string; table: string; columns: string }> = [
+  {
+    name: 'paper_trades_v6',
+    table: 'paper_trades',
+    columns: 'stop_loss,take_profit',
+  },
+];
+
+const MIGRATION_007_CHECKS: Array<{ name: string; table: string; columns: string }> = [
+  {
+    name: 'broker_vault_state',
+    table: 'broker_vault_state',
+    columns: 'user_id,active_account_id,auto_execute_broker_demo,accounts_json,orders_json,idempotency_keys_json,updated_at',
+  },
+];
+
+const MIGRATION_008_CHECKS: Array<{ name: string; table: string; columns: string }> = [
+  {
+    name: 'paper_trades_v8',
+    table: 'paper_trades',
+    columns: 'account_bucket,strategy_name',
+  },
+];
+
+const MIGRATION_009_CHECKS: Array<{ name: string; table: string; columns: string }> = [
+  {
+    name: 'user_settings_v9',
+    table: 'user_settings',
+    columns: 'runtime_recovery',
+  },
+];
+
+const RLS_PROTECTED_TABLES = [
+  'user_settings',
+  'paper_trades',
+  'broker_connections',
+  'broker_vault_state',
+  'android_devices',
+  'android_action_queue',
+];
+
+function isMissingTableError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('could not find the table') ||
+    lower.includes('does not exist') && lower.includes('relation') ||
+    lower.includes('pgrst205')
+  );
+}
+
+async function runMigrationChecks(
+  admin: SupabaseClient,
+  migrationId: string,
+  checks: Array<{ name: string; table: string; columns: string }>,
+  tables: Record<string, { exists: boolean; error: string | null }>,
+  missingTablesSet: Set<string>,
+  missingColumns: MissingColumnReport[]
+): Promise<boolean> {
+  let allPassed = true;
+  for (const check of checks) {
+    const { error } = await admin.from(check.table).select(check.columns).limit(0);
+    tables[check.name] = { exists: !error, error: error ? error.message : null };
+    if (error) {
+      allPassed = false;
+      if (isMissingTableError(error.message)) {
+        missingTablesSet.add(check.table);
+      } else {
+        const failedCols: string[] = [];
+        for (const col of check.columns.split(',').map((c) => c.trim()).filter(Boolean)) {
+          const single = await admin.from(check.table).select(col).limit(0);
+          if (single.error) failedCols.push(col);
+        }
+        missingColumns.push({
+          table: check.table,
+          columns: failedCols.length > 0 ? failedCols : check.columns.split(',').map((c) => c.trim()),
+          migration: migrationId,
+          error: error.message,
+        });
+      }
+    }
+  }
+  return allPassed;
+}
 
 export async function runSupabaseDiagnostics(): Promise<SupabaseSchemaDiagnostics> {
   const cfg = getSupabaseServerConfig();
   const checkedAt = new Date().toISOString();
   const tables: Record<string, { exists: boolean; error: string | null }> = {};
+  const missingTablesSet = new Set<string>();
+  const missingColumns: MissingColumnReport[] = [];
+  const missingFunctions: string[] = [];
+  const rlsPolicies: Record<string, TableRlsDiagnostic> = {};
 
   let authReachable = false;
   let authError: string | null = null;
@@ -184,7 +325,18 @@ export async function runSupabaseDiagnostics(): Promise<SupabaseSchemaDiagnostic
       migration001Applied: false,
       migration002Applied: false,
       migration003Applied: false,
+      migration004Applied: false,
+      migration005Applied: false,
+      migration006Applied: false,
+      migration007Applied: false,
+      migration008Applied: false,
+      migration009Applied: false,
       tables,
+      missingTables: [],
+      missingColumns,
+      missingFunctions,
+      rlsPolicies,
+      migrationsSummary: {},
       eligibleAutoWorkspacesCount: 0,
       checkedAt,
     };
@@ -199,25 +351,76 @@ export async function runSupabaseDiagnostics(): Promise<SupabaseSchemaDiagnostic
     if (!authError) authError = err instanceof Error ? err.message : 'Admin check failed';
   }
 
-  let migration001Applied = true;
-  for (const check of MIGRATION_001_CHECKS) {
-    const { error } = await admin.from(check.table).select(check.columns).limit(0);
-    tables[check.name] = { exists: !error, error: error ? error.message : null };
-    if (error) migration001Applied = false;
+  const migration001Applied = await runMigrationChecks(admin, '001', MIGRATION_001_CHECKS, tables, missingTablesSet, missingColumns);
+  const migration002Applied = await runMigrationChecks(admin, '002', MIGRATION_002_CHECKS, tables, missingTablesSet, missingColumns);
+  const migration003Applied = await runMigrationChecks(admin, '003', MIGRATION_003_CHECKS, tables, missingTablesSet, missingColumns);
+  const migration006Applied = await runMigrationChecks(admin, '006', MIGRATION_006_CHECKS, tables, missingTablesSet, missingColumns);
+  const migration007Applied = await runMigrationChecks(admin, '007', MIGRATION_007_CHECKS, tables, missingTablesSet, missingColumns);
+  const migration008Applied = await runMigrationChecks(admin, '008', MIGRATION_008_CHECKS, tables, missingTablesSet, missingColumns);
+  const migration009Applied = await runMigrationChecks(admin, '009', MIGRATION_009_CHECKS, tables, missingTablesSet, missingColumns);
+
+  // Migration 004 creates partial indexes on android_devices (requires migration 003 base table/columns)
+  const migration004Applied = Boolean(tables.android_devices?.exists) && !missingTablesSet.has('android_devices');
+  tables.android_pairing_indexes_004 = {
+    exists: migration004Applied,
+    error: migration004Applied
+      ? null
+      : 'Prerequisite table public.android_devices unavailable for pairing indexes.',
+  };
+
+  // Migration 005 adds single-use atomic RPC redeem_android_pairing_code(); blank args cleanly return null with 0 side effects
+  let migration005Applied = false;
+  try {
+    const { error: rpcError } = await admin.rpc('redeem_android_pairing_code', {
+      p_pairing_code_hash: '',
+      p_device_name: '',
+      p_device_model: null,
+      p_os_version: null,
+      p_media_projection: false,
+      p_accessibility: false,
+      p_token_hash: '',
+      p_token_prefix: '',
+    });
+    migration005Applied = !rpcError;
+    tables.redeem_android_pairing_code = {
+      exists: migration005Applied,
+      error: rpcError ? rpcError.message : null,
+    };
+    if (rpcError) {
+      missingFunctions.push('public.redeem_android_pairing_code');
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'RPC check failed';
+    tables.redeem_android_pairing_code = { exists: false, error: msg };
+    missingFunctions.push('public.redeem_android_pairing_code');
   }
 
-  let migration002Applied = true;
-  for (const check of MIGRATION_002_CHECKS) {
-    const { error } = await admin.from(check.table).select(check.columns).limit(0);
-    tables[check.name] = { exists: !error, error: error ? error.message : null };
-    if (error) migration002Applied = false;
-  }
-
-  let migration003Applied = true;
-  for (const check of MIGRATION_003_CHECKS) {
-    const { error } = await admin.from(check.table).select(check.columns).limit(0);
-    tables[check.name] = { exists: !error, error: error ? error.message : null };
-    if (error) migration003Applied = false;
+  // Non-destructive RLS isolation probe using unauthenticated anon key
+  if (cfg.urlValid && cfg.url && cfg.anonKey) {
+    const anonClient = createClient(cfg.url, cfg.anonKey, {
+      auth: { autoRefreshToken: false, persistSession: false },
+    });
+    for (const tbl of RLS_PROTECTED_TABLES) {
+      if (missingTablesSet.has(tbl)) {
+        rlsPolicies[tbl] = { rlsProtected: false, anonBlocked: true, error: 'Table missing' };
+        continue;
+      }
+      try {
+        const { data, error } = await anonClient.from(tbl).select('*').limit(1);
+        const leakedRows = !error && Array.isArray(data) && data.length > 0;
+        rlsPolicies[tbl] = {
+          rlsProtected: !leakedRows,
+          anonBlocked: !leakedRows,
+          error: leakedRows ? 'Anon query returned rows without authentication (check RLS policy).' : error ? error.message : null,
+        };
+      } catch (err) {
+        rlsPolicies[tbl] = {
+          rlsProtected: true,
+          anonBlocked: true,
+          error: err instanceof Error ? err.message : null,
+        };
+      }
+    }
   }
 
   let eligibleAutoWorkspacesCount = 0;
@@ -230,6 +433,47 @@ export async function runSupabaseDiagnostics(): Promise<SupabaseSchemaDiagnostic
     eligibleAutoWorkspacesCount = count ?? 0;
   }
 
+  const migrationsSummary: Record<string, { applied: boolean; detail: string }> = {
+    '001': {
+      applied: migration001Applied,
+      detail: migration001Applied ? 'Core platform tables verified.' : 'Missing core platform table(s) or columns.',
+    },
+    '002': {
+      applied: migration002Applied,
+      detail: migration002Applied ? 'Virtual balance and risk assessment columns verified.' : 'Missing 002 columns.',
+    },
+    '003': {
+      applied: migration003Applied,
+      detail: migration003Applied ? 'Android companion tables and verification columns verified.' : 'Missing 003 Android tables or verification columns.',
+    },
+    '004': {
+      applied: migration004Applied,
+      detail: migration004Applied
+        ? 'Target table public.android_devices present (partial pg_indexes verified via SQL).'
+        : 'Target table public.android_devices missing.',
+    },
+    '005': {
+      applied: migration005Applied,
+      detail: migration005Applied ? 'RPC public.redeem_android_pairing_code verified.' : 'RPC public.redeem_android_pairing_code missing.',
+    },
+    '006': {
+      applied: migration006Applied,
+      detail: migration006Applied ? 'paper_trades SL/TP columns verified.' : 'Missing paper_trades stop_loss/take_profit columns.',
+    },
+    '007': {
+      applied: migration007Applied,
+      detail: migration007Applied ? 'broker_vault_state table verified.' : 'Missing broker_vault_state table or columns.',
+    },
+    '008': {
+      applied: migration008Applied,
+      detail: migration008Applied ? 'paper_trades account_bucket and strategy_name verified.' : 'Missing 008 learning attribution columns.',
+    },
+    '009': {
+      applied: migration009Applied,
+      detail: migration009Applied ? 'user_settings.runtime_recovery verified.' : 'Optional 009 runtime_recovery column not yet applied (graceful fallback active).',
+    },
+  };
+
   return {
     clientConfigured: cfg.clientAuthConfigured,
     serverConfigured: cfg.serviceRoleConfigured,
@@ -240,7 +484,18 @@ export async function runSupabaseDiagnostics(): Promise<SupabaseSchemaDiagnostic
     migration001Applied,
     migration002Applied,
     migration003Applied,
+    migration004Applied,
+    migration005Applied,
+    migration006Applied,
+    migration007Applied,
+    migration008Applied,
+    migration009Applied,
     tables,
+    missingTables: Array.from(missingTablesSet),
+    missingColumns,
+    missingFunctions,
+    rlsPolicies,
+    migrationsSummary,
     eligibleAutoWorkspacesCount,
     checkedAt,
   };

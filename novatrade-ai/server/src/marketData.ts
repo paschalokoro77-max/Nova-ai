@@ -184,7 +184,7 @@ async function fetchKrakenCandles(pair: string, timeframe: Timeframe, limit: num
 
 async function fetchBinanceCandles(symbol: string, timeframe: Timeframe, limit: number): Promise<Candle[]> {
   const interval = BINANCE_INTERVAL[timeframe];
-  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${Math.min(limit, 500)}`;
+  const url = `https://api.binance.com/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${Math.min(limit, 1000)}`;
   const res = await fetch(url, { signal: AbortSignal.timeout(6500) });
   if (!res.ok) throw new Error(`Binance HTTP ${res.status}`);
   const rows = (await res.json()) as Array<[number, string, string, string, string, string]>;
@@ -252,7 +252,11 @@ export async function fetchMarketCandles(
 
       const currentDate = new Date();
       const dayOfWeek = currentDate.getUTCDay();
-      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6 || (dayOfWeek === 5 && currentDate.getUTCHours() >= 22);
+      const utcHour = currentDate.getUTCHours();
+      const isWeekend =
+        dayOfWeek === 6 ||
+        (dayOfWeek === 5 && utcHour >= 22) ||
+        (dayOfWeek === 0 && utcHour < 22);
 
       let marketStatus: MarketStatus = 'LIVE';
       if (isWeekend && asset.instrumentType === 'FOREX') {

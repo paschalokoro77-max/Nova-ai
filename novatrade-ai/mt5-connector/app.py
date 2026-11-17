@@ -1,6 +1,6 @@
 """FastAPI HTTP bridge wrapping NovaTrade's official MetaTrader 5 Python SDK service.
 
-Run on Windows x64 alongside a logged-in MetaTrader 5 Desktop Terminal (DEMO account only):
+Run on Windows x64 alongside a logged-in MetaTrader 5 Desktop Terminal (Demo or Real account):
     uvicorn app:app --host 127.0.0.1 --port 8765
 """
 import hmac
@@ -60,9 +60,10 @@ def health(x_bridge_token: Optional[str] = Header(default=None)):
 @app.post("/connect")
 def connect(body: ConnectBody, x_bridge_token: Optional[str] = Header(default=None)):
     _check_auth(x_bridge_token)
-    if body.environment.strip().lower() != "demo":
-        raise HTTPException(status_code=403, detail="Only DEMO environment connections are permitted.")
-    return _run(service.connect, login=body.login, password=body.password, server=body.server)
+    env = body.environment.strip().lower()
+    if env not in ("demo", "real"):
+        raise HTTPException(status_code=400, detail="Environment must be 'demo' or 'real'.")
+    return _run(service.connect, login=body.login, password=body.password, server=body.server, environment=env)
 
 
 @app.post("/disconnect")
@@ -126,7 +127,7 @@ def validate_order(body: OrderBody, x_bridge_token: Optional[str] = Header(defau
 def place_order(body: OrderBody, x_bridge_token: Optional[str] = Header(default=None)):
     _check_auth(x_bridge_token)
     return _run(
-        service.place_demo_order,
+        service.place_order,
         environment=body.environment,
         symbol=body.symbol,
         side=body.side,

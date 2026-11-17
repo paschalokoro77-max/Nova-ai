@@ -75,6 +75,7 @@ interface BrokersViewProps {
     accountId?: string;
     brokerId: BrokerId;
     label: string;
+    environment?: 'demo' | 'real';
     externalAccountId?: string | null;
     credentials: Record<string, string>;
   }) => Promise<ManagedBrokerAccountPublic>;
@@ -184,6 +185,7 @@ export function BrokerConnectionsView({
 }: BrokersViewProps) {
   const [showAddForm, setShowAddForm] = useState(false);
   const [newBrokerId, setNewBrokerId] = useState<BrokerId>('mt5');
+  const [newEnvironment, setNewEnvironment] = useState<'demo' | 'real'>('demo');
   const [newLabel, setNewLabel] = useState('');
   const [newCreds, setNewCreds] = useState<Record<string, string>>({});
   const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
@@ -214,6 +216,7 @@ export function BrokerConnectionsView({
   const [mt5Login, setMt5Login] = useState('');
   const [mt5Password, setMt5Password] = useState('');
   const [mt5Server, setMt5Server] = useState('MetaQuotes-Demo');
+  const [mt5Environment, setMt5Environment] = useState<'demo' | 'real'>('demo');
   const [mt5SuccessMsg, setMt5SuccessMsg] = useState<string | null>(null);
   const [isMt5LoggingIn, setIsMt5LoggingIn] = useState(false);
 
@@ -234,7 +237,8 @@ export function BrokerConnectionsView({
     try {
       const savedAccount = await onSaveAccount({
         brokerId: 'mt5',
-        label: `MT5 Account (${mt5Login.trim()})`,
+        label: `MT5 ${mt5Environment === 'real' ? 'Real' : 'Demo'} (${mt5Login.trim()})`,
+        environment: mt5Environment,
         externalAccountId: mt5Login.trim(),
         credentials: {
           accountNumber: mt5Login.trim(),
@@ -347,6 +351,7 @@ export function BrokerConnectionsView({
     const item = catalog.find((c) => c.id === brokerId);
     setEditingAccountId(null);
     setNewBrokerId(brokerId);
+    setNewEnvironment('demo');
     setNewLabel(brokerId === 'mt5' ? 'MT5 MetaQuotes-Demo' : `${item?.name || brokerId} Demo`);
     setNewCreds(brokerId === 'mt5' ? { serverName: 'MetaQuotes-Demo' } : {});
     setShowAddForm(true);
@@ -355,6 +360,7 @@ export function BrokerConnectionsView({
   function openCredentialUpdate(acct: ManagedBrokerAccountPublic) {
     setEditingAccountId(acct.id);
     setNewBrokerId(acct.brokerId);
+    setNewEnvironment(acct.brokerId === 'mt5' ? acct.environment : 'demo');
     setNewLabel(acct.label);
     setNewCreds(
       acct.brokerId === 'mt5'
@@ -374,7 +380,8 @@ export function BrokerConnectionsView({
       await onSaveAccount({
         accountId: editingAccountId || undefined,
         brokerId: newBrokerId,
-        label: newLabel.trim() || `${selectedCatalogItem?.name || newBrokerId} Demo`,
+        label: newLabel.trim() || `${selectedCatalogItem?.name || newBrokerId} ${newBrokerId === 'mt5' && newEnvironment === 'real' ? 'Real' : 'Demo'}`,
+        environment: newBrokerId === 'mt5' ? newEnvironment : 'demo',
         externalAccountId: newCreds.accountNumber?.trim() || undefined,
         credentials: newCreds,
       });
@@ -500,7 +507,7 @@ export function BrokerConnectionsView({
         <div>
           <h2 className="text-xl font-semibold tracking-tight text-slate-900 dark:text-white">MT5 + IQ Option Broker Manager</h2>
           <p className="mt-0.5 text-sm text-slate-600 dark:text-slate-400">
-            Manage demo accounts for MetaTrader 5 (Official Python SDK Bridge) and IQ Option (Unofficial Practice Read-Only Connector). Credentials stay encrypted on the server.
+            Manage Demo or Real accounts for MetaTrader 5 (Official Python SDK Bridge) and Practice Read-Only accounts for IQ Option. Credentials stay encrypted on the server.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -510,7 +517,7 @@ export function BrokerConnectionsView({
             disabled={busy}
             className="min-h-11 inline-flex items-center gap-2 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 px-4 py-2 text-xs font-semibold text-white whitespace-nowrap transition-colors"
           >
-            <Plus className="h-3.5 w-3.5" /> Add MT5 / IQ Demo Account
+            <Plus className="h-3.5 w-3.5" /> Add MT5 / IQ Account
           </button>
           <button
             type="button"
@@ -523,7 +530,7 @@ export function BrokerConnectionsView({
         </div>
       </div>
 
-      {/* Active Execution Target, Auto-Routing Guard & Real-Money Safety Lock */}
+      {/* Active Execution Target, Auto-Routing Guard & Safety Badge */}
       <div className={`${CARD_SURFACE} p-5 flex flex-wrap items-center justify-between gap-4`}>
         <div className="flex items-start gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-amber-300/80 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/35 text-amber-700 dark:text-amber-300">
@@ -533,11 +540,11 @@ export function BrokerConnectionsView({
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Active Execution Target</p>
             <h3 className="text-sm font-semibold text-slate-900 dark:text-white mt-0.5">
               {activeAccount
-                ? `${activeAccount.label} · ${activeAccount.brokerName} (${activeAccount.accountType || 'DEMO'})`
+                ? `${activeAccount.label} · ${activeAccount.brokerName} (${activeAccount.accountType || activeAccount.environment.toUpperCase()})`
                 : 'NovaTrade Paper Simulator (Default Safe Mode)'}
             </h3>
             <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-              Real-money execution is disabled. MT5 routes strictly DEMO orders after `mt5.order_check()`; IQ Option stays read-only PRACTICE diagnostics.
+              MT5 supports connected Demo or Real accounts with pre-flight `mt5.order_check()` and per-account risk limits; IQ Option stays read-only PRACTICE diagnostics.
             </p>
           </div>
         </div>
@@ -556,8 +563,8 @@ export function BrokerConnectionsView({
               {emergencyStop
                 ? 'Auto MT5 Halted (Emergency Stop)'
                 : autoBrokerExecution
-                  ? 'Auto MT5 Demo Routing: ON'
-                  : 'Auto MT5 Demo Routing: OFF'}
+                  ? `Auto MT5 ${activeAccount.environment.toUpperCase()} Routing: ON`
+                  : `Auto MT5 ${activeAccount.environment.toUpperCase()} Routing: OFF`}
             </button>
           )}
           {activeAccount && (
@@ -570,8 +577,14 @@ export function BrokerConnectionsView({
               Switch to Paper Simulator
             </button>
           )}
-          <span className="rounded-lg border border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 px-3 py-1.5 text-xs font-medium text-amber-800 dark:text-amber-300 whitespace-nowrap">
-            Live Money Locked (Demo Only)
+          <span className={`rounded-lg border px-3 py-1.5 text-xs font-medium whitespace-nowrap ${
+            activeAccount?.brokerId === 'mt5' && activeAccount.environment === 'real'
+              ? 'border-emerald-300 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300'
+              : 'border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-300'
+          }`}>
+            {activeAccount?.brokerId === 'mt5'
+              ? `MT5 ${activeAccount.environment.toUpperCase()} Active`
+              : 'Paper / Practice Only'}
           </span>
         </div>
       </div>
@@ -649,15 +662,28 @@ export function BrokerConnectionsView({
               className={INPUT_CLASS}
             />
           </div>
-          <div>
-            <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Server (optional)</label>
-            <input
-              type="text"
-              value={mt5Server}
-              onChange={(e) => setMt5Server(e.target.value)}
-              placeholder="MetaQuotes-Demo"
-              className={INPUT_CLASS}
-            />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Server (optional)</label>
+              <input
+                type="text"
+                value={mt5Server}
+                onChange={(e) => setMt5Server(e.target.value)}
+                placeholder={mt5Environment === 'real' ? 'Broker-Live' : 'MetaQuotes-Demo'}
+                className={INPUT_CLASS}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Account Environment</label>
+              <select
+                value={mt5Environment}
+                onChange={(e) => setMt5Environment(e.target.value === 'real' ? 'real' : 'demo')}
+                className={SELECT_CLASS}
+              >
+                <option value="demo">Demo Account</option>
+                <option value="real">Real / Live Account</option>
+              </select>
+            </div>
           </div>
           <button
             type="submit"
@@ -742,7 +768,7 @@ export function BrokerConnectionsView({
             <div className="flex items-center gap-2">
               <KeyRound className="h-4 w-4 text-blue-600 dark:text-indigo-400" />
               <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-                {editingAccountId ? 'Update Demo Account Credentials' : 'Connect New Sandbox / Demo Account'}
+                {editingAccountId ? 'Update Broker Account Credentials' : 'Connect New Broker Account'}
               </h3>
             </div>
             <button
@@ -767,8 +793,9 @@ export function BrokerConnectionsView({
                   const id = e.target.value as BrokerId;
                   const item = catalog.find((c) => c.id === id);
                   setNewBrokerId(id);
+                  if (id !== 'mt5') setNewEnvironment('demo');
                   if (!editingAccountId) {
-                    setNewLabel(id === 'mt5' ? 'MT5 MetaQuotes-Demo' : `${item?.name || id} Demo`);
+                    setNewLabel(id === 'mt5' ? 'MT5 MetaQuotes-Demo' : `${item?.name || id} Practice`);
                   }
                   setNewCreds(id === 'mt5' ? { serverName: 'MetaQuotes-Demo' } : {});
                 }}
@@ -788,18 +815,29 @@ export function BrokerConnectionsView({
                 required
                 value={newLabel}
                 onChange={(e) => setNewLabel(e.target.value)}
-                placeholder="e.g. MetaTrader 5 Demo Desk"
+                placeholder="e.g. MetaTrader 5 Account"
                 className={INPUT_CLASS}
               />
             </div>
             <div>
               <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Environment</label>
-              <input
-                type="text"
-                disabled
-                value="DEMO / PRACTICE ONLY (Live Locked)"
-                className={`${INPUT_CLASS} opacity-75 cursor-not-allowed`}
-              />
+              {newBrokerId === 'mt5' ? (
+                <select
+                  value={newEnvironment}
+                  onChange={(e) => setNewEnvironment(e.target.value === 'real' ? 'real' : 'demo')}
+                  className={SELECT_CLASS}
+                >
+                  <option value="demo">DEMO (Paper / Practice)</option>
+                  <option value="real">REAL (Live MT5 Account)</option>
+                </select>
+              ) : (
+                <input
+                  type="text"
+                  disabled
+                  value="PRACTICE / DEMO ONLY (Read-Only)"
+                  className={`${INPUT_CLASS} opacity-75 cursor-not-allowed`}
+                />
+              )}
             </div>
           </div>
 
@@ -841,7 +879,7 @@ export function BrokerConnectionsView({
               disabled={busy}
               className="min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 disabled:opacity-50 px-5 py-2 text-xs font-semibold text-white transition-colors"
             >
-              {editingAccountId ? 'Update Encrypted Account' : 'Save Demo Account'}
+              {editingAccountId ? 'Update Encrypted Account' : `Save ${newBrokerId === 'mt5' ? newEnvironment.toUpperCase() : 'Demo'} Account`}
             </button>
           </div>
         </form>
@@ -884,6 +922,15 @@ export function BrokerConnectionsView({
                   <div>
                     <div className="flex flex-wrap items-center gap-2">
                       <span className="text-sm font-semibold text-slate-900 dark:text-white">{acct.label}</span>
+                      <span
+                        className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase ${
+                          acct.environment === 'real'
+                            ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
+                            : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        {acct.environment}
+                      </span>
                       {isActiveTarget && (
                         <span className="rounded-md bg-blue-500/15 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-indigo-300">
                           Active Target
@@ -892,7 +939,7 @@ export function BrokerConnectionsView({
                     </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                       {acct.brokerName} · {acct.capabilities.isOfficialApi ? 'Official API' : 'Bridge / Unofficial'} ·{' '}
-                      {acct.accountType || 'DEMO / SANDBOX'}
+                      {acct.accountType || acct.environment.toUpperCase()}
                     </p>
                   </div>
 
@@ -914,7 +961,7 @@ export function BrokerConnectionsView({
                 {/* Balance, Equity, Credentials Mask */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-3 border-t border-slate-200/80 dark:border-slate-800 text-xs">
                   <div>
-                    <p className="text-[11px] text-slate-500">Demo Balance</p>
+                    <p className="text-[11px] text-slate-500">{acct.environment === 'real' ? 'Account Balance' : 'Demo Balance'}</p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
                       {acct.balance != null ? `${acct.balance.toFixed(2)} ${acct.currency || 'USD'}` : '—'}
                     </p>
@@ -932,15 +979,19 @@ export function BrokerConnectionsView({
                     </p>
                   </div>
                   <div>
-                    <p className="text-[11px] text-slate-500">Demo Execution</p>
+                    <p className="text-[11px] text-slate-500">{acct.environment === 'real' ? 'Live Execution' : 'Demo Execution'}</p>
                     <p
                       className={`mt-0.5 font-semibold ${
-                        acct.capabilities.demoOrderPlacementSupported
+                        (acct.environment === 'real' ? acct.capabilities.liveOrderPlacementSupported : acct.capabilities.demoOrderPlacementSupported)
                           ? 'text-emerald-600 dark:text-emerald-400'
                           : 'text-amber-600 dark:text-amber-400'
                       }`}
                     >
-                      {acct.capabilities.demoOrderPlacementSupported ? 'Sandbox Ready' : 'Read-Only'}
+                      {(acct.environment === 'real' ? acct.capabilities.liveOrderPlacementSupported : acct.capabilities.demoOrderPlacementSupported)
+                        ? acct.environment === 'real'
+                          ? 'Live Ready'
+                          : 'Sandbox Ready'
+                        : 'Read-Only'}
                     </p>
                   </div>
                 </div>
@@ -974,7 +1025,7 @@ export function BrokerConnectionsView({
                       }}
                       className="min-h-10 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 disabled:opacity-40 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors"
                     >
-                      Connect Demo
+                      {acct.environment === 'real' ? 'Connect Real' : 'Connect Demo'}
                     </button>
                   ) : (
                     <button
@@ -996,7 +1047,9 @@ export function BrokerConnectionsView({
                     <Activity className="h-3.5 w-3.5" /> Health &amp; Balance
                   </button>
 
-                  {acct.capabilities.demoOrderPlacementSupported && (
+                  {(acct.environment === 'real'
+                    ? acct.capabilities.liveOrderPlacementSupported
+                    : acct.capabilities.demoOrderPlacementSupported) && (
                     <button
                       type="button"
                       disabled={busy || !acct.connected}
