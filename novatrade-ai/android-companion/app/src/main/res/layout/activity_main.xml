@@ -1,0 +1,501 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/nt_bg"
+    android:orientation="vertical">
+
+    <!-- Top Header -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/nt_surface"
+        android:orientation="horizontal"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="14dp"
+        android:gravity="center_vertical">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="NovaTrade AI Companion"
+                android:textColor="@color/nt_text_primary"
+                android:textSize="17sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Android App Bridge · MT5 &amp; IQ Option"
+                android:textColor="@color/nt_text_secondary"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/statusBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@color/nt_surface_alt"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="5dp"
+            android:text="UNPAIRED"
+            android:textColor="@color/nt_amber"
+            android:textSize="11sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/emergencyStopBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/nt_red"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="8dp"
+        android:text="EMERGENCY STOP ENGAGED · Screen capture &amp; actions halted."
+        android:textColor="@color/nt_text_primary"
+        android:textSize="12sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
+    <ScrollView
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <!-- 1. Pairing & Device Security -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                app:cardBackgroundColor="@color/nt_surface"
+                app:cardCornerRadius="14dp"
+                app:strokeColor="@color/nt_border"
+                app:strokeWidth="1dp">
+
+                <LinearLayout
+                    android:id="@+id/pairingSection"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="1. Pair With NovaTrade AI"
+                        android:textColor="@color/nt_text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/textPairingStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="Enter your NovaTrade backend URL and the 6-digit pairing code generated in Broker Connections."
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <EditText
+                        android:id="@+id/inputServerUrl"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="@color/nt_surface_alt"
+                        android:hint="https://your-novatrade-server.app"
+                        android:inputType="textUri"
+                        android:padding="10dp"
+                        android:textColor="@color/nt_text_primary"
+                        android:textColorHint="@color/nt_text_secondary"
+                        android:textSize="13sp" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:orientation="horizontal">
+
+                        <EditText
+                            android:id="@+id/inputPairingCode"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="8dp"
+                            android:layout_weight="1"
+                            android:background="@color/nt_surface_alt"
+                            android:hint="6-char code"
+                            android:inputType="textCapCharacters"
+                            android:maxLength="8"
+                            android:padding="10dp"
+                            android:textColor="@color/nt_text_primary"
+                            android:textColorHint="@color/nt_text_secondary"
+                            android:textSize="14sp" />
+
+                        <EditText
+                            android:id="@+id/inputDeviceName"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1.3"
+                            android:background="@color/nt_surface_alt"
+                            android:hint="Phone label"
+                            android:inputType="text"
+                            android:padding="10dp"
+                            android:textColor="@color/nt_text_primary"
+                            android:textColorHint="@color/nt_text_secondary"
+                            android:textSize="13sp" />
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnPairDevice"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="8dp"
+                            android:layout_weight="1"
+                            android:text="Pair Device"
+                            app:backgroundTint="@color/nt_primary" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnDisconnectDevice"
+                            style="@style/Widget.Material3.Button.OutlinedButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Disconnect"
+                            android:textColor="@color/nt_red"
+                            app:strokeColor="@color/nt_red" />
+                    </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- 2. Installed Trading App Detection & Selection -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                app:cardBackgroundColor="@color/nt_surface"
+                app:cardCornerRadius="14dp"
+                app:strokeColor="@color/nt_border"
+                app:strokeWidth="1dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:gravity="center_vertical"
+                        android:orientation="horizontal">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="2. Installed Trading Applications"
+                            android:textColor="@color/nt_text_primary"
+                            android:textSize="14sp"
+                            android:textStyle="bold" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnRefreshApps"
+                            style="@style/Widget.Material3.Button.TextButton"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Rescan"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:id="@+id/textMt5Status"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="MetaTrader 5: Checking device..."
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <TextView
+                        android:id="@+id/textIqStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text="IQ Option: Checking device..."
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <RadioGroup
+                        android:id="@+id/radioTargetApp"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:orientation="horizontal">
+
+                        <RadioButton
+                            android:id="@+id/radioTargetMt5"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:checked="true"
+                            android:text="MetaTrader 5"
+                            android:textColor="@color/nt_text_primary"
+                            android:textSize="13sp" />
+
+                        <RadioButton
+                            android:id="@+id/radioTargetIq"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="IQ Option"
+                            android:textColor="@color/nt_text_primary"
+                            android:textSize="13sp" />
+                    </RadioGroup>
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnLaunchSelectedApp"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:text="Open Selected App"
+                        app:strokeColor="@color/nt_border" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- 3. Explicit Screen Capture & Accessibility Permissions -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                app:cardBackgroundColor="@color/nt_surface"
+                app:cardCornerRadius="14dp"
+                app:strokeColor="@color/nt_border"
+                app:strokeWidth="1dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="3. Explicit User Permissions"
+                        android:textColor="@color/nt_text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/textCaptureStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:text="Screen Capture (MediaProjection): Not authorized"
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnToggleScreenCapture"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:text="Authorize Screen Capture"
+                        app:backgroundTint="@color/nt_primary" />
+
+                    <TextView
+                        android:id="@+id/textAccessibilityStatus"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:text="Accessibility Context Reader: Disabled"
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnOpenAccessibilitySettings"
+                        style="@style/Widget.Material3.Button.OutlinedButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:text="Grant Accessibility Permission in Settings"
+                        app:strokeColor="@color/nt_border" />
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+
+            <!-- 4. Screen Analysis & Authorized Action Queue -->
+            <com.google.android.material.card.MaterialCardView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="14dp"
+                app:cardBackgroundColor="@color/nt_surface"
+                app:cardCornerRadius="14dp"
+                app:strokeColor="@color/nt_border"
+                app:strokeWidth="1dp">
+
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:padding="16dp">
+
+                    <TextView
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="4. AI Vision &amp; Authorized Actions"
+                        android:textColor="@color/nt_text_primary"
+                        android:textSize="14sp"
+                        android:textStyle="bold" />
+
+                    <EditText
+                        android:id="@+id/inputAnalysisNotes"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:background="@color/nt_surface_alt"
+                        android:hint="Optional note for screen analysis"
+                        android:inputType="text"
+                        android:padding="10dp"
+                        android:textColor="@color/nt_text_primary"
+                        android:textColorHint="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/switchAutoInterval"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="6dp"
+                        android:text="Auto-analyze foreground trading screen every 15s"
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnCaptureAnalyzeNow"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="8dp"
+                            android:layout_weight="1.3"
+                            android:text="Capture &amp; Analyze"
+                            app:backgroundTint="@color/nt_emerald" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnPollActions"
+                            style="@style/Widget.Material3.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="Sync Actions"
+                            app:strokeColor="@color/nt_border" />
+                    </LinearLayout>
+
+                    <TextView
+                        android:id="@+id/textLastAnalysisHeader"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="12dp"
+                        android:text="No screen analyzed yet."
+                        android:textColor="@color/nt_text_primary"
+                        android:textSize="13sp"
+                        android:textStyle="bold" />
+
+                    <TextView
+                        android:id="@+id/textLastAnalysisMetrics"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text=""
+                        android:textColor="@color/nt_amber"
+                        android:textSize="12sp" />
+
+                    <TextView
+                        android:id="@+id/textLastAnalysisSummary"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp"
+                        android:text=""
+                        android:textColor="@color/nt_text_secondary"
+                        android:textSize="12sp" />
+
+                    <TextView
+                        android:id="@+id/textAuthorizedActions"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="10dp"
+                        android:background="@color/nt_surface_alt"
+                        android:padding="10dp"
+                        android:text="Authorized Action Queue: None pending."
+                        android:textColor="@color/nt_text_primary"
+                        android:textSize="12sp" />
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnAckLatestAction"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_marginEnd="8dp"
+                            android:layout_weight="1"
+                            android:enabled="false"
+                            android:text="Report Completed"
+                            app:backgroundTint="@color/nt_primary" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/btnRejectLatestAction"
+                            style="@style/Widget.Material3.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:enabled="false"
+                            android:text="Dismiss Action"
+                            app:strokeColor="@color/nt_border" />
+                    </LinearLayout>
+                </LinearLayout>
+            </com.google.android.material.card.MaterialCardView>
+        </LinearLayout>
+    </ScrollView>
+
+    <!-- Persistent Emergency Stop Control -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/nt_surface"
+        android:padding="12dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnEmergencyStop"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="EMERGENCY STOP"
+            android:textStyle="bold"
+            app:backgroundTint="@color/nt_red" />
+    </LinearLayout>
+</LinearLayout>
