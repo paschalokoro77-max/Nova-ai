@@ -3,4 +3,4 @@ uvicorn[standard]>=0.34,<1
 pydantic>=2,<3
 requests>=2.28,<3
 websockets>=10.0,<13
-iqoptionapi>=6.0.0
+git+https://github.com/Lu-Yi-Hsun/iqoptionapi.git@7dd95a81c079e8af7a3728aa2aa194154f29ba3f
