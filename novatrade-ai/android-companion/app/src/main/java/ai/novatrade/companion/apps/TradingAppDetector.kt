@@ -18,9 +18,10 @@ data class InstalledTradingApp(
  * Never fabricates app installation status.
  */
 object TradingAppDetector {
-
+    const val PACKAGE_MT5 = "net.metaquotes.metatrader5"
     const val PACKAGE_MT5_PRIMARY = "net.metaquotes.metatrader5"
     const val PACKAGE_MT5_VARIANT = "com.meta.trader5"
+    const val PACKAGE_IQ_OPTION = "com.iqoption"
     const val PACKAGE_IQ_PRIMARY = "com.iqoption"
     const val PACKAGE_IQ_VARIANT = "com.iqoption.x"
 
@@ -29,12 +30,14 @@ object TradingAppDetector {
     fun detectInstalledApps(context: Context): List<InstalledTradingApp> {
         val pm = context.packageManager
         val mt5Installed = isPackageInstalled(pm, PACKAGE_MT5_PRIMARY) || isPackageInstalled(pm, PACKAGE_MT5_VARIANT)
-        val iqInstalled = isPackageInstalled(pm, PACKAGE_IQ_PRIMARY) || isPackageInstalled(pm, PACKAGE_IQ_VARIANT)
+        val mt5Pkg = if (isPackageInstalled(pm, PACKAGE_MT5_PRIMARY)) PACKAGE_MT5_PRIMARY else PACKAGE_MT5_VARIANT
+        val mt5App = inspectPackage(pm, if (mt5Installed) mt5Pkg else PACKAGE_MT5_PRIMARY, "MetaTrader 5").copy(installed = mt5Installed)
 
-        return listOf(
-            inspectPackage(pm, PACKAGE_MT5_PRIMARY, "MetaTrader 5"),
-            inspectPackage(pm, PACKAGE_IQ_PRIMARY, "IQ Option")
-        )
+        val iqInstalled = isPackageInstalled(pm, PACKAGE_IQ_PRIMARY) || isPackageInstalled(pm, PACKAGE_IQ_VARIANT)
+        val iqPkg = if (isPackageInstalled(pm, PACKAGE_IQ_PRIMARY)) PACKAGE_IQ_PRIMARY else PACKAGE_IQ_VARIANT
+        val iqApp = inspectPackage(pm, if (iqInstalled) iqPkg else PACKAGE_IQ_PRIMARY, "IQ Option").copy(installed = iqInstalled)
+
+        return listOf(mt5App, iqApp)
     }
 
     fun isTargetTradingPackage(packageName: String?): Boolean {
