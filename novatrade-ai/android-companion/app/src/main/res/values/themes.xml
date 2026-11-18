@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.NovaTradeCompanion" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/nt_primary</item>
+        <item name="android:windowBackground">@color/nt_bg</item>
+        <item name="android:statusBarColor">@color/nt_bg</item>
+        <item name="android:navigationBarColor">@color/nt_bg</item>
+    </style>
+</resources>
