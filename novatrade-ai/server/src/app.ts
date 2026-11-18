@@ -551,7 +551,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const executionCapabilities = {
       paperSimulation: true,
       mt5DemoOrderPlacement: true,
-      mt5RealOrderPlacement: true,
+      mt5RealOrderPlacement: false as const,
       iqOptionReadInspection: true,
       iqOptionOrderExecutionSupported: false as const,
     };
