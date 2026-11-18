@@ -1,0 +1,4 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+MetaTrader5>=5.0.45
+pydantic>=2.7,<3
