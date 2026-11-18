@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.venv/
+__pycache__/
+.env*
+!.env.example
+*.log
+.novatrade-data/
+*.broker-vault.key
+.broker-vault.key
