@@ -44,9 +44,11 @@ data class AccessibilitySnapshot(
  * Thread-safe shared state connecting MainActivity, ScreenCaptureService, and TradingAccessibilityService.
  */
 object CompanionRuntimeState {
-
     private val _captureRunning = MutableStateFlow(false)
     val captureRunning: StateFlow<Boolean> = _captureRunning.asStateFlow()
+
+    private val _autoIntervalEnabled = MutableStateFlow(false)
+    val autoIntervalEnabled: StateFlow<Boolean> = _autoIntervalEnabled.asStateFlow()
 
     private val _mt5AutoEnabled = MutableStateFlow(false)
     val mt5AutoEnabled: StateFlow<Boolean> = _mt5AutoEnabled.asStateFlow()
@@ -71,6 +73,10 @@ object CompanionRuntimeState {
 
     fun setCaptureRunning(running: Boolean) {
         _captureRunning.value = running
+    }
+
+    fun setAutoIntervalEnabled(enabled: Boolean) {
+        _autoIntervalEnabled.value = enabled
     }
 
     fun setMt5AutoEnabled(enabled: Boolean) {
