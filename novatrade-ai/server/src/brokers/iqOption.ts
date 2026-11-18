@@ -157,41 +157,68 @@ export class IQOptionAdapter implements BrokerAdapter {
     if (!cfg.urlValid || !cfg.url) {
       throw new Error(cfg.warnings[0] || 'IQ_CONNECTOR_URL is invalid.');
     }
-    const res = await fetch(`${cfg.url}${path}`, {
-      ...init,
-      headers: { ...this.getHeaders(ctx), ...(init.headers || {}) },
-      signal: AbortSignal.timeout(6000),
-    });
-    const contentType = (res.headers.get('content-type') || '').toLowerCase();
-    const text = await res.text();
-    const trimmed = text.trimStart();
-    const looksHtml =
-      contentType.includes('text/html') ||
-      (trimmed.startsWith('<') && /^(<!doctype\s+html|<html|<head|<body|<title|<h1)/i.test(trimmed));
 
-    if (looksHtml) {
-      throw new Error(`IQ Option connector returned an unexpected HTML response (HTTP ${res.status}).`);
-    }
+    const maxAttempts = 3;
+    let lastErr: unknown = null;
 
-    let json: Record<string, unknown> = {};
-    if (trimmed) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const parsed: unknown = JSON.parse(text);
-        if (parsed && typeof parsed === 'object') {
-          json = parsed as Record<string, unknown>;
+        const res = await fetch(`${cfg.url}${path}`, {
+          ...init,
+          headers: { ...this.getHeaders(ctx), ...(init.headers || {}) },
+          signal: AbortSignal.timeout(15000), // 15s timeout for cloud cold start / WebSocket handshake
+        });
+
+        const contentType = (res.headers.get('content-type') || '').toLowerCase();
+        const text = await res.text();
+        const trimmed = text.trimStart();
+        const looksHtml =
+          contentType.includes('text/html') ||
+          (trimmed.startsWith('<') && /^(<!doctype\s+html|<html|<head|<body|<title|<h1)/i.test(trimmed));
+
+        if (looksHtml) {
+          throw new Error(`IQ Option connector returned an unexpected HTML response (HTTP ${res.status}).`);
         }
-      } catch {
+
+        let json: Record<string, unknown> = {};
+        if (trimmed) {
+          try {
+            const parsed: unknown = JSON.parse(text);
+            if (parsed && typeof parsed === 'object') {
+              json = parsed as Record<string, unknown>;
+            }
+          } catch {
+            if (!res.ok) {
+              throw new Error(`IQ Option connector HTTP ${res.status}.`);
+            }
+            throw new Error('IQ Option connector returned a non-JSON response.');
+          }
+        }
         if (!res.ok) {
-          throw new Error(`IQ Option connector HTTP ${res.status}.`);
+          const msg = String(json.detail || json.error || `Connector HTTP ${res.status}`);
+          if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
+            await new Promise((r) => setTimeout(r, 1000 * attempt));
+            continue;
+          }
+          throw new Error(msg);
         }
-        throw new Error('IQ Option connector returned a non-JSON response.');
+        return json as T;
+      } catch (err) {
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient = /timeout|timed out|abort|econreset|etimedout|fetch failed|502|503|504/i.test(msg);
+        if (isTransient && attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        if (attempt >= maxAttempts) {
+          break;
+        }
       }
     }
-    if (!res.ok) {
-      const msg = String(json.detail || json.error || `Connector HTTP ${res.status}`);
-      throw new Error(msg);
-    }
-    return json as T;
+
+    const errMsg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    throw new Error(`IQ connector unreachable or timed out after ${maxAttempts} attempts (${errMsg}).`);
   }
 
   async getCapabilities(ctx?: BrokerAccountContext): Promise<BrokerCapabilities> {
