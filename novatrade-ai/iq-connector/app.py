@@ -7,21 +7,49 @@ import os
 import time
 import threading
 from typing import Any, Optional, Tuple
-from fastapi import FastAPI, Header, HTTPException, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.0')
+app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.1')
 _lock = threading.RLock()
 _client: Any = None
 _last_error: Optional[str] = None
 _connected_at: Optional[float] = None
 _requested_mode: str = 'PRACTICE'
+_opcodes_updated: bool = False
+
+
+def _sanitize_error(msg: str) -> str:
+    cleaned = str(msg or '')
+    for secret_key in ('IQ_PASSWORD', 'IQ_CONNECTOR_TOKEN'):
+        secret = (os.environ.get(secret_key) or '').strip()
+        if secret and secret in cleaned:
+            cleaned = cleaned.replace(secret, '***')
+    return cleaned[:300]
+
+
+@app.exception_handler(Exception)
+async def _unhandled_exception_handler(_request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=502,
+        content={
+            'detail': f'IQ Option connector internal error ({type(exc).__name__}).',
+            'orderExecutionSupported': False,
+            'realTradingEnabled': False,
+        },
+    )
 
 
 class CandlesQuery(BaseModel):
     symbol: str = Field(default='EURUSD', pattern=r'^[A-Z0-9_-]{3,25}$')
-    interval: int = Field(default=60, ge=5, le=3600)
+    interval: int = Field(default=60, ge=5, le=86400)
     count: int = Field(default=100, ge=1, le=500)
+
+    @field_validator('symbol', mode='before')
+    @classmethod
+    def _normalize_symbol(cls, v: Any) -> str:
+        return str(v or '').strip().upper().replace('/', '')
 
 
 def _check_auth(x_connector_token: Optional[str]):
@@ -67,11 +95,21 @@ def _ensure_balance_mode(client: Any, target_mode: str) -> Tuple[str, bool]:
     Fails closed when REAL mode is requested unless get_balance_mode() explicitly confirms REAL.
     """
     global _last_error
+    current_mode = None
     try:
-        client.change_balance(target_mode)
-    except Exception as exc:
-        _last_error = f'change_balance({target_mode}) failed: {type(exc).__name__}: {exc}'
-        return ('UNVERIFIED', False)
+        if hasattr(client, 'get_balance_mode'):
+            raw_cur = client.get_balance_mode()
+            if raw_cur:
+                current_mode = str(raw_cur).strip().upper()
+    except Exception:
+        current_mode = None
+
+    if current_mode != target_mode:
+        try:
+            client.change_balance(target_mode)
+        except Exception as exc:
+            _last_error = _sanitize_error(f'change_balance({target_mode}) failed: {type(exc).__name__}: {exc}')
+            return ('UNVERIFIED', False)
 
     confirmed = 'UNVERIFIED'
     try:
@@ -80,7 +118,7 @@ def _ensure_balance_mode(client: Any, target_mode: str) -> Tuple[str, bool]:
             if raw_mode:
                 confirmed = str(raw_mode).strip().upper()
     except Exception as exc:
-        _last_error = f'get_balance_mode() failed: {type(exc).__name__}: {exc}'
+        _last_error = _sanitize_error(f'get_balance_mode() failed: {type(exc).__name__}: {exc}')
         return ('UNVERIFIED', False)
 
     if target_mode == 'REAL':
@@ -112,17 +150,21 @@ def connect(
     email: Optional[str] = None,
     password: Optional[str] = None,
     target_mode: Optional[str] = None,
+    force_reconnect: bool = False,
 ):
-    global _client, _last_error, _connected_at, _requested_mode
+    global _client, _last_error, _connected_at, _requested_mode, _opcodes_updated
     resolved_mode = _normalize_mode(target_mode) or _requested_mode
     with _lock:
-        if _client is not None:
+        if _client is not None and not force_reconnect:
             try:
                 if _client.check_connect():
                     _requested_mode = resolved_mode
                     return _client
             except Exception:
                 _client = None
+        if force_reconnect:
+            _client = None
+            _opcodes_updated = False
         target_email = email or os.environ.get('IQ_EMAIL')
         target_password = password or os.environ.get('IQ_PASSWORD')
         if not target_email or not target_password:
@@ -143,8 +185,116 @@ def connect(
         except HTTPException:
             raise
         except Exception as exc:
-            _last_error = f'{type(exc).__name__}: {exc}'
-            raise HTTPException(502, f'Broker connection failed ({type(exc).__name__}); check connector logs locally.') from None
+            _last_error = _sanitize_error(f'{type(exc).__name__}: {exc}')
+            raise HTTPException(502, f'Broker connection failed ({type(exc).__name__}); check connector configuration.') from None
+
+
+def _resolve_active_id(client: Any, clean_symbol: str) -> Optional[int]:
+    global _opcodes_updated
+    try:
+        from iqoptionapi.constants import ACTIVES
+    except Exception:
+        return None
+
+    if clean_symbol in ACTIVES:
+        return int(ACTIVES[clean_symbol])
+
+    upper_map = {str(k).upper(): v for k, v in ACTIVES.items()}
+    if clean_symbol in upper_map:
+        return int(upper_map[clean_symbol])
+
+    if not _opcodes_updated and hasattr(client, 'update_ACTIVES_OPCODE'):
+        _opcodes_updated = True
+        try:
+            client.update_ACTIVES_OPCODE()
+            if clean_symbol in ACTIVES:
+                return int(ACTIVES[clean_symbol])
+            upper_map = {str(k).upper(): v for k, v in ACTIVES.items()}
+            if clean_symbol in upper_map:
+                return int(upper_map[clean_symbol])
+        except Exception:
+            pass
+    return None
+
+
+def _fetch_candles_safe(
+    client: Any,
+    clean_symbol: str,
+    interval: int,
+    count: int,
+    target_mode: str,
+    timeout_seconds: float = 7.0,
+) -> list:
+    global _last_error
+    has_low_level_api = (
+        hasattr(client, 'api')
+        and hasattr(client.api, 'getcandles')
+        and hasattr(client.api, 'candles')
+    )
+
+    if not has_low_level_api:
+        try:
+            rows = client.get_candles(clean_symbol, interval, count, int(time.time()))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _last_error = _sanitize_error(f'get_candles({clean_symbol}) failed: {type(exc).__name__}: {exc}')
+            raise HTTPException(502, f'Broker failed to retrieve candles for {clean_symbol} ({type(exc).__name__}).') from None
+        if not isinstance(rows, list):
+            raise HTTPException(502, f'Broker did not return valid candles for {clean_symbol}.')
+        return rows
+
+    active_id = _resolve_active_id(client, clean_symbol)
+    if active_id is None:
+        raise HTTPException(404, f'Unsupported or unknown IQ Option symbol "{clean_symbol}".')
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            if hasattr(client, 'check_connect') and not client.check_connect():
+                client = connect(target_mode=target_mode, force_reconnect=True)
+                _ensure_balance_mode(client, target_mode)
+            client.api.candles.candles_data = None
+            client.api.getcandles(int(active_id), int(interval), int(count), int(time.time()))
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                rows = getattr(client.api.candles, 'candles_data', None)
+                if rows is not None:
+                    if not isinstance(rows, list):
+                        raise HTTPException(502, f'Broker returned invalid candle payload for {clean_symbol}.')
+                    return rows
+                if hasattr(client, 'check_connect') and not client.check_connect():
+                    break
+                time.sleep(0.05)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            _last_error = _sanitize_error(f'getcandles({clean_symbol}) failed: {type(exc).__name__}: {exc}')
+
+        if attempt == 0:
+            try:
+                if os.environ.get('IQ_EMAIL') and os.environ.get('IQ_PASSWORD'):
+                    client = connect(target_mode=target_mode, force_reconnect=True)
+                    _ensure_balance_mode(client, target_mode)
+                elif hasattr(client, 'connect'):
+                    res = client.connect()
+                    if isinstance(res, (list, tuple)) and res and res[0]:
+                        _ensure_balance_mode(client, target_mode)
+                    else:
+                        break
+                else:
+                    break
+            except HTTPException:
+                break
+            except Exception as exc:
+                last_exc = exc
+                _last_error = _sanitize_error(f'reconnect failed: {type(exc).__name__}: {exc}')
+
+    if last_exc is not None:
+        raise HTTPException(502, f'IQ Option upstream error retrieving candles for {clean_symbol} ({type(last_exc).__name__}).') from None
+    _last_error = f'Timed out waiting for IQ Option candles for {clean_symbol}.'
+    raise HTTPException(504, f'IQ Option upstream timed out returning candles for {clean_symbol}.')
 
 
 @app.get('/health')
@@ -156,16 +306,28 @@ def health(
     connected = False
     confirmed_mode = target_mode
     mode_verified = False
-    with _lock:
-        if _client is not None:
-            try:
-                connected = bool(_client.check_connect())
-                if connected:
-                    confirmed_mode, mode_verified = _ensure_balance_mode(_client, target_mode)
-            except Exception:
-                connected = False
+    busy = False
+    acquired = _lock.acquire(timeout=1.5)
+    if acquired:
+        try:
+            if _client is not None:
+                try:
+                    connected = bool(_client.check_connect())
+                    if connected:
+                        confirmed_mode, mode_verified = _ensure_balance_mode(_client, target_mode)
+                except Exception:
+                    connected = False
+        finally:
+            _lock.release()
+    else:
+        busy = True
+        connected = _client is not None
+        confirmed_mode = _requested_mode
+        mode_verified = False
+
     return {
         'status': 'running',
+        'busy': busy,
         'connected': connected and (target_mode != 'REAL' or mode_verified),
         'mode': confirmed_mode,
         'requestedMode': target_mode,
@@ -239,7 +401,10 @@ def account(
     with _lock:
         client = connect(target_mode=target_mode)
         confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
-        balance_val = client.get_balance()
+        try:
+            balance_val = client.get_balance()
+        except Exception as exc:
+            raise HTTPException(502, f'Failed to retrieve account balance ({type(exc).__name__}).') from None
         return {
             'connected': True,
             'mode': confirmed_mode,
@@ -265,8 +430,12 @@ def balance(
     with _lock:
         client = connect(target_mode=target_mode)
         confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
+        try:
+            balance_val = client.get_balance()
+        except Exception as exc:
+            raise HTTPException(502, f'Failed to retrieve balance ({type(exc).__name__}).') from None
         return {
-            'balance': client.get_balance(),
+            'balance': balance_val,
             'mode': confirmed_mode,
             'requestedMode': target_mode,
             'accountType': confirmed_mode,
@@ -307,17 +476,19 @@ def latest_price(
 ):
     _check_auth(x_connector_token)
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    clean = symbol.strip().upper()
+    clean = symbol.strip().upper().replace('/', '')
     if not clean or len(clean) < 3 or len(clean) > 25:
         raise HTTPException(400, 'Invalid symbol format.')
     with _lock:
         client = connect(target_mode=target_mode)
-        _ensure_balance_mode(client, target_mode)
-        rows = client.get_candles(clean, 60, 2, int(time.time()))
+        confirmed_mode, _ = _require_verified_mode(client, target_mode)
+        rows = _fetch_candles_safe(client, clean, 60, 2, target_mode)
         if not isinstance(rows, list) or len(rows) == 0 or not isinstance(rows[-1], dict):
             raise HTTPException(502, f'Broker did not return valid candle price for {clean}.')
         bar = rows[-1]
         close_price = bar.get('close')
+        if close_price is None:
+            raise HTTPException(502, f'Broker candle for {clean} did not include a close price.')
         return {
             'symbol': clean,
             'bid': None,
@@ -325,6 +496,9 @@ def latest_price(
             'last': close_price,
             'spread': None,
             'time': bar.get('from'),
+            'mode': confirmed_mode,
+            'orderExecutionSupported': False,
+            'realTradingEnabled': False,
             'source': 'IQ_OPTION_UNOFFICIAL',
             'note': 'Reference close price from unofficial 1m candles (iqoptionapi); live bid/ask stream is not exposed.',
         }
@@ -341,10 +515,8 @@ def candles(
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
     with _lock:
         client = connect(target_mode=target_mode)
-        _ensure_balance_mode(client, target_mode)
-        rows = client.get_candles(query.symbol, query.interval, query.count, int(time.time()))
-        if not isinstance(rows, list):
-            raise HTTPException(502, 'Broker did not return valid candles.')
+        confirmed_mode, _ = _require_verified_mode(client, target_mode)
+        rows = _fetch_candles_safe(client, query.symbol, query.interval, query.count, target_mode)
         normalized = [
             {
                 'time': c.get('from'),
@@ -355,12 +527,15 @@ def candles(
                 'volume': c.get('volume', 0),
             }
             for c in rows
-            if isinstance(c, dict)
+            if isinstance(c, dict) and c.get('close') is not None
         ]
         return {
             'symbol': query.symbol,
             'interval': query.interval,
             'candles': normalized,
+            'mode': confirmed_mode,
+            'orderExecutionSupported': False,
+            'realTradingEnabled': False,
             'source': 'IQ_OPTION_UNOFFICIAL',
             'note': 'Historical candles from unofficial WebSocket; verify latency before use.',
         }
@@ -417,9 +592,10 @@ def order_locked(x_connector_token: Optional[str] = Header(default=None)):
 @app.post('/disconnect')
 def disconnect(x_connector_token: Optional[str] = Header(default=None)):
     _check_auth(x_connector_token)
-    global _client, _connected_at, _requested_mode
+    global _client, _connected_at, _requested_mode, _opcodes_updated
     with _lock:
         _client = None
         _connected_at = None
         _requested_mode = 'PRACTICE'
+        _opcodes_updated = False
     return {'connected': False}

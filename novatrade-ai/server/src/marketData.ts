@@ -202,8 +202,12 @@ async function fetchBinanceCandles(symbol: string, timeframe: Timeframe, limit: 
 async function fetchIqConnectorCandles(symbol: string, timeframe: Timeframe, limit: number): Promise<Candle[] | null> {
   const cfg = parseIqConnectorConfig();
   if (!cfg.urlValid || !cfg.url) return null;
+  const cleanSymbol = symbol.toUpperCase().replace(/[^A-Z0-9_-]/g, '');
   const intervalMap: Record<Timeframe, number> = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600 };
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'x-iq-mode': 'PRACTICE',
+  };
   const token = (process.env.IQ_CONNECTOR_TOKEN || '').trim();
   if (token) {
     headers['x-connector-token'] = token;
@@ -211,10 +215,11 @@ async function fetchIqConnectorCandles(symbol: string, timeframe: Timeframe, lim
   const res = await fetch(`${cfg.url}/candles`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ symbol, interval: intervalMap[timeframe], count: limit }),
-    signal: AbortSignal.timeout(4500),
+    body: JSON.stringify({ symbol: cleanSymbol, interval: intervalMap[timeframe], count: limit }),
+    signal: AbortSignal.timeout(10000),
   });
-  if (!res.ok) return null;
+  const contentType = (res.headers.get('content-type') || '').toLowerCase();
+  if (!res.ok || !contentType.includes('application/json')) return null;
   const data = (await res.json()) as { candles?: Candle[] };
   if (!Array.isArray(data.candles) || data.candles.length < 10) return null;
   return data.candles;

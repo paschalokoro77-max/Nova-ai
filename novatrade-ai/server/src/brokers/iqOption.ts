@@ -159,6 +159,7 @@ export class IQOptionAdapter implements BrokerAdapter {
     }
 
     const maxAttempts = 3;
+    const timeoutMs = path === '/health' ? 12000 : 20000;
     let lastErr: unknown = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -166,7 +167,7 @@ export class IQOptionAdapter implements BrokerAdapter {
         const res = await fetch(`${cfg.url}${path}`, {
           ...init,
           headers: { ...this.getHeaders(ctx), ...(init.headers || {}) },
-          signal: AbortSignal.timeout(15000), // 15s timeout for cloud cold start / WebSocket handshake
+          signal: AbortSignal.timeout(timeoutMs),
         });
 
         const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -177,6 +178,13 @@ export class IQOptionAdapter implements BrokerAdapter {
           (trimmed.startsWith('<') && /^(<!doctype\s+html|<html|<head|<body|<title|<h1)/i.test(trimmed));
 
         if (looksHtml) {
+          if (res.status === 502 || res.status === 503 || res.status === 504) {
+            if (attempt < maxAttempts) {
+              await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+              continue;
+            }
+            throw new Error(`IQ Option connector gateway returned HTTP ${res.status} HTML (service cold start or upstream timeout).`);
+          }
           throw new Error(`IQ Option connector returned an unexpected HTML response (HTTP ${res.status}).`);
         }
 
@@ -189,6 +197,10 @@ export class IQOptionAdapter implements BrokerAdapter {
             }
           } catch {
             if (!res.ok) {
+              if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
+                await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                continue;
+              }
               throw new Error(`IQ Option connector HTTP ${res.status}.`);
             }
             throw new Error('IQ Option connector returned a non-JSON response.');
@@ -197,22 +209,29 @@ export class IQOptionAdapter implements BrokerAdapter {
         if (!res.ok) {
           const msg = String(json.detail || json.error || `Connector HTTP ${res.status}`);
           if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
-            await new Promise((r) => setTimeout(r, 1000 * attempt));
+            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
             continue;
           }
-          throw new Error(msg);
+          const httpErr = new Error(msg) as Error & { status?: number; nonRetryable?: boolean };
+          httpErr.status = res.status;
+          httpErr.nonRetryable = res.status >= 400 && res.status < 500;
+          throw httpErr;
         }
         return json as T;
       } catch (err) {
         lastErr = err;
-        const msg = err instanceof Error ? err.message : String(err);
-        const isTransient = /timeout|timed out|abort|econreset|etimedout|fetch failed|502|503|504/i.test(msg);
-        if (isTransient && attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 1000 * attempt));
-          continue;
+        const tagged = err as Error & { nonRetryable?: boolean };
+        if (tagged?.nonRetryable) {
+          throw err;
         }
-        if (attempt >= maxAttempts) {
-          break;
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient = /timeout|timed out|abort|econnreset|etimedout|econnrefused|fetch failed|gateway returned http 50[234]|502|503|504/i.test(msg);
+        if (!isTransient) {
+          throw err;
+        }
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+          continue;
         }
       }
     }
@@ -537,33 +556,48 @@ export class IQOptionAdapter implements BrokerAdapter {
   }
 
   async getQuote(symbol: string, ctx?: BrokerAccountContext): Promise<BrokerQuote> {
-    const clean = symbol.toUpperCase().replace(/[^A-Z0-9._-]/g, '');
+    const clean = symbol.toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     try {
       const res = await this.requestConnector<BrokerQuote>(`/price/${encodeURIComponent(clean)}`, {}, ctx);
-      return {
-        symbol: res.symbol || clean,
-        bid: typeof res.bid === 'number' ? res.bid : null,
-        ask: typeof res.ask === 'number' ? res.ask : null,
-        last: typeof res.last === 'number' ? res.last : null,
-        spread: typeof res.spread === 'number' ? res.spread : null,
-        time: typeof res.time === 'number' ? res.time : null,
-        source: res.source || 'IQ_OPTION_UNOFFICIAL',
-        note: res.note,
-      };
-    } catch {
-      const fallback = await this.getCandles(clean, 60, 2, ctx);
-      const latest = fallback.candles[fallback.candles.length - 1];
-      return {
-        symbol: clean,
-        bid: null,
-        ask: null,
-        last: latest ? latest.close : null,
-        spread: null,
-        time: latest ? latest.time : null,
-        source: fallback.source || 'IQ_OPTION_UNOFFICIAL',
-        note: 'Derived from latest unofficial 1m candle close.',
-      };
+      if (typeof res.last === 'number' && Number.isFinite(res.last)) {
+        return {
+          symbol: res.symbol || clean,
+          bid: typeof res.bid === 'number' ? res.bid : null,
+          ask: typeof res.ask === 'number' ? res.ask : null,
+          last: res.last,
+          spread: typeof res.spread === 'number' ? res.spread : null,
+          time: typeof res.time === 'number' ? res.time : null,
+          source: res.source || 'IQ_OPTION_UNOFFICIAL',
+          note: res.note,
+        };
+      }
+    } catch (err) {
+      const tagged = err as Error & { status?: number; nonRetryable?: boolean };
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        tagged?.nonRetryable &&
+        tagged.status !== 404 &&
+        tagged.status !== 405
+      ) {
+        throw err;
+      }
+      if (/IQ_CONNECTOR_URL|unreachable or timed out after/i.test(msg)) {
+        throw err;
+      }
     }
+
+    const fallback = await this.getCandles(clean, 60, 2, ctx);
+    const latest = fallback.candles[fallback.candles.length - 1];
+    return {
+      symbol: clean,
+      bid: null,
+      ask: null,
+      last: latest ? latest.close : null,
+      spread: null,
+      time: latest ? latest.time : null,
+      source: fallback.source || 'IQ_OPTION_UNOFFICIAL',
+      note: 'Derived from latest unofficial 1m candle close.',
+    };
   }
 
   async getCandles(
@@ -572,11 +606,14 @@ export class IQOptionAdapter implements BrokerAdapter {
     count = 100,
     ctx?: BrokerAccountContext
   ): Promise<{ candles: BrokerCandle[]; source: string; note?: string }> {
+    const clean = symbol.toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+    const safeInterval = Math.max(5, Math.min(86400, Math.round(Number(intervalSeconds) || 60)));
+    const safeCount = Math.max(1, Math.min(500, Math.round(Number(count) || 100)));
     const res = await this.requestConnector<{ candles?: BrokerCandle[]; source?: string; note?: string }>(
       '/candles',
       {
         method: 'POST',
-        body: JSON.stringify({ symbol, interval: intervalSeconds, count }),
+        body: JSON.stringify({ symbol: clean, interval: safeInterval, count: safeCount }),
       },
       ctx
     );
