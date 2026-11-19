@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   BarChart3,
@@ -261,6 +261,8 @@ export default function App() {
   const [manualStakeDraft, setManualStakeDraft] = useState('50');
   const [busy, setBusy] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const refreshInFlightRef = useRef(false);
+  const brokerActionInFlightRef = useRef(false);
   const [toasts, setToasts] = useState<ToastNotice[]>([]);
   const [confirmState, setConfirmState] = useState<{
     type: 'emergency-stop' | 'reset-daily' | 'arm-auto' | null;
@@ -337,7 +339,12 @@ export default function App() {
     };
   }, []);
 
-  const refreshPlatformState = useCallback(async () => {
+  const refreshPlatformState = useCallback(async (forceOrEvent?: unknown) => {
+    const force = forceOrEvent === true;
+    if (!force && (refreshInFlightRef.current || brokerActionInFlightRef.current)) {
+      return;
+    }
+    refreshInFlightRef.current = true;
     try {
       const [
         healthRes,
@@ -414,6 +421,8 @@ export default function App() {
       }
     } catch (err) {
       pushToast('error', 'Connection Issue', err instanceof Error ? err.message : 'Unable to reach NovaTrade API.');
+    } finally {
+      refreshInFlightRef.current = false;
     }
   }, [authHeaders, currentAnalysis, pushToast]);
 
@@ -963,6 +972,8 @@ export default function App() {
       pushToast('error', 'Broker Connection Failed', msg);
       throw new Error(msg);
     }
+    if (brokerActionInFlightRef.current) return;
+    brokerActionInFlightRef.current = true;
     setBusy(true);
     try {
       const res = await apiRequest<{
@@ -995,18 +1006,23 @@ export default function App() {
         );
       }
       pushToast('success', 'Broker Demo Connected', `${account.label || 'Broker Account'} · ${account.accountType || 'DEMO'}`);
-      await refreshPlatformState();
+      brokerActionInFlightRef.current = false;
+      await refreshPlatformState(true);
     } catch (err) {
       const msg = sanitizeErrorMessage(err, 'MT5 gateway is offline / not configured. Your account has not been connected.');
       pushToast('error', 'Broker Connection Failed', msg);
-      await refreshPlatformState();
+      brokerActionInFlightRef.current = false;
+      await refreshPlatformState(true);
       throw new Error(msg);
     } finally {
+      brokerActionInFlightRef.current = false;
       setBusy(false);
     }
   }
 
   async function handleDisconnectBrokerAccount(accountId: string) {
+    if (brokerActionInFlightRef.current) return;
+    brokerActionInFlightRef.current = true;
     setBusy(true);
     try {
       const res = await apiRequest<{ account?: ManagedBrokerAccountPublic; error?: string }>(
@@ -1018,16 +1034,21 @@ export default function App() {
         }
       );
       pushToast('info', 'Broker Disconnected', `${res?.account?.label || 'Broker account'} disconnected.`);
-      await refreshPlatformState();
+      brokerActionInFlightRef.current = false;
+      await refreshPlatformState(true);
     } catch (err) {
       pushToast('error', 'Broker Disconnect Failed', sanitizeErrorMessage(err, 'Unable to disconnect.'));
-      await refreshPlatformState();
+      brokerActionInFlightRef.current = false;
+      await refreshPlatformState(true);
     } finally {
+      brokerActionInFlightRef.current = false;
       setBusy(false);
     }
   }
 
   async function handleSyncBrokerAccount(accountId: string) {
+    if (brokerActionInFlightRef.current) return;
+    brokerActionInFlightRef.current = true;
     setBusy(true);
     try {
       const res = await apiRequest<{ account?: ManagedBrokerAccountPublic; error?: string; message?: string }>(
@@ -1049,11 +1070,14 @@ export default function App() {
         'Health & Balance Synced',
         `${account.label || 'Broker Account'}: ${account.status}${account.balance != null ? ` · ${account.balance.toFixed(2)} ${account.currency || 'USD'}` : ''}`
       );
-      await refreshPlatformState();
+      brokerActionInFlightRef.current = false;
+      await refreshPlatformState(true);
     } catch (err) {
       pushToast('error', 'Health & Balance Sync Failed', sanitizeErrorMessage(err, 'Unable to sync broker account.'));
-      await refreshPlatformState();
+      brokerActionInFlightRef.current = false;
+      await refreshPlatformState(true);
     } finally {
+      brokerActionInFlightRef.current = false;
       setBusy(false);
     }
   }

@@ -202,6 +202,26 @@ async function fetchBinanceCandles(symbol: string, timeframe: Timeframe, limit: 
 async function fetchIqConnectorCandles(symbol: string, timeframe: Timeframe, limit: number): Promise<Candle[] | null> {
   const cfg = parseIqConnectorConfig();
   if (!cfg.urlValid || !cfg.url) return null;
+
+  // Never trigger an unsolicited broker connect or contend with an in-flight connect/operation from background market-data fallbacks
+  try {
+    const healthRes = await fetch(`${cfg.url}/health`, {
+      headers: { 'x-iq-mode': 'PRACTICE' },
+      signal: AbortSignal.timeout(3000),
+    });
+    if (!healthRes.ok) return null;
+    const health = (await healthRes.json()) as {
+      connected?: boolean;
+      busy?: boolean;
+      connectInFlight?: boolean;
+    };
+    if (!health.connected || health.busy || health.connectInFlight) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
   const cleanSymbol = symbol.toUpperCase().replace(/[^A-Z0-9_-]/g, '');
   const intervalMap: Record<Timeframe, number> = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600 };
   const headers: Record<string, string> = {

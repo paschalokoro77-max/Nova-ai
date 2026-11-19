@@ -208,6 +208,126 @@ async function runBrokerConfigTests() {
     mockServer.close();
   }
 
+  // Test 6: Single-flight connect/status coalescing, slow connect, transient 503 busy recovery, and ConnectionManager flow
+  let connectHits = 0;
+  let accountHits = 0;
+  let healthHits = 0;
+  let failFirstConnectWith503 = false;
+  const concurrencyServer = http.createServer((req, res) => {
+    if (req.url === '/connect' && req.method === 'POST') {
+      connectHits++;
+      if (failFirstConnectWith503 && connectHits === 1) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            detail: 'IQ Option connector is busy with an upstream broker operation; please retry shortly.',
+          })
+        );
+        return;
+      }
+      // Simulate slow broker WebSocket handshake (250ms)
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            connected: true,
+            mode: 'PRACTICE',
+            accountType: 'PRACTICE',
+            modeVerified: true,
+            orderExecutionSupported: false,
+            realTradingEnabled: false,
+          })
+        );
+      }, 250);
+      return;
+    }
+    if (req.url === '/health') {
+      healthHits++;
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            status: 'running',
+            busy: false,
+            connectInFlight: false,
+            connected: true,
+            authenticated: true,
+            mode: 'PRACTICE',
+            accountType: 'PRACTICE',
+            modeVerified: true,
+            credentialsConfigured: true,
+            lastError: null,
+          })
+        );
+      }, 100);
+      return;
+    }
+    if (req.url === '/account') {
+      accountHits++;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          connected: true,
+          mode: 'PRACTICE',
+          accountType: 'PRACTICE',
+          modeVerified: true,
+          balance: 10000.0,
+          currency: 'USD',
+          orderExecutionSupported: false,
+          realTradingEnabled: false,
+        })
+      );
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ detail: 'Not found' }));
+  });
+
+  await new Promise<void>((resolve) => concurrencyServer.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = (concurrencyServer.address() as { port: number }).port;
+    process.env.IQ_CONNECTOR_URL = `http://127.0.0.1:${port}`;
+    process.env.IQ_CONNECTOR_TOKEN = 'valid-secret';
+
+    // Simultaneous connect() calls must coalesce into ONE POST /connect request
+    const [c1, c2, c3] = await Promise.all([
+      iqAdapter.connect(),
+      iqAdapter.connect(),
+      iqAdapter.connect(),
+    ]);
+    assert.equal(connectHits, 1, `Expected 1 coalesced /connect hit, got ${connectHits}`);
+    assert.equal(c1.connected, true);
+    assert.equal(c2.connected, true);
+    assert.equal(c3.connected, true);
+    assert.equal(c1.balance, 10000);
+    console.log('  ✅ [PASS] Simultaneous IQOptionAdapter.connect() calls coalesce into 1 upstream /connect request');
+
+    // Simultaneous getStatus() calls must coalesce into ONE /health + ONE /account round-trip
+    healthHits = 0;
+    accountHits = 0;
+    const [s1, s2, s3] = await Promise.all([
+      iqAdapter.getStatus(),
+      iqAdapter.getStatus(),
+      iqAdapter.getStatus(),
+    ]);
+    assert.equal(healthHits, 1, `Expected 1 coalesced /health hit, got ${healthHits}`);
+    assert.equal(accountHits, 1, `Expected 1 coalesced /account hit, got ${accountHits}`);
+    assert.equal(s1.connected, true);
+    assert.equal(s2.balance, 10000);
+    assert.equal(s3.balance, 10000);
+    console.log('  ✅ [PASS] Simultaneous IQOptionAdapter.getStatus() calls coalesce cleanly');
+
+    // Transient 503 busy on first /connect recovers cleanly on bounded retry (2 attempts total)
+    connectHits = 0;
+    failFirstConnectWith503 = true;
+    const recovered = await iqAdapter.connect();
+    assert.equal(recovered.connected, true);
+    assert.equal(connectHits, 2, `Expected 2 bounded attempts on transient 503, got ${connectHits}`);
+    console.log('  ✅ [PASS] Transient HTTP 503 busy recovers cleanly with bounded backoff retry');
+  } finally {
+    concurrencyServer.close();
+  }
+
   console.log('\n========================================================================');
   console.log('🎉 ALL BROKER CONNECTOR CONFIGURATION TESTS PASSED SUCCESSFULLY!');
   console.log('========================================================================\n');

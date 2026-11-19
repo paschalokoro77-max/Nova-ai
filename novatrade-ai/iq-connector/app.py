@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.5')
+app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.6')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
@@ -29,7 +29,7 @@ _WS_ORIGIN = 'https://iqoption.com'
 _WS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 _AUTH_LOGIN_URL = 'https://auth.iqoption.com/api/v2/login'
 
-_LOCK_ACQUIRE_TIMEOUT = float(os.environ.get('IQ_LOCK_TIMEOUT_SECONDS', '2.0'))
+_LOCK_ACQUIRE_TIMEOUT = float(os.environ.get('IQ_LOCK_TIMEOUT_SECONDS', '4.0'))
 _WS_CONNECT_TIMEOUT = float(os.environ.get('IQ_WS_CONNECT_TIMEOUT_SECONDS', '6.0'))
 _CONNECT_TIMEOUT = float(os.environ.get('IQ_CONNECT_TIMEOUT_SECONDS', '18.0'))
 _BALANCE_TIMEOUT = float(os.environ.get('IQ_BALANCE_TIMEOUT_SECONDS', '6.0'))
@@ -42,7 +42,14 @@ _HTTP_CONNECT_TIMEOUT = float(os.environ.get('IQ_HTTP_CONNECT_TIMEOUT_SECONDS', 
 _HTTP_TIMEOUT = float(os.environ.get('IQ_HTTP_READ_TIMEOUT_SECONDS', '10.0'))
 
 _lock = threading.RLock()
+_state_lock = threading.Lock()
+_worker_ctx = threading.local()
 _client: Any = None
+_session_generation: int = 0
+_inflight_connect: Optional['_InFlightConnect'] = None
+_busy_operation: Optional[str] = None
+_last_connect_stage: Optional[str] = None
+_last_connect_duration_ms: Optional[float] = None
 _last_error: Optional[str] = None
 _connected_at: Optional[float] = None
 _requested_mode: str = 'PRACTICE'
@@ -54,6 +61,47 @@ _last_ws_diagnostics: Optional[List[dict]] = None
 _last_candle_check: Optional[dict] = None
 _opcodes_updated: bool = False
 _iqoptionapi_patched: bool = False
+
+
+class _InFlightConnect:
+    """Tracks a single active upstream connection attempt so concurrent callers coalesce safely."""
+
+    def __init__(self, generation: int, target_mode: str):
+        self.generation = generation
+        self.target_mode = target_mode
+        self.done = threading.Event()
+        self.cancel_event = threading.Event()
+        self.client_ref: Any = None
+        self.result_client: Any = None
+        self.error: Optional[BaseException] = None
+        self.started_at = time.monotonic()
+
+
+def _is_worker_cancelled() -> bool:
+    """Return True if the current connect worker was cancelled or superseded by a newer session generation."""
+    cancel_ev = getattr(_worker_ctx, 'cancel_event', None)
+    if cancel_ev is not None and cancel_ev.is_set():
+        return True
+    worker_gen = getattr(_worker_ctx, 'generation', None)
+    if worker_gen is not None and worker_gen != _session_generation:
+        return True
+    return False
+
+
+def _remaining_connect_budget(fallback_seconds: float) -> float:
+    """Cap an inner stage timeout to the shared connect wall-clock deadline when running inside connect()."""
+    deadline = getattr(_worker_ctx, 'deadline', None)
+    if deadline is None:
+        return float(fallback_seconds)
+    remaining = deadline - time.monotonic()
+    return max(0.05, min(float(fallback_seconds), remaining))
+
+
+def _set_connect_stage(stage: str) -> None:
+    global _last_connect_stage
+    if not _is_worker_cancelled():
+        _last_connect_stage = stage
+
 
 T = TypeVar('T')
 
@@ -247,7 +295,8 @@ async def _unhandled_exception_handler(_request: Request, exc: Exception):
 
 
 @contextlib.contextmanager
-def _bounded_lock(timeout: Optional[float] = None):
+def _bounded_lock(timeout: Optional[float] = None, op_name: str = 'operation'):
+    global _busy_operation
     wait = _LOCK_ACQUIRE_TIMEOUT if timeout is None else timeout
     acquired = _lock.acquire(timeout=wait)
     if not acquired:
@@ -255,27 +304,46 @@ def _bounded_lock(timeout: Optional[float] = None):
             503,
             'IQ Option connector is busy with an upstream broker operation; please retry shortly.',
         )
+    prev_op = _busy_operation
+    _busy_operation = op_name
     try:
         yield
     finally:
+        _busy_operation = prev_op
         _lock.release()
 
 
-def _run_with_timeout(fn: Callable[[], T], timeout_seconds: float, op_name: str) -> T:
-    """Execute a potentially blocking broker call on a daemon thread with a strict wall-clock cap."""
+def _run_with_timeout(
+    fn: Callable[[], T],
+    timeout_seconds: float,
+    op_name: str,
+    cancel_event: Optional[threading.Event] = None,
+    generation: Optional[int] = None,
+    deadline: Optional[float] = None,
+) -> T:
+    """Execute a potentially blocking broker call on a daemon thread with a strict wall-clock cap and cooperative cancellation."""
     result_box: dict = {}
     error_box: dict = {}
 
     def _target():
+        _worker_ctx.cancel_event = cancel_event
+        _worker_ctx.generation = generation
+        _worker_ctx.deadline = deadline
         try:
             result_box['value'] = fn()
         except BaseException as exc:
             error_box['error'] = exc
+        finally:
+            _worker_ctx.cancel_event = None
+            _worker_ctx.generation = None
+            _worker_ctx.deadline = None
 
     worker = threading.Thread(target=_target, name=f'iq-op-{op_name}', daemon=True)
     worker.start()
     worker.join(timeout=timeout_seconds)
     if worker.is_alive():
+        if cancel_event is not None:
+            cancel_event.set()
         raise TimeoutError(f'{op_name} timed out after {timeout_seconds:.1f}s.')
     if 'error' in error_box:
         raise error_box['error']
@@ -292,8 +360,10 @@ def _reset_iq_global_locks():
         pass
 
 
-def _safe_close_client(client: Any, timeout_seconds: Optional[float] = None):
-    """Best-effort, strictly bounded teardown of an IQ Option client and its WebSocket thread."""
+def _safe_close_client(client: Any, timeout_seconds: Optional[float] = None, reset_globals: bool = True):
+    """Best-effort, strictly bounded teardown of an IQ Option client and its WebSocket thread.
+    Pass reset_globals=False when closing an abandoned/superseded client so a newer session's global flags are untouched.
+    """
     if client is None:
         return
     timeout = _CLOSE_TIMEOUT if timeout_seconds is None else timeout_seconds
@@ -331,28 +401,38 @@ def _safe_close_client(client: Any, timeout_seconds: Optional[float] = None):
     except Exception:
         pass
     finally:
-        try:
-            import iqoptionapi.global_value as global_value
-            global_value.check_websocket_if_connect = 0
-            global_value.ssl_Mutual_exclusion = False
-            global_value.ssl_Mutual_exclusion_write = False
-        except Exception:
-            pass
+        if reset_globals:
+            try:
+                import iqoptionapi.global_value as global_value
+                global_value.check_websocket_if_connect = 0
+                global_value.ssl_Mutual_exclusion = False
+                global_value.ssl_Mutual_exclusion_write = False
+            except Exception:
+                pass
 
 
-def _invalidate_client(reason: Optional[str] = None):
-    global _client, _connected_at, _mode_verified, _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_error
-    old_client = _client
-    _client = None
-    _connected_at = None
-    _mode_verified = False
-    _active_ws_url = None
-    _active_ws_via_proxy = False
-    _opcodes_updated = False
-    if reason:
-        _last_error = _sanitize_error(reason)
+def _invalidate_client(reason: Optional[str] = None, cancel_inflight: bool = False):
+    global _client, _connected_at, _mode_verified, _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_error, _session_generation
+    with _state_lock:
+        _session_generation += 1
+        old_client = _client
+        _client = None
+        _connected_at = None
+        _mode_verified = False
+        _active_ws_url = None
+        _active_ws_via_proxy = False
+        _opcodes_updated = False
+        if reason:
+            _last_error = _sanitize_error(reason)
+        if cancel_inflight and _inflight_connect is not None:
+            _inflight_connect.cancel_event.set()
+            inflight_client = _inflight_connect.client_ref
+        else:
+            inflight_client = None
     if old_client is not None:
-        _safe_close_client(old_client)
+        _safe_close_client(old_client, reset_globals=True)
+    if inflight_client is not None and inflight_client is not old_client:
+        _safe_close_client(inflight_client, reset_globals=False)
 
 
 def _get_ws_candidates(preferred_url: Optional[str] = None) -> List[str]:
@@ -876,7 +956,11 @@ def _patch_iqoptionapi():
         orig_request = self.session.request
 
         def _timed_request(*r_args, **r_kwargs):
-            r_kwargs.setdefault('timeout', (_HTTP_CONNECT_TIMEOUT, _HTTP_TIMEOUT))
+            if _is_worker_cancelled():
+                raise TimeoutError('Connection attempt cancelled after timeout.')
+            conn_t = _remaining_connect_budget(_HTTP_CONNECT_TIMEOUT)
+            read_t = _remaining_connect_budget(_HTTP_TIMEOUT)
+            r_kwargs.setdefault('timeout', (conn_t, read_t))
             r_kwargs['verify'] = True
             if proxies is not None and r_kwargs.get('proxies') is None:
                 r_kwargs['proxies'] = proxies
@@ -906,8 +990,9 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.send_websocket_request = _safe_send_ws_request
 
-    # 4. Bounded close() so websocket_thread.join() can NEVER hang forever
-    def _safe_api_close(self):
+    # 4. Bounded close() so websocket_thread.join() can NEVER hang forever, and cancelled workers never wipe newer globals
+    def _safe_api_close(self, reset_globals: Optional[bool] = None):
+        should_reset = (not _is_worker_cancelled()) if reset_globals is None else bool(reset_globals)
         ws_client = getattr(self, 'websocket_client', None)
         wss = getattr(ws_client, 'wss', None) if ws_client is not None else None
         if wss is not None:
@@ -921,16 +1006,26 @@ def _patch_iqoptionapi():
                 ws_thread.join(timeout=_CLOSE_TIMEOUT)
             except Exception:
                 pass
-        global_value.check_websocket_if_connect = 0
-        global_value.ssl_Mutual_exclusion = False
-        global_value.ssl_Mutual_exclusion_write = False
+        session = getattr(self, 'session', None)
+        if session is not None and hasattr(session, 'close'):
+            try:
+                session.close()
+            except Exception:
+                pass
+        if should_reset:
+            global_value.check_websocket_if_connect = 0
+            global_value.ssl_Mutual_exclusion = False
+            global_value.ssl_Mutual_exclusion_write = False
 
     IQOptionAPI.close = _safe_api_close
 
-    # 5. Hardened start_websocket() with 6s socket timeout, Origin/User-Agent headers, no cacert.pem, primary->fallback, and validated WS proxy support
+    # 5. Hardened start_websocket() with 6s socket timeout, Origin/User-Agent headers, no cacert.pem, primary->fallback, and cooperative cancellation
     def _safe_start_websocket(self):
         global _active_ws_url, _active_ws_via_proxy, _last_ws_diagnostics
-        ws_timeout = _WS_CONNECT_TIMEOUT
+        if _is_worker_cancelled():
+            return False, 'Connection attempt cancelled after timeout.'
+        _set_connect_stage('ws_open')
+        ws_timeout = _remaining_connect_budget(_WS_CONNECT_TIMEOUT)
         candidates = _get_ws_candidates(getattr(self, 'wss_url', None))
         attempt_diags: List[dict] = []
 
@@ -962,11 +1057,15 @@ def _patch_iqoptionapi():
             plan = [(u, False) for u in candidates]
 
         for candidate_url, use_proxy in plan:
+            if _is_worker_cancelled():
+                self.close(reset_globals=False)
+                return False, 'Connection attempt cancelled after timeout.'
+            step_timeout = _remaining_connect_budget(_WS_CONNECT_TIMEOUT)
             if use_proxy and proxy_url:
                 probe = _probe_https_via_proxy(
                     candidate_url,
                     proxy_url,
-                    timeout_seconds=ws_timeout,
+                    timeout_seconds=step_timeout,
                     include_upgrade=False,
                     verify_tls=False,
                 )
@@ -974,11 +1073,15 @@ def _patch_iqoptionapi():
                     attempt_diags.append(probe)
                     continue
             else:
-                probe = _probe_ws_endpoint(candidate_url, timeout_seconds=ws_timeout, include_upgrade=False)
+                probe = _probe_ws_endpoint(candidate_url, timeout_seconds=step_timeout, include_upgrade=False)
                 probe['viaProxy'] = False
                 if not probe.get('ok'):
                     attempt_diags.append(probe)
                     continue
+
+            if _is_worker_cancelled():
+                self.close(reset_globals=False)
+                return False, 'Connection attempt cancelled after timeout.'
 
             global_value.check_websocket_if_connect = None
             global_value.check_websocket_if_error = False
@@ -1005,11 +1108,15 @@ def _patch_iqoptionapi():
             self.websocket_thread.start()
 
             t_open = time.monotonic()
-            deadline = t_open + ws_timeout
+            open_budget = _remaining_connect_budget(_WS_CONNECT_TIMEOUT)
+            deadline = t_open + open_budget
             opened = False
             ws_err: Optional[str] = None
 
             while time.monotonic() < deadline:
+                if _is_worker_cancelled():
+                    self.close(reset_globals=False)
+                    return False, 'Connection attempt cancelled after timeout.'
                 if global_value.check_websocket_if_error:
                     ws_err = str(global_value.websocket_error_reason or 'WebSocket error callback triggered.')
                     break
@@ -1022,6 +1129,9 @@ def _patch_iqoptionapi():
                 time.sleep(0.02)
 
             if opened:
+                if _is_worker_cancelled():
+                    self.close(reset_globals=False)
+                    return False, 'Connection attempt cancelled after timeout.'
                 probe['upgradeMs'] = round((time.monotonic() - t_open) * 1000, 1)
                 probe['stage'] = 'ok'
                 probe['ok'] = True
@@ -1031,18 +1141,19 @@ def _patch_iqoptionapi():
                 _last_ws_diagnostics = attempt_diags
                 return True, None
 
-            self.close()
+            self.close(reset_globals=not _is_worker_cancelled())
             probe['ok'] = False
             probe['stage'] = 'ws_upgrade'
             probe['upgradeMs'] = round((time.monotonic() - t_open) * 1000, 1)
             probe['error'] = _sanitize_error(
-                ws_err or f'WebSocket upgrade timed out for {candidate_url} after {ws_timeout:.1f}s.'
+                ws_err or f'WebSocket upgrade timed out for {candidate_url} after {open_budget:.1f}s.'
             )
             attempt_diags.append(probe)
 
-        _active_ws_url = None
-        _active_ws_via_proxy = False
-        _last_ws_diagnostics = attempt_diags
+        if not _is_worker_cancelled():
+            _active_ws_url = None
+            _active_ws_via_proxy = False
+            _last_ws_diagnostics = attempt_diags
         summary = '; '.join(
             f"{d.get('url')} [{d.get('stage')}: {d.get('error') or 'failed'}]"
             for d in attempt_diags
@@ -1051,12 +1162,17 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.start_websocket = _safe_start_websocket
 
-    # 6. Bounded send_ssid() wait
+    # 6. Bounded send_ssid() wait with cooperative cancellation
     def _safe_send_ssid(self):
+        if _is_worker_cancelled():
+            return False
+        _set_connect_stage('send_ssid')
         self.profile.msg = None
         self.ssid(global_value.SSID)
-        deadline = time.monotonic() + 8.0
+        deadline = time.monotonic() + _remaining_connect_budget(8.0)
         while time.monotonic() < deadline:
+            if _is_worker_cancelled():
+                return False
             if self.profile.msg is not None:
                 return self.profile.msg is not False
             if global_value.check_websocket_if_connect == 0 or global_value.check_websocket_if_error:
@@ -1078,7 +1194,7 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.get_ssid = _safe_get_ssid
 
-    # 7. Bounded IQOptionAPI.connect() (no infinite timesync spin, safe TimeSync None handling, safe auth classification)
+    # 7. Bounded IQOptionAPI.connect() (no infinite timesync spin, safe TimeSync None handling, safe auth classification, cancellation fencing)
     def _classify_auth_exception(exc: BaseException, extra: Tuple[Optional[str], ...]) -> str:
         cls_name = type(exc).__name__
         low = f'{cls_name}: {exc}'.lower()
@@ -1093,6 +1209,9 @@ def _patch_iqoptionapi():
         return _sanitize_error(f'IQ Option auth request failed ({cls_name}): {exc}', extra)
 
     def _fetch_ssid_safely(api_self) -> Tuple[Optional[str], Optional[str]]:
+        if _is_worker_cancelled():
+            return None, 'Connection attempt cancelled after timeout.'
+        _set_connect_stage('auth')
         extra = (getattr(api_self, 'username', None), getattr(api_self, 'password', None))
         try:
             response = api_self.get_ssid()
@@ -1100,6 +1219,9 @@ def _patch_iqoptionapi():
                 return None, _classify_auth_exception(response, extra)
         except Exception as exc:
             return None, _classify_auth_exception(exc, extra)
+
+        if _is_worker_cancelled():
+            return None, 'Connection attempt cancelled after timeout.'
 
         try:
             ssid_val = response.cookies['ssid']
@@ -1126,44 +1248,67 @@ def _patch_iqoptionapi():
         return None, _sanitize_error(getattr(response, 'text', str(response)), extra)
 
     def _safe_api_connect(self):
+        if _is_worker_cancelled():
+            return False, 'Connection attempt cancelled after timeout.'
         global_value.ssl_Mutual_exclusion = False
         global_value.ssl_Mutual_exclusion_write = False
         try:
-            self.close()
+            self.close(reset_globals=False)
         except Exception:
             pass
         check_ws, ws_reason = self.start_websocket()
         if not check_ws:
             return check_ws, ws_reason
 
+        if _is_worker_cancelled():
+            self.close(reset_globals=False)
+            return False, 'Connection attempt cancelled after timeout.'
+
         if global_value.SSID is not None:
             check_ssid = self.send_ssid()
             if not check_ssid:
+                if _is_worker_cancelled():
+                    self.close(reset_globals=False)
+                    return False, 'Connection attempt cancelled after timeout.'
                 ssid_val, auth_err = _fetch_ssid_safely(self)
                 if not ssid_val:
-                    self.close()
+                    self.close(reset_globals=not _is_worker_cancelled())
                     return False, auth_err or 'IQ Option authentication failed.'
+                if _is_worker_cancelled():
+                    self.close(reset_globals=False)
+                    return False, 'Connection attempt cancelled after timeout.'
                 global_value.SSID = ssid_val
                 check_ws2, ws_reason2 = self.start_websocket()
                 if not check_ws2:
                     return False, ws_reason2
                 if not self.send_ssid():
-                    self.close()
+                    self.close(reset_globals=not _is_worker_cancelled())
                     return False, 'IQ Option SSID authentication timed out.'
         else:
             ssid_val, auth_err = _fetch_ssid_safely(self)
             if not ssid_val:
-                self.close()
+                self.close(reset_globals=not _is_worker_cancelled())
                 return False, auth_err or 'IQ Option authentication failed.'
+            if _is_worker_cancelled():
+                self.close(reset_globals=False)
+                return False, 'Connection attempt cancelled after timeout.'
             global_value.SSID = ssid_val
             if not self.send_ssid():
-                self.close()
+                self.close(reset_globals=not _is_worker_cancelled())
                 return False, 'IQ Option SSID authentication timed out.'
 
+        if _is_worker_cancelled():
+            self.close(reset_globals=False)
+            return False, 'Connection attempt cancelled after timeout.'
+
         requests.utils.add_dict_to_cookiejar(self.session.cookies, {'ssid': global_value.SSID})
+        _set_connect_stage('time_sync')
         self.timesync.server_timestamp = None
-        deadline = time.monotonic() + 6.0
+        deadline = time.monotonic() + _remaining_connect_budget(6.0)
         while time.monotonic() < deadline:
+            if _is_worker_cancelled():
+                self.close(reset_globals=False)
+                return False, 'Connection attempt cancelled after timeout.'
             try:
                 ts_val = self.timesync.server_timestamp
             except TypeError:
@@ -1172,28 +1317,39 @@ def _patch_iqoptionapi():
             if ts_val is not None:
                 return True, None
             if global_value.check_websocket_if_connect == 0 or global_value.check_websocket_if_error:
-                self.close()
+                self.close(reset_globals=not _is_worker_cancelled())
                 return False, global_value.websocket_error_reason or 'WebSocket closed during timeSync.'
             time.sleep(0.02)
-        self.close()
+        self.close(reset_globals=not _is_worker_cancelled())
         return False, 'Timed out waiting for IQ Option timeSync.'
 
     IQOptionAPI.connect = _safe_api_connect
 
-    # 8. Bounded IQ_Option.connect() (no infinite balance_id spin)
+    # 8. Bounded IQ_Option.connect() (no infinite balance_id spin, cancellation fenced)
     def _safe_stable_connect(self):
+        if _is_worker_cancelled():
+            return False, 'Connection attempt cancelled after timeout.'
         try:
-            self.api.close()
+            self.api.close(reset_globals=False)
         except Exception:
             pass
+        if _is_worker_cancelled():
+            return False, 'Connection attempt cancelled after timeout.'
         global_value.balance_id = None
         self.api = IQOptionAPI('iqoption.com', self.email, self.password)
         self.api.set_session(headers=self.SESSION_HEADER, cookies=self.SESSION_COOKIE)
         check, reason = self.api.connect()
         if check is True:
+            if _is_worker_cancelled():
+                self.api.close(reset_globals=False)
+                return False, 'Connection attempt cancelled after timeout.'
             self.re_subscribe_stream()
-            deadline = time.monotonic() + 6.0
+            _set_connect_stage('balance_profile')
+            deadline = time.monotonic() + _remaining_connect_budget(6.0)
             while global_value.balance_id is None and time.monotonic() < deadline:
+                if _is_worker_cancelled():
+                    self.api.close(reset_globals=False)
+                    return False, 'Connection attempt cancelled after timeout.'
                 profile_msg = getattr(getattr(self.api, 'profile', None), 'msg', None)
                 if isinstance(profile_msg, dict) and isinstance(profile_msg.get('balances'), list):
                     for bal in profile_msg['balances']:
@@ -1207,11 +1363,14 @@ def _patch_iqoptionapi():
                 if global_value.balance_id is not None:
                     break
                 if global_value.check_websocket_if_connect == 0 or global_value.check_websocket_if_error:
-                    self.api.close()
+                    self.api.close(reset_globals=not _is_worker_cancelled())
                     return False, global_value.websocket_error_reason or 'WebSocket closed awaiting balance profile.'
                 time.sleep(0.02)
+            if _is_worker_cancelled():
+                self.api.close(reset_globals=False)
+                return False, 'Connection attempt cancelled after timeout.'
             if global_value.balance_id is None:
-                self.api.close()
+                self.api.close(reset_globals=not _is_worker_cancelled())
                 return False, 'Timed out waiting for IQ Option balance profile.'
             self.position_change_all('subscribeMessage', global_value.balance_id)
             self.order_changed_all('subscribeMessage')
@@ -1353,6 +1512,11 @@ def _ensure_balance_mode(client: Any, target_mode: str, timeout_seconds: Optiona
     except Exception:
         current_mode = None
 
+    if current_mode == target_mode and current_mode in ('PRACTICE', 'REAL'):
+        _confirmed_mode = current_mode
+        _mode_verified = True
+        return (current_mode, True)
+
     if current_mode != target_mode:
         try:
             _run_with_timeout(lambda: client.change_balance(target_mode), timeout, 'change_balance')
@@ -1414,9 +1578,23 @@ def connect(
     target_mode: Optional[str] = None,
     force_reconnect: bool = False,
 ):
-    global _client, _last_error, _connected_at, _requested_mode, _confirmed_mode, _mode_verified, _opcodes_updated
+    """Single-flight, generation-fenced IQ Option session establishment.
+    Runs outside _lock so concurrent callers coalesce cleanly instead of failing with HTTP 503 busy,
+    and ensures timed-out or superseded workers cannot corrupt a newer session.
+    """
+    global _client, _last_error, _connected_at, _requested_mode, _confirmed_mode, _mode_verified
+    global _active_ws_url, _active_ws_via_proxy, _opcodes_updated
+    global _session_generation, _inflight_connect, _last_connect_stage, _last_connect_duration_ms
+
     resolved_mode = _normalize_mode(target_mode) or _requested_mode
-    with _bounded_lock():
+    existing_flight: Optional[_InFlightConnect] = None
+    flight: Optional[_InFlightConnect] = None
+    stale_client: Any = None
+    superseded_client: Any = None
+    target_email: Optional[str] = None
+    target_password: Optional[str] = None
+
+    with _state_lock:
         prior_email = getattr(_client, 'email', None) if _client is not None else None
         prior_password = getattr(_client, 'password', None) if _client is not None else None
 
@@ -1424,56 +1602,180 @@ def connect(
             if _is_client_alive(_client):
                 _requested_mode = resolved_mode
                 return _client
-            _invalidate_client('IQ Option WebSocket session disconnected; reconnecting.')
+            stale_client = _client
+            _client = None
+            _connected_at = None
+            _mode_verified = False
+            _active_ws_url = None
+            _active_ws_via_proxy = False
+            _opcodes_updated = False
+            _last_error = 'IQ Option WebSocket session disconnected; reconnecting.'
 
-        if force_reconnect and _client is not None:
-            _invalidate_client()
+        if _inflight_connect is not None and not force_reconnect:
+            existing_flight = _inflight_connect
+        else:
+            target_email = email or os.environ.get('IQ_EMAIL') or prior_email
+            target_password = password or os.environ.get('IQ_PASSWORD') or prior_password
+            if not target_email or not target_password:
+                raise HTTPException(503, 'IQ Option email and password are required.')
 
-        target_email = email or os.environ.get('IQ_EMAIL') or prior_email
-        target_password = password or os.environ.get('IQ_PASSWORD') or prior_password
-        if not target_email or not target_password:
-            raise HTTPException(503, 'IQ Option email and password are required.')
+            if force_reconnect and _client is not None:
+                stale_client = _client
+                _client = None
+                _connected_at = None
+                _mode_verified = False
+                _active_ws_url = None
+                _active_ws_via_proxy = False
+                _opcodes_updated = False
+
+            if _inflight_connect is not None:
+                _inflight_connect.cancel_event.set()
+                superseded_client = _inflight_connect.client_ref
+
+            _session_generation += 1
+            flight = _InFlightConnect(generation=_session_generation, target_mode=resolved_mode)
+            _inflight_connect = flight
+            _last_connect_stage = 'initializing'
+
+    # Joiner path: wait for the single active connection leader without holding _lock
+    if existing_flight is not None:
+        wait_cap = max(2.0, _CONNECT_TIMEOUT + _MODE_TIMEOUT + 2.0)
+        finished = existing_flight.done.wait(timeout=wait_cap)
+        if not finished:
+            raise HTTPException(504, 'IQ Option broker connection timed out; please retry.')
+        if existing_flight.error is not None:
+            raise existing_flight.error
+        if existing_flight.result_client is not None and _is_client_alive(existing_flight.result_client):
+            return existing_flight.result_client
+        with _state_lock:
+            if _client is not None and _is_client_alive(_client):
+                return _client
+        raise HTTPException(502, 'Broker connection did not establish an active session; please retry.')
+
+    assert flight is not None
+    my_gen = flight.generation
+    client: Any = None
+    try:
+        if stale_client is not None:
+            _safe_close_client(stale_client, reset_globals=True)
+        if superseded_client is not None and superseded_client is not stale_client:
+            _safe_close_client(superseded_client, reset_globals=False)
 
         _patch_iqoptionapi()
         _reset_iq_global_locks()
 
-        try:
-            from iqoptionapi.stable_api import IQ_Option
-            client = IQ_Option(target_email, target_password)
-            result = _run_with_timeout(client.connect, _CONNECT_TIMEOUT, 'iq_connect')
-            if not result or not result[0]:
-                reason = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else 'Authentication failed or 2FA required.'
-                _safe_close_client(client)
-                raise RuntimeError(str(reason))
-            _requested_mode = resolved_mode
-            _run_with_timeout(lambda: client.change_balance(resolved_mode), _MODE_TIMEOUT, 'change_balance')
-            _client = client
-            _confirmed_mode = resolved_mode
-            _mode_verified = resolved_mode == 'PRACTICE'
-            _last_error = None
-            _connected_at = time.time()
-            return client
-        except HTTPException:
-            raise
-        except TimeoutError as exc:
-            _last_error = _sanitize_error(f'Connection timed out: {exc}', (target_email, target_password))
-            _invalidate_client()
-            raise HTTPException(504, 'IQ Option broker connection timed out; please retry.') from None
-        except Exception as exc:
-            _last_error = _sanitize_error(f'{type(exc).__name__}: {exc}', (target_email, target_password))
-            raise HTTPException(502, f'Broker connection failed ({type(exc).__name__}); check connector configuration.') from None
+        from iqoptionapi.stable_api import IQ_Option
+        client = IQ_Option(target_email, target_password)
+        flight.client_ref = client
+
+        deadline = time.monotonic() + _CONNECT_TIMEOUT
+        result = _run_with_timeout(
+            client.connect,
+            _CONNECT_TIMEOUT,
+            'iq_connect',
+            cancel_event=flight.cancel_event,
+            generation=my_gen,
+            deadline=deadline,
+        )
+        if not result or not result[0]:
+            reason = result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else 'Authentication failed or 2FA required.'
+            flight.cancel_event.set()
+            _safe_close_client(client, reset_globals=False)
+            raise RuntimeError(str(reason))
+
+        # Fence before mutating shared state: if superseded or cancelled while finishing, discard safely
+        with _state_lock:
+            still_current = (not flight.cancel_event.is_set()) and (_session_generation == my_gen)
+        if not still_current:
+            _safe_close_client(client, reset_globals=False)
+            err = HTTPException(409, 'Connection attempt was superseded by a newer session; please retry.')
+            flight.error = err
+            raise err
+
+        _set_connect_stage('mode_verify')
+        confirmed_mode, mode_verified = _ensure_balance_mode(client, resolved_mode, timeout_seconds=_MODE_TIMEOUT)
+
+        with _state_lock:
+            still_current = (not flight.cancel_event.is_set()) and (_session_generation == my_gen)
+            if not still_current:
+                discard_client = client
+            else:
+                discard_client = None
+                _requested_mode = resolved_mode
+                _client = client
+                _confirmed_mode = confirmed_mode
+                _mode_verified = mode_verified
+                _last_error = None if (resolved_mode != 'REAL' or mode_verified) else _last_error
+                _connected_at = time.time()
+                _last_connect_stage = 'connected'
+                _last_connect_duration_ms = round((time.monotonic() - flight.started_at) * 1000, 1)
+                flight.result_client = client
+
+        if discard_client is not None:
+            _safe_close_client(discard_client, reset_globals=False)
+            err = HTTPException(409, 'Connection attempt was superseded by a newer session; please retry.')
+            flight.error = err
+            raise err
+
+        return client
+    except HTTPException as http_exc:
+        flight.cancel_event.set()
+        if flight.error is None:
+            flight.error = http_exc
+        raise
+    except TimeoutError as exc:
+        flight.cancel_event.set()
+        with _state_lock:
+            if _session_generation == my_gen:
+                _session_generation += 1
+                _last_connect_stage = 'timeout'
+                _last_connect_duration_ms = round((time.monotonic() - flight.started_at) * 1000, 1)
+                _last_error = _sanitize_error(f'Connection timed out: {exc}', (target_email, target_password))
+        # Actively close the local client instance (never leave an unclosed WS/socket leaking!)
+        if client is not None:
+            _safe_close_client(client, reset_globals=False)
+        err = HTTPException(504, 'IQ Option broker connection timed out; please retry.')
+        flight.error = err
+        raise err from None
+    except Exception as exc:
+        flight.cancel_event.set()
+        with _state_lock:
+            if _session_generation == my_gen:
+                _session_generation += 1
+                _last_connect_stage = 'failed'
+                _last_connect_duration_ms = round((time.monotonic() - flight.started_at) * 1000, 1)
+                _last_error = _sanitize_error(f'{type(exc).__name__}: {exc}', (target_email, target_password))
+        if client is not None:
+            _safe_close_client(client, reset_globals=False)
+        err = HTTPException(502, f'Broker connection failed ({type(exc).__name__}); check connector configuration.')
+        flight.error = err
+        raise err from None
+    finally:
+        with _state_lock:
+            if _inflight_connect is flight:
+                _inflight_connect = None
+        flight.done.set()
 
 
 def _try_reconnect_session(client: Any, target_mode: str) -> Optional[Any]:
-    """Attempt a single safe reconnect if credentials are available."""
+    """Attempt a single safe, generation-fenced reconnect if credentials are available."""
     email = os.environ.get('IQ_EMAIL') or getattr(client, 'email', None)
     password = os.environ.get('IQ_PASSWORD') or getattr(client, 'password', None)
     if email and password:
         new_client = connect(email=email, password=password, target_mode=target_mode, force_reconnect=True)
-        _ensure_balance_mode(new_client, target_mode)
         return new_client
     if hasattr(client, 'connect'):
-        res = _run_with_timeout(client.connect, _CONNECT_TIMEOUT, 'client_reconnect')
+        cancel_ev = threading.Event()
+        with _state_lock:
+            cur_gen = _session_generation
+        res = _run_with_timeout(
+            client.connect,
+            _CONNECT_TIMEOUT,
+            'client_reconnect',
+            cancel_event=cancel_ev,
+            generation=cur_gen,
+            deadline=time.monotonic() + _CONNECT_TIMEOUT,
+        )
         if isinstance(res, (list, tuple)) and res and res[0]:
             _ensure_balance_mode(client, target_mode)
             return client
@@ -1705,22 +2007,28 @@ async def health(
     connected = False
     confirmed_mode = target_mode
     mode_verified = False
-    busy = False
+    lock_busy = False
+    connect_in_flight = _inflight_connect is not None
 
     acquired = _lock.acquire(blocking=False)
     if acquired:
         try:
-            if _client is not None:
-                connected = _is_client_alive(_client)
+            cur_client = _client
+            if cur_client is not None:
+                connected = _is_client_alive(cur_client)
                 if connected:
-                    confirmed_mode, mode_verified = _peek_balance_mode_nonblocking(_client, target_mode)
+                    confirmed_mode, mode_verified = _peek_balance_mode_nonblocking(cur_client, target_mode)
         finally:
             _lock.release()
     else:
-        busy = True
-        connected = _is_client_alive(_client)
+        lock_busy = True
+        cur_client = _client
+        connected = _is_client_alive(cur_client)
         confirmed_mode = _confirmed_mode if connected else _requested_mode
         mode_verified = bool(_mode_verified and confirmed_mode == target_mode) if connected else False
+
+    busy = bool(lock_busy or connect_in_flight)
+    active_op = 'connect' if connect_in_flight else (_busy_operation if lock_busy else None)
 
     proxy_config_error: Optional[str] = None
     try:
@@ -1735,6 +2043,11 @@ async def health(
         'status': 'running',
         'serviceAvailable': True,
         'busy': busy,
+        'connectInFlight': connect_in_flight,
+        'busyOperation': active_op,
+        'sessionGeneration': _session_generation,
+        'lastConnectStage': _last_connect_stage,
+        'lastConnectDurationMs': _last_connect_duration_ms,
         'authenticated': bool(connected),
         'connected': verified_connected,
         'mode': confirmed_mode,
@@ -1822,6 +2135,11 @@ async def network_check(
         'brokerSession': {
             'authenticated': alive_now,
             'connected': alive_now and (_requested_mode != 'REAL' or _mode_verified),
+            'connectInFlight': _inflight_connect is not None,
+            'busyOperation': 'connect' if _inflight_connect is not None else _busy_operation,
+            'sessionGeneration': _session_generation,
+            'lastConnectStage': _last_connect_stage,
+            'lastConnectDurationMs': _last_connect_duration_ms,
             'mode': _confirmed_mode if alive_now else _requested_mode,
             'modeVerified': bool(_mode_verified) if alive_now else False,
             'candleRetrievalReady': bool(alive_now and (_requested_mode != 'REAL' or _mode_verified)),
@@ -1852,15 +2170,18 @@ def connect_route(
         x_iq_mode=x_iq_mode,
         query_mode=mode,
     )
-    with _bounded_lock():
-        client = connect(
-            email=body.email if body else None,
-            password=body.password if body else None,
-            target_mode=target_mode,
-        )
+    client = connect(
+        email=body.email if body else None,
+        password=body.password if body else None,
+        target_mode=target_mode,
+    )
+    with _bounded_lock(op_name='connect_verify'):
         _requested_mode = target_mode
         is_connected = _is_client_alive(client)
-        confirmed_mode, mode_verified = _ensure_balance_mode(client, target_mode)
+        if is_connected and _confirmed_mode == target_mode and _mode_verified:
+            confirmed_mode, mode_verified = _confirmed_mode, True
+        else:
+            confirmed_mode, mode_verified = _ensure_balance_mode(client, target_mode)
 
         if target_mode == 'REAL' and not mode_verified:
             return {
@@ -1895,8 +2216,8 @@ def account(
 ):
     _check_auth(x_connector_token)
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    with _bounded_lock():
-        client = connect(target_mode=target_mode)
+    client = connect(target_mode=target_mode)
+    with _bounded_lock(op_name='account'):
         confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
         balance_val = _fetch_balance_safe(client, target_mode)
         return {
@@ -1921,8 +2242,8 @@ def balance(
 ):
     _check_auth(x_connector_token)
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    with _bounded_lock():
-        client = connect(target_mode=target_mode)
+    client = connect(target_mode=target_mode)
+    with _bounded_lock(op_name='balance'):
         confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
         balance_val = _fetch_balance_safe(client, target_mode)
         return {
@@ -1940,8 +2261,8 @@ def balance(
 @app.get('/assets')
 def assets(x_connector_token: Optional[str] = Header(default=None)):
     _check_auth(x_connector_token)
-    with _bounded_lock():
-        client = connect()
+    client = connect()
+    with _bounded_lock(op_name='assets'):
         try:
             open_time = _run_with_timeout(client.get_all_open_time, _ASSETS_TIMEOUT, 'get_all_open_time')
             available = []
@@ -1972,8 +2293,8 @@ def latest_price(
     clean = symbol.strip().upper().replace('/', '')
     if not clean or len(clean) < 3 or len(clean) > 25:
         raise HTTPException(400, 'Invalid symbol format.')
-    with _bounded_lock():
-        client = connect(target_mode=target_mode)
+    client = connect(target_mode=target_mode)
+    with _bounded_lock(op_name='price'):
         confirmed_mode, _ = _require_verified_mode(client, target_mode)
         rows = _fetch_candles_safe(client, clean, 60, 2, target_mode)
         if not isinstance(rows, list) or len(rows) == 0:
@@ -2007,8 +2328,8 @@ def candles(
     global _last_candle_check
     _check_auth(x_connector_token)
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    with _bounded_lock():
-        client = connect(target_mode=target_mode)
+    client = connect(target_mode=target_mode)
+    with _bounded_lock(op_name='candles'):
         confirmed_mode, _ = _require_verified_mode(client, target_mode)
         rows = _fetch_candles_safe(client, query.symbol, query.interval, query.count, target_mode)
         normalized = [b for b in (_normalize_candle_bar(c) for c in rows) if b is not None]
@@ -2048,8 +2369,8 @@ def history(
 ):
     _check_auth(x_connector_token)
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    with _bounded_lock():
-        client = connect(target_mode=target_mode)
+    client = connect(target_mode=target_mode)
+    with _bounded_lock(op_name='history'):
         confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
         try:
             if hasattr(client, 'get_optioninfo_v2'):
@@ -2100,8 +2421,8 @@ def order_locked(x_connector_token: Optional[str] = Header(default=None)):
 def disconnect(x_connector_token: Optional[str] = Header(default=None)):
     _check_auth(x_connector_token)
     global _requested_mode, _confirmed_mode
-    with _bounded_lock():
-        _invalidate_client()
+    with _bounded_lock(op_name='disconnect'):
+        _invalidate_client(cancel_inflight=True)
         _requested_mode = 'PRACTICE'
         _confirmed_mode = 'PRACTICE'
     return {'connected': False}

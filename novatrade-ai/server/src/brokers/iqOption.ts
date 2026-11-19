@@ -136,6 +136,21 @@ export class IQOptionAdapter implements BrokerAdapter {
   readonly brokerId = 'iq_option' as const;
   readonly brokerName = 'IQ Option';
 
+  private readonly inflightConnect = new Map<
+    string,
+    Promise<{
+      connected: boolean;
+      accountType: string | null;
+      balance: number | null;
+      equity: number | null;
+      currency: string | null;
+      externalAccountId: string | null;
+      message: string;
+    }>
+  >();
+
+  private readonly inflightStatus = new Map<string, Promise<BrokerStatusSnapshot>>();
+
   private getConfig(ctx?: BrokerAccountContext): ParsedIqConnectorConfig {
     const url = ctx?.credentials.bridgeUrl || process.env.IQ_CONNECTOR_URL || '';
     const token = ctx?.credentials.bridgeToken || process.env.IQ_CONNECTOR_TOKEN || '';
@@ -162,8 +177,13 @@ export class IQOptionAdapter implements BrokerAdapter {
       throw new Error(cfg.warnings[0] || 'IQ_CONNECTOR_URL is invalid.');
     }
 
-    const maxAttempts = 3;
-    const timeoutMs = path === '/health' ? 12000 : 20000;
+    const isHealth = path === '/health';
+    const isConnect = path === '/connect';
+    const maxAttempts = 2;
+    // Align /connect client timeout (28s) above the connector's bounded connect+mode budget (~23s)
+    // so Node does not abort and pile up duplicate handshakes while the connector is still finishing.
+    const timeoutMs = isHealth ? 10000 : isConnect ? 28000 : 18000;
+    const baseBackoffMs = isConnect ? 2000 : 1200;
     let lastErr: unknown = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -184,12 +204,23 @@ export class IQOptionAdapter implements BrokerAdapter {
         if (looksHtml) {
           if (res.status === 502 || res.status === 503 || res.status === 504) {
             if (attempt < maxAttempts) {
-              await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+              await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
               continue;
             }
-            throw new Error(`IQ Option connector gateway returned HTTP ${res.status} HTML (service cold start or upstream timeout).`);
+            const htmlErr = new Error(
+              `IQ Option connector gateway returned HTTP ${res.status} HTML (service cold start or upstream timeout).`
+            ) as Error & { status?: number; nonRetryable?: boolean };
+            htmlErr.status = res.status;
+            htmlErr.nonRetryable = true;
+            throw htmlErr;
           }
-          throw new Error(`IQ Option connector returned an unexpected HTML response (HTTP ${res.status}).`);
+          const htmlErr = new Error(`IQ Option connector returned an unexpected HTML response (HTTP ${res.status}).`) as Error & {
+            status?: number;
+            nonRetryable?: boolean;
+          };
+          htmlErr.status = res.status;
+          htmlErr.nonRetryable = true;
+          throw htmlErr;
         }
 
         let json: Record<string, unknown> = {};
@@ -202,39 +233,56 @@ export class IQOptionAdapter implements BrokerAdapter {
           } catch {
             if (!res.ok) {
               if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
-                await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
                 continue;
               }
-              throw new Error(`IQ Option connector HTTP ${res.status}.`);
+              const parseErr = new Error(`IQ Option connector HTTP ${res.status}.`) as Error & {
+                status?: number;
+                nonRetryable?: boolean;
+              };
+              parseErr.status = res.status;
+              parseErr.nonRetryable = true;
+              throw parseErr;
             }
             throw new Error('IQ Option connector returned a non-JSON response.');
           }
         }
         if (!res.ok) {
           const msg = String(json.detail || json.error || `Connector HTTP ${res.status}`);
-          if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
-            await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+          // Retry once on transient 502/503 (e.g. cold start or momentary busy lock), but do not blindly retry 504 on /connect
+          const retryableStatus = isConnect ? res.status === 502 || res.status === 503 : res.status === 502 || res.status === 503 || res.status === 504;
+          if (retryableStatus && attempt < maxAttempts) {
+            await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
             continue;
           }
           const httpErr = new Error(msg) as Error & { status?: number; nonRetryable?: boolean };
           httpErr.status = res.status;
-          httpErr.nonRetryable = res.status >= 400 && res.status < 500;
+          httpErr.nonRetryable = true;
           throw httpErr;
         }
         return json as T;
       } catch (err) {
         lastErr = err;
-        const tagged = err as Error & { nonRetryable?: boolean };
+        const tagged = err as Error & { nonRetryable?: boolean; name?: string };
         if (tagged?.nonRetryable) {
           throw err;
         }
         const msg = err instanceof Error ? err.message : String(err);
+        const isClientTimeout =
+          tagged?.name === 'TimeoutError' ||
+          tagged?.name === 'AbortError' ||
+          /aborted due to timeout|operation was aborted/i.test(msg);
+        if (isConnect && isClientTimeout) {
+          throw new Error(
+            `IQ Option connector timed out during ${path} after ${Math.round(timeoutMs / 1000)}s (broker handshake did not complete in time).`
+          );
+        }
         const isTransient = /timeout|timed out|abort|econnreset|etimedout|econnrefused|fetch failed|gateway returned http 50[234]|502|503|504/i.test(msg);
         if (!isTransient) {
           throw err;
         }
         if (attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+          await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
           continue;
         }
       }
@@ -292,6 +340,22 @@ export class IQOptionAdapter implements BrokerAdapter {
   }
 
   async getStatus(ctx?: BrokerAccountContext): Promise<BrokerStatusSnapshot> {
+    const cfg = this.getConfig(ctx);
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
+    const key = `${cfg.url || 'unconfigured'}:${requestedMode}`;
+    const existing = this.inflightStatus.get(key);
+    if (existing) return existing;
+
+    const promise = this.getStatusInternal(ctx).finally(() => {
+      if (this.inflightStatus.get(key) === promise) {
+        this.inflightStatus.delete(key);
+      }
+    });
+    this.inflightStatus.set(key, promise);
+    return promise;
+  }
+
+  private async getStatusInternal(ctx?: BrokerAccountContext): Promise<BrokerStatusSnapshot> {
     const caps = await this.getCapabilities(ctx);
     const cfg = this.getConfig(ctx);
     const checkedAt = new Date().toISOString();
@@ -333,6 +397,8 @@ export class IQOptionAdapter implements BrokerAdapter {
       const health = await this.requestConnector<{
         connected?: boolean;
         authenticated?: boolean;
+        busy?: boolean;
+        connectInFlight?: boolean;
         mode?: string;
         accountType?: string;
         modeVerified?: boolean;
@@ -347,7 +413,7 @@ export class IQOptionAdapter implements BrokerAdapter {
       let modeVerificationError: string | null = null;
       let accountSyncError: string | null = null;
 
-      if (health.connected && health.authenticated !== false) {
+      if (health.connected && health.authenticated !== false && !health.connectInFlight) {
         try {
           const acct = await this.requestConnector<{
             accountType?: string;
@@ -416,9 +482,11 @@ export class IQOptionAdapter implements BrokerAdapter {
             ? accountSyncError
               ? `Connected to IQ Option connector (${accountType || requestedMode} read-only, ${latencyMs}ms), but balance is unavailable (${accountSyncError}).${warningSuffix}`
               : `Connected to IQ Option connector (${accountType || requestedMode} read-only, ${latencyMs}ms). Order execution locked.${warningSuffix}`
-            : health.credentialsConfigured
-              ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || `click Connect to initiate ${requestedMode} session`}).${warningSuffix}`
-              : `IQ connector reachable (${latencyMs}ms), but IQ_EMAIL / IQ_PASSWORD are not set on the connector host.${warningSuffix}`,
+            : health.connectInFlight
+              ? `IQ connector reachable (${latencyMs}ms); establishing ${requestedMode} broker session, please wait...${warningSuffix}`
+              : health.credentialsConfigured
+                ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || `click Connect to initiate ${requestedMode} session`}).${warningSuffix}`
+                : `IQ connector reachable (${latencyMs}ms), but IQ_EMAIL / IQ_PASSWORD are not set on the connector host.${warningSuffix}`,
         limitations: IQ_LIMITATIONS,
         diagnostics,
       };
@@ -449,6 +517,22 @@ export class IQOptionAdapter implements BrokerAdapter {
   }
 
   async connect(ctx?: BrokerAccountContext) {
+    const cfg = this.getConfig(ctx);
+    const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
+    const key = `${cfg.url || 'unconfigured'}:${requestedMode}:${(ctx?.credentials.email || 'env').trim().toLowerCase()}`;
+    const existing = this.inflightConnect.get(key);
+    if (existing) return existing;
+
+    const promise = this.connectInternal(ctx).finally(() => {
+      if (this.inflightConnect.get(key) === promise) {
+        this.inflightConnect.delete(key);
+      }
+    });
+    this.inflightConnect.set(key, promise);
+    return promise;
+  }
+
+  private async connectInternal(ctx?: BrokerAccountContext) {
     const requestedMode = ctx?.environment === 'real' ? 'REAL' : 'PRACTICE';
     const creds = ctx?.credentials || {};
     const res = await this.requestConnector<{

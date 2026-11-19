@@ -19,6 +19,7 @@ import type {
   BrokerOrderValidationResult,
   BrokerPosition,
   BrokerQuote,
+  BrokerStatusSnapshot,
   BrokerTradeHistoryResult,
   InstrumentCompatibilityResult,
   ManagedBrokerAccountPublic,
@@ -137,6 +138,7 @@ export class BrokerConnectionManager {
   private readonly stores = new Map<string, UserBrokerStore>();
   private readonly hydratedUsers = new Set<string>();
   private readonly pendingHydrations = new Map<string, Promise<UserBrokerStore>>();
+  private readonly inflightAccountOps = new Map<string, Promise<ManagedBrokerAccountPublic>>();
   private readonly vaultKey: Buffer;
   private lastPersistenceError: string | null = null;
   private vaultTableUnavailable = false;
@@ -1103,6 +1105,20 @@ export class BrokerConnectionManager {
   }
 
   async connectAccount(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
+    const opKey = `${userId}:${accountId}:connect`;
+    const existing = this.inflightAccountOps.get(opKey);
+    if (existing) return existing;
+
+    const promise = this.connectAccountInternal(userId, accountId).finally(() => {
+      if (this.inflightAccountOps.get(opKey) === promise) {
+        this.inflightAccountOps.delete(opKey);
+      }
+    });
+    this.inflightAccountOps.set(opKey, promise);
+    return promise;
+  }
+
+  private async connectAccountInternal(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
     const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) {
@@ -1139,7 +1155,40 @@ export class BrokerConnectionManager {
       this.saveStore(userId, store, false);
       await this.persistStoreToSupabase(userId, store);
 
-      const statusSnap = await adapter.getStatus(this.toContext(acct));
+      let statusSnap: BrokerStatusSnapshot;
+      if (acct.brokerId === 'iq_option' && res.connected) {
+        // Avoid redundant immediate /health + /account round-trip right after /connect already verified session & balance
+        const caps = await adapter.getCapabilities(ctx);
+        statusSnap = {
+          ...caps,
+          connected: true,
+          executionEnabled: false,
+          accountType: res.accountType,
+          balance: validBalance,
+          equity: validEquity,
+          currency: res.currency || acct.currency,
+          connectorUrlConfigured: true,
+          lastCheckedAt: now,
+          message: res.message,
+          limitations: [],
+          diagnostics: {
+            configured: true,
+            urlValid: true,
+            hadVarNamePrefix: false,
+            isLocalhost: false,
+            reachable: true,
+            authenticated: true,
+            credentialsConfigured: true,
+            tokenConfigured: Boolean((ctx.credentials.bridgeToken || process.env.IQ_CONNECTOR_TOKEN || '').trim()),
+            latencyMs: null,
+            targetHost: null,
+            warnings: [],
+            lastConnectorError: null,
+          },
+        };
+      } else {
+        statusSnap = await adapter.getStatus(this.toContext(acct));
+      }
       void this.syncBrokerSummaryToSupabase(acct, statusSnap);
       const publicAccount = await this.toPublicAccount(acct, statusSnap.diagnostics, statusSnap);
       if (!res.connected) {
@@ -1173,7 +1222,9 @@ export class BrokerConnectionManager {
           lower.includes('enotfound') ||
           lower.includes('fetch failed') ||
           lower.includes('timeout') ||
+          lower.includes('timed out') ||
           lower.includes('aborted') ||
+          lower.includes('busy with an upstream broker operation') ||
           lower.includes('unexpected html response') ||
           lower.includes('non-json response') ||
           lower.includes('http 5'));
@@ -1228,6 +1279,20 @@ export class BrokerConnectionManager {
   }
 
   async checkHealthAndSyncBalance(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
+    const opKey = `${userId}:${accountId}:sync`;
+    const existing = this.inflightAccountOps.get(opKey);
+    if (existing) return existing;
+
+    const promise = this.checkHealthAndSyncBalanceInternal(userId, accountId).finally(() => {
+      if (this.inflightAccountOps.get(opKey) === promise) {
+        this.inflightAccountOps.delete(opKey);
+      }
+    });
+    this.inflightAccountOps.set(opKey, promise);
+    return promise;
+  }
+
+  private async checkHealthAndSyncBalanceInternal(userId: string, accountId: string): Promise<ManagedBrokerAccountPublic> {
     const store = await this.ensureHydrated(userId);
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');

@@ -158,6 +158,11 @@ class FakeIqClient:
 class TestIqConnectorModes(unittest.TestCase):
     def setUp(self):
         app._client = None
+        app._session_generation = 0
+        app._inflight_connect = None
+        app._busy_operation = None
+        app._last_connect_stage = None
+        app._last_connect_duration_ms = None
         app._requested_mode = "PRACTICE"
         app._confirmed_mode = "PRACTICE"
         app._mode_verified = False
@@ -1748,6 +1753,341 @@ class TestIqConnectorModes(unittest.TestCase):
         with self.assertRaises(app.HTTPException) as bad_p_ctx:
             app.latest_price("EURUSD", mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
         self.assertEqual(bad_p_ctx.exception.status_code, 502)
+
+    def test_simultaneous_connect_requests_coalesce_via_single_flight_and_slow_ws(self):
+        """Simulate a slow WebSocket connect + 5 simultaneous POST /connect calls:
+        only ONE upstream IQ_Option.connect() runs, /health stays non-blocking and reports connectInFlight=True,
+        and all 5 callers succeed cleanly without HTTP 503 busy errors.
+        """
+        saved_modules = {
+            k: sys.modules.get(k)
+            for k in ("iqoptionapi", "iqoptionapi.stable_api", "iqoptionapi.global_value")
+        }
+        orig_patched = app._iqoptionapi_patched
+        orig_connect_timeout = app._CONNECT_TIMEOUT
+        orig_lock_timeout = app._LOCK_ACQUIRE_TIMEOUT
+        app._iqoptionapi_patched = True
+        app._CONNECT_TIMEOUT = 3.0
+        app._LOCK_ACQUIRE_TIMEOUT = 0.08  # Much shorter than slow connect delay (0.28s)!
+
+        connect_calls = []
+        connect_started = threading.Event()
+        release_connect = threading.Event()
+
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_gv.check_websocket_if_connect = 1
+
+        class SlowFakeIQOption(FakeIqClient):
+            def __init__(self, email, password):
+                super().__init__(initial_mode="PRACTICE")
+                self.email = email
+                self.password = password
+
+            def connect(self):
+                connect_calls.append(time.monotonic())
+                connect_started.set()
+                release_connect.wait(timeout=2.0)
+                return True, None
+
+        m_stable = ModuleType("iqoptionapi.stable_api")
+        m_stable.IQ_Option = SlowFakeIQOption
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.stable_api"] = m_stable
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                body = app.ConnectBody(email="trader@example.com", password="secret-pass", mode="PRACTICE")
+                res = app.connect_route(body=body, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+                results.append(res)
+            except BaseException as exc:
+                errors.append(exc)
+
+        try:
+            threads = [threading.Thread(target=worker) for _ in range(5)]
+            for t in threads:
+                t.start()
+
+            self.assertTrue(connect_started.wait(timeout=1.0))
+            # Allow all 5 threads to reach single-flight barrier
+            time.sleep(0.15)
+            # While slow connect is in flight (> _LOCK_ACQUIRE_TIMEOUT), /health stays non-blocking
+            t0 = time.monotonic()
+            h = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertLess(time.monotonic() - t0, 0.2)
+            self.assertTrue(h["connectInFlight"])
+            self.assertTrue(h["busy"])
+            self.assertEqual(h["busyOperation"], "connect")
+
+            release_connect.set()
+            for t in threads:
+                t.join(timeout=3.0)
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 5)
+            self.assertEqual(len(connect_calls), 1)
+            for res in results:
+                self.assertTrue(res["connected"])
+                self.assertEqual(res["mode"], "PRACTICE")
+                self.assertTrue(res["modeVerified"])
+                self.assertFalse(res["orderExecutionSupported"])
+                self.assertFalse(res["realTradingEnabled"])
+
+            # After completion, connector is idle and connected
+            h_after = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertFalse(h_after["busy"])
+            self.assertFalse(h_after["connectInFlight"])
+            self.assertTrue(h_after["connected"])
+            self.assertEqual(h_after["lastConnectStage"], "connected")
+        finally:
+            release_connect.set()
+            app._iqoptionapi_patched = orig_patched
+            app._CONNECT_TIMEOUT = orig_connect_timeout
+            app._LOCK_ACQUIRE_TIMEOUT = orig_lock_timeout
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_connect_timeout_closes_local_client_fences_abandoned_worker_and_clears_busy(self):
+        """Simulate a hanging connect() that times out:
+        1. Returns HTTP 504 promptly.
+        2. Closes the local client instance so the abandoned thread unblocks.
+        3. Connector is NOT left permanently busy (connectInFlight=False, busy=False).
+        4. Subsequent connect() establishes a healthy session and the late-exiting abandoned worker
+           CANNOT overwrite app._client or reset global_value.check_websocket_if_connect to 0.
+        """
+        saved_modules = {
+            k: sys.modules.get(k)
+            for k in ("iqoptionapi", "iqoptionapi.stable_api", "iqoptionapi.global_value")
+        }
+        orig_patched = app._iqoptionapi_patched
+        orig_connect_timeout = app._CONNECT_TIMEOUT
+        app._iqoptionapi_patched = True
+        app._CONNECT_TIMEOUT = 0.12
+
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_gv.check_websocket_if_connect = 0
+
+        attempt_counter = {"n": 0}
+        first_client_closed = threading.Event()
+        release_abandoned_worker = threading.Event()
+        abandoned_worker_saw_cancel = []
+        created_clients = []
+
+        class ControllableIQOption(FakeIqClient):
+            def __init__(self, email, password):
+                super().__init__(initial_mode="PRACTICE")
+                self.email = email
+                self.password = password
+                attempt_counter["n"] += 1
+                self.attempt_num = attempt_counter["n"]
+                created_clients.append(self)
+
+            def close(self):
+                if self.attempt_num == 1:
+                    first_client_closed.set()
+
+            def connect(self):
+                if self.attempt_num == 1:
+                    # Stay blocked past _CONNECT_TIMEOUT until explicitly released AFTER session 2 connects
+                    release_abandoned_worker.wait(timeout=3.0)
+                    abandoned_worker_saw_cancel.append(app._is_worker_cancelled())
+                    # Even if abandoned worker returns (True, None) late, it MUST be fenced out
+                    return True, None
+                m_gv.check_websocket_if_connect = 1
+                return True, None
+
+        m_stable = ModuleType("iqoptionapi.stable_api")
+        m_stable.IQ_Option = ControllableIQOption
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.stable_api"] = m_stable
+
+        try:
+            body = app.ConnectBody(email="trader@example.com", password="secret-pass", mode="PRACTICE")
+            with self.assertRaises(app.HTTPException) as ctx:
+                app.connect_route(body=body, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(ctx.exception.status_code, 504)
+
+            # Local client from timed-out attempt MUST have been closed
+            self.assertTrue(first_client_closed.is_set())
+
+            # Connector MUST NOT be stuck busy after failed/timed-out request
+            h_failed = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertFalse(h_failed["busy"])
+            self.assertFalse(h_failed["connectInFlight"])
+            self.assertFalse(h_failed["connected"])
+            self.assertEqual(h_failed["lastConnectStage"], "timeout")
+
+            # Now establish a new healthy session (attempt 2) while worker 1 is still alive!
+            app._CONNECT_TIMEOUT = 2.0
+            res2 = app.connect_route(body=body, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertTrue(res2["connected"])
+            active_client = app._client
+            self.assertIs(active_client, created_clients[1])
+            self.assertEqual(m_gv.check_websocket_if_connect, 1)
+
+            # Release abandoned worker 1 and confirm it saw cancellation and did NOT corrupt session 2
+            release_abandoned_worker.set()
+            time.sleep(0.1)
+            self.assertEqual(abandoned_worker_saw_cancel, [True])
+            self.assertIs(app._client, active_client)
+            self.assertEqual(m_gv.check_websocket_if_connect, 1)
+            h_ok = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertTrue(h_ok["connected"])
+            self.assertFalse(h_ok["busy"])
+        finally:
+            release_abandoned_worker.set()
+            app._iqoptionapi_patched = orig_patched
+            app._CONNECT_TIMEOUT = orig_connect_timeout
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_abandoned_api_close_does_not_reset_newer_session_websocket_flag(self):
+        """Ensure patched IQOptionAPI.close() called from a cancelled worker does NOT reset global_value.check_websocket_if_connect."""
+        api_inst, _records, cleanup = self._with_patched_ws_stubs(lambda _u, gv, _w: setattr(gv, "check_websocket_if_connect", 1))
+        try:
+            import iqoptionapi.global_value as m_gv
+            m_gv.check_websocket_if_connect = 1
+            cancel_ev = threading.Event()
+            cancel_ev.set()
+
+            def run_cancelled_close():
+                app._worker_ctx.cancel_event = cancel_ev
+                app._worker_ctx.generation = 1
+                try:
+                    api_inst.close()
+                finally:
+                    app._worker_ctx.cancel_event = None
+                    app._worker_ctx.generation = None
+
+            t = threading.Thread(target=run_cancelled_close)
+            t.start()
+            t.join(timeout=1.0)
+            # Active session's WebSocket flag MUST remain 1
+            self.assertEqual(m_gv.check_websocket_if_connect, 1)
+        finally:
+            cleanup()
+
+    def test_repeated_health_and_balance_requests_succeed_without_busy_starvation(self):
+        """Simulate rapid repeated Health & Balance requests concurrently and verify zero 503 busy errors."""
+        app._client = FakeIqClient(initial_mode="PRACTICE")
+        app._confirmed_mode = "PRACTICE"
+        app._mode_verified = True
+        errors = []
+        balances = []
+
+        def hit_balance():
+            try:
+                res = app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+                balances.append(res["balance"])
+            except BaseException as exc:
+                errors.append(exc)
+
+        def hit_health():
+            try:
+                res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+                self.assertEqual(res["status"], "running")
+                self.assertTrue(res["connected"])
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = []
+        for _ in range(10):
+            threads.append(threading.Thread(target=hit_balance))
+            threads.append(threading.Thread(target=hit_health))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=3.0)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(balances), 10)
+        self.assertTrue(all(b == 10000.0 for b in balances))
+
+    def test_reconnect_after_disconnect_replaces_stale_session_cleanly(self):
+        """Verify force_reconnect / dead-client reconnect replaces stale session without leaving stale references or busy state."""
+        saved_modules = {
+            k: sys.modules.get(k)
+            for k in ("iqoptionapi", "iqoptionapi.stable_api", "iqoptionapi.global_value")
+        }
+        orig_patched = app._iqoptionapi_patched
+        app._iqoptionapi_patched = True
+
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_gv.check_websocket_if_connect = 1
+
+        instances = []
+
+        class ReconnectableClient(FakeIqClient):
+            def __init__(self, email, password):
+                super().__init__(initial_mode="PRACTICE")
+                self.email = email
+                self.password = password
+                self.alive = True
+                self.closed = False
+                instances.append(self)
+
+            def check_connect(self):
+                return self.alive
+
+            def close(self):
+                self.closed = True
+                self.alive = False
+
+            def connect(self):
+                self.alive = True
+                return True, None
+
+        m_stable = ModuleType("iqoptionapi.stable_api")
+        m_stable.IQ_Option = ReconnectableClient
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.stable_api"] = m_stable
+
+        try:
+            c1 = app.connect(email="trader@example.com", password="pw", target_mode="PRACTICE")
+            gen1 = app._session_generation
+            self.assertIs(c1, instances[0])
+            self.assertTrue(app._is_client_alive(c1))
+
+            # Simulate socket drop on c1
+            c1.alive = False
+            c2 = app._try_reconnect_session(c1, "PRACTICE")
+            self.assertIsNotNone(c2)
+            self.assertIsNot(c2, c1)
+            self.assertIs(app._client, c2)
+            self.assertTrue(c1.closed)
+            self.assertGreater(app._session_generation, gen1)
+            self.assertTrue(app._is_client_alive(c2))
+            bal = app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(bal["balance"], 10000.0)
+            self.assertFalse(bal["orderExecutionSupported"])
+            self.assertFalse(bal["realTradingEnabled"])
+        finally:
+            app._iqoptionapi_patched = orig_patched
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
 
 
 if __name__ == "__main__":
