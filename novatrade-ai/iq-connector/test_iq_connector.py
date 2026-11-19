@@ -1,7 +1,10 @@
 """Unit tests for novatrade-ai/iq-connector/app.py.
 Tests mode normalization, PRACTICE/REAL balance mode verification, fail-closed behavior, and order locking.
 """
+import asyncio
 import sys
+import threading
+import time
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -155,6 +158,8 @@ class TestIqConnectorModes(unittest.TestCase):
     def setUp(self):
         app._client = None
         app._requested_mode = "PRACTICE"
+        app._confirmed_mode = "PRACTICE"
+        app._mode_verified = False
         app._last_error = None
         app._connected_at = None
         app._opcodes_updated = False
@@ -263,8 +268,9 @@ class TestIqConnectorModes(unittest.TestCase):
 
     def test_health_always_reports_practice_and_execution_locked(self):
         app._client = FakeIqClient(initial_mode="PRACTICE")
-        res = app.health(mode=None, x_iq_mode="PRACTICE")
+        res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
         self.assertEqual(res["status"], "running")
+        self.assertFalse(res["busy"])
         self.assertTrue(res["connected"])
         self.assertEqual(res["mode"], "PRACTICE")
         self.assertFalse(res["orderExecutionSupported"])
@@ -321,6 +327,273 @@ class TestIqConnectorModes(unittest.TestCase):
                 sys.modules.pop("iqoptionapi.constants", None)
             else:
                 sys.modules["iqoptionapi.constants"] = orig_iq_const
+
+    def test_endpoints_remain_responsive_under_lock_contention(self):
+        app._client = FakeIqClient(initial_mode="PRACTICE")
+        app._confirmed_mode = "PRACTICE"
+        app._mode_verified = True
+        orig_lock_timeout = app._LOCK_ACQUIRE_TIMEOUT
+        app._LOCK_ACQUIRE_TIMEOUT = 0.05
+
+        lock_acquired = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_lock():
+            app._lock.acquire()
+            try:
+                lock_acquired.set()
+                release_lock.wait(timeout=2.0)
+            finally:
+                app._lock.release()
+
+        holder = threading.Thread(target=hold_lock, daemon=True)
+        holder.start()
+        self.assertTrue(lock_acquired.wait(timeout=1.0))
+        try:
+            # /health must return immediately (<0.2s) with busy=True even while _lock is held
+            t0 = time.monotonic()
+            health_res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            elapsed_health = time.monotonic() - t0
+            self.assertLess(elapsed_health, 0.25)
+            self.assertEqual(health_res["status"], "running")
+            self.assertTrue(health_res["busy"])
+            self.assertFalse(health_res["orderExecutionSupported"])
+            self.assertFalse(health_res["realTradingEnabled"])
+
+            # /balance, /price, and /candles must fail fast with HTTP 503 instead of hanging
+            with self.assertRaises(app.HTTPException) as bal_ctx:
+                app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(bal_ctx.exception.status_code, 503)
+
+            with self.assertRaises(app.HTTPException) as price_ctx:
+                app.latest_price("EURUSD", mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(price_ctx.exception.status_code, 503)
+
+            q = app.CandlesQuery(symbol="EURUSD", interval=60, count=2)
+            with self.assertRaises(app.HTTPException) as candle_ctx:
+                app.candles(q, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(candle_ctx.exception.status_code, 503)
+        finally:
+            release_lock.set()
+            holder.join(timeout=1.0)
+            app._LOCK_ACQUIRE_TIMEOUT = orig_lock_timeout
+
+        # After lock release, all endpoints recover immediately
+        bal_ok = app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+        self.assertEqual(bal_ok["balance"], 10000.0)
+        self.assertFalse(bal_ok["orderExecutionSupported"])
+        self.assertFalse(bal_ok["realTradingEnabled"])
+
+    def test_hanging_balance_and_candles_timeout_and_release_lock(self):
+        release_blocker = threading.Event()
+
+        class HangingClient(FakeIqClient):
+            def get_balance(self):
+                release_blocker.wait(timeout=3.0)
+                return 10000.0
+
+            def get_candles(self, symbol, interval, count, endtime):
+                release_blocker.wait(timeout=3.0)
+                return []
+
+        orig_bal_timeout = app._BALANCE_TIMEOUT
+        orig_candle_timeout = app._CANDLES_TIMEOUT
+        app._BALANCE_TIMEOUT = 0.08
+        app._CANDLES_TIMEOUT = 0.08
+        app._client = HangingClient(initial_mode="PRACTICE")
+        try:
+            t0 = time.monotonic()
+            with self.assertRaises(app.HTTPException) as bal_ctx:
+                app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(bal_ctx.exception.status_code, 504)
+            self.assertLess(time.monotonic() - t0, 1.0)
+
+            t1 = time.monotonic()
+            with self.assertRaises(app.HTTPException) as price_ctx:
+                app.latest_price("EURUSD", mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(price_ctx.exception.status_code, 504)
+            self.assertLess(time.monotonic() - t1, 1.0)
+
+            t2 = time.monotonic()
+            q = app.CandlesQuery(symbol="EURUSD", interval=60, count=2)
+            with self.assertRaises(app.HTTPException) as candle_ctx:
+                app.candles(q, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(candle_ctx.exception.status_code, 504)
+            self.assertLess(time.monotonic() - t2, 1.0)
+
+            # Confirm _lock is guaranteed released and /health responds immediately
+            other_acquired = []
+
+            def probe_lock():
+                got = app._lock.acquire(blocking=False)
+                if got:
+                    app._lock.release()
+                other_acquired.append(got)
+
+            t = threading.Thread(target=probe_lock)
+            t.start()
+            t.join(timeout=1.0)
+            self.assertEqual(other_acquired, [True])
+
+            health_res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertEqual(health_res["status"], "running")
+            self.assertFalse(health_res["busy"])
+        finally:
+            release_blocker.set()
+            app._BALANCE_TIMEOUT = orig_bal_timeout
+            app._CANDLES_TIMEOUT = orig_candle_timeout
+
+    def test_dead_websocket_thread_detected_and_close_is_bounded(self):
+        class DeadWsApi:
+            def websocket_alive(self):
+                return False
+
+            class _WsClient:
+                class _Wss:
+                    def close(self):
+                        pass
+                wss = _Wss()
+
+            websocket_client = _WsClient()
+
+            class _HangingThread:
+                def join(self, timeout=None):
+                    if timeout is None:
+                        time.sleep(5.0)
+                    else:
+                        time.sleep(min(timeout, 0.02))
+
+            websocket_thread = _HangingThread()
+
+        class DeadWsClient(FakeIqClient):
+            def __init__(self):
+                super().__init__(initial_mode="PRACTICE")
+                self.api = DeadWsApi()
+
+        dead_client = DeadWsClient()
+        app._client = dead_client
+        self.assertFalse(app._is_client_alive(dead_client))
+
+        health_res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+        self.assertEqual(health_res["status"], "running")
+        self.assertFalse(health_res["connected"])
+
+        t0 = time.monotonic()
+        app._safe_close_client(dead_client, timeout_seconds=0.05)
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_patch_iqoptionapi_prevents_ssl_lock_leaks_and_untimed_close(self):
+        saved_modules = {}
+        module_names = [
+            "requests",
+            "iqoptionapi",
+            "iqoptionapi.global_value",
+            "iqoptionapi.api",
+            "iqoptionapi.stable_api",
+            "iqoptionapi.ws",
+            "iqoptionapi.ws.client",
+        ]
+        for name in module_names:
+            saved_modules[name] = sys.modules.get(name)
+
+        orig_patched = app._iqoptionapi_patched
+        app._iqoptionapi_patched = False
+
+        try:
+            m_req = ModuleType("requests")
+            m_req.utils = type("U", (), {"add_dict_to_cookiejar": staticmethod(lambda *a, **k: None)})()
+
+            m_iq = ModuleType("iqoptionapi")
+            m_gv = ModuleType("iqoptionapi.global_value")
+            m_gv.ssl_Mutual_exclusion = False
+            m_gv.ssl_Mutual_exclusion_write = False
+            m_gv.check_websocket_if_connect = 1
+            m_gv.check_websocket_if_error = False
+            m_gv.websocket_error_reason = None
+            m_gv.SSID = None
+            m_gv.balance_id = None
+
+            class StubWebsocketClient:
+                def on_message(self, message):
+                    m_gv.ssl_Mutual_exclusion = True
+                    raise ValueError("Malformed frame")
+
+            class StubIQOptionAPI:
+                def __init__(self, *args, **kwargs):
+                    self.session = type("S", (), {"request": lambda *_a, **_k: None})()
+                    self.websocket_client = None
+                    self.websocket_thread = None
+
+                @property
+                def websocket(self):
+                    return self._wss
+
+            class StubIQOption:
+                def connect(self):
+                    return True, None
+
+            m_api = ModuleType("iqoptionapi.api")
+            m_api.IQOptionAPI = StubIQOptionAPI
+            m_stable = ModuleType("iqoptionapi.stable_api")
+            m_stable.IQ_Option = StubIQOption
+            m_ws = ModuleType("iqoptionapi.ws")
+            m_ws_client = ModuleType("iqoptionapi.ws.client")
+            m_ws_client.WebsocketClient = StubWebsocketClient
+
+            sys.modules["requests"] = m_req
+            sys.modules["iqoptionapi"] = m_iq
+            sys.modules["iqoptionapi.global_value"] = m_gv
+            sys.modules["iqoptionapi.api"] = m_api
+            sys.modules["iqoptionapi.stable_api"] = m_stable
+            sys.modules["iqoptionapi.ws"] = m_ws
+            sys.modules["iqoptionapi.ws.client"] = m_ws_client
+
+            app._patch_iqoptionapi()
+            self.assertTrue(app._iqoptionapi_patched)
+
+            # 1. on_message exception MUST still clear ssl_Mutual_exclusion
+            ws_client = StubWebsocketClient()
+            with self.assertRaises(ValueError):
+                ws_client.on_message("bad")
+            self.assertFalse(m_gv.ssl_Mutual_exclusion)
+
+            # 2. send_websocket_request failure MUST still clear ssl_Mutual_exclusion_write
+            api_inst = StubIQOptionAPI()
+
+            class FailingWss:
+                def send(self, _data):
+                    raise OSError("Broken pipe")
+
+                def close(self):
+                    pass
+
+            api_inst._wss = FailingWss()
+            with self.assertRaises(OSError):
+                api_inst.send_websocket_request("test", {})
+            self.assertFalse(m_gv.ssl_Mutual_exclusion_write)
+
+            # 3. close() MUST pass a finite timeout to websocket_thread.join and reset connect flag
+            join_timeouts = []
+
+            class SpyThread:
+                def join(self, timeout=None):
+                    join_timeouts.append(timeout)
+
+            api_inst.websocket_client = type("WC", (), {"wss": FailingWss()})()
+            api_inst.websocket_thread = SpyThread()
+            m_gv.check_websocket_if_connect = 1
+            api_inst.close()
+            self.assertEqual(len(join_timeouts), 1)
+            self.assertIsNotNone(join_timeouts[0])
+            self.assertGreater(join_timeouts[0], 0)
+            self.assertEqual(m_gv.check_websocket_if_connect, 0)
+        finally:
+            app._iqoptionapi_patched = orig_patched
+            for name, mod in saved_modules.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
 
 
 if __name__ == "__main__":
