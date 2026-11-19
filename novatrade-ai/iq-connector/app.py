@@ -3,22 +3,32 @@ Credentials are read from local environment variables, never accepted over HTTP 
 Supports read-only account/balance/market/history inspection in PRACTICE or REAL mode without placing orders.
 Never silently switches REAL to PRACTICE or returns PRACTICE balances under a REAL label.
 """
+import asyncio
+import base64
 import contextlib
 import json
 import logging
 import os
+import socket
 import ssl
 import threading
 import time
-from typing import Any, Callable, Optional, Tuple, TypeVar
+import urllib.parse
+from typing import Any, Callable, List, Optional, Tuple, TypeVar
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.2')
+app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.3')
+
+_WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
+_WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
+_WS_ORIGIN = 'https://iqoption.com'
+_WS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 _LOCK_ACQUIRE_TIMEOUT = float(os.environ.get('IQ_LOCK_TIMEOUT_SECONDS', '2.0'))
-_CONNECT_TIMEOUT = float(os.environ.get('IQ_CONNECT_TIMEOUT_SECONDS', '12.0'))
+_WS_CONNECT_TIMEOUT = float(os.environ.get('IQ_WS_CONNECT_TIMEOUT_SECONDS', '6.0'))
+_CONNECT_TIMEOUT = float(os.environ.get('IQ_CONNECT_TIMEOUT_SECONDS', '18.0'))
 _BALANCE_TIMEOUT = float(os.environ.get('IQ_BALANCE_TIMEOUT_SECONDS', '6.0'))
 _CANDLES_TIMEOUT = float(os.environ.get('IQ_CANDLES_TIMEOUT_SECONDS', '7.0'))
 _MODE_TIMEOUT = float(os.environ.get('IQ_MODE_TIMEOUT_SECONDS', '5.0'))
@@ -34,6 +44,8 @@ _connected_at: Optional[float] = None
 _requested_mode: str = 'PRACTICE'
 _confirmed_mode: str = 'PRACTICE'
 _mode_verified: bool = False
+_active_ws_url: Optional[str] = None
+_last_ws_diagnostics: Optional[List[dict]] = None
 _opcodes_updated: bool = False
 _iqoptionapi_patched: bool = False
 
@@ -52,7 +64,7 @@ def _sanitize_error(msg: str, extra_secrets: Tuple[Optional[str], ...] = ()) -> 
     for secret in secrets:
         if secret and secret in cleaned:
             cleaned = cleaned.replace(secret, '***')
-    return cleaned[:300]
+    return cleaned[:480]
 
 
 @app.exception_handler(Exception)
@@ -162,16 +174,209 @@ def _safe_close_client(client: Any, timeout_seconds: Optional[float] = None):
 
 
 def _invalidate_client(reason: Optional[str] = None):
-    global _client, _connected_at, _mode_verified, _opcodes_updated, _last_error
+    global _client, _connected_at, _mode_verified, _active_ws_url, _opcodes_updated, _last_error
     old_client = _client
     _client = None
     _connected_at = None
     _mode_verified = False
+    _active_ws_url = None
     _opcodes_updated = False
     if reason:
         _last_error = _sanitize_error(reason)
     if old_client is not None:
         _safe_close_client(old_client)
+
+
+def _get_ws_candidates(preferred_url: Optional[str] = None) -> List[str]:
+    """Return ordered, deduplicated WebSocket endpoints (env override -> primary -> fallback)."""
+    raw_list: List[str] = []
+    env_override = (os.environ.get('IQ_WS_URL') or '').strip()
+    if env_override:
+        raw_list.append(env_override)
+    if preferred_url and str(preferred_url).strip():
+        raw_list.append(str(preferred_url).strip())
+    raw_list.append(_WS_PRIMARY_URL)
+    raw_list.append(_WS_FALLBACK_URL)
+    deduped: List[str] = []
+    for url in raw_list:
+        if url and url not in deduped:
+            deduped.append(url)
+    return deduped
+
+
+def _probe_ws_endpoint(
+    ws_url: str,
+    timeout_seconds: Optional[float] = None,
+    include_upgrade: bool = False,
+) -> dict:
+    """Run bounded DNS -> TCP -> TLS (-> optional HTTP/1.1 WS Upgrade) diagnostics on a WebSocket URL."""
+    budget = _WS_CONNECT_TIMEOUT if timeout_seconds is None else float(timeout_seconds)
+    deadline = time.monotonic() + budget
+    parsed = urllib.parse.urlparse(ws_url)
+    scheme = (parsed.scheme or 'wss').lower()
+    host = parsed.hostname or ''
+    port = parsed.port or (443 if scheme in ('wss', 'https') else 80)
+    path = parsed.path or '/echo/websocket'
+    if parsed.query:
+        path = f'{path}?{parsed.query}'
+
+    diag: dict = {
+        'url': ws_url,
+        'host': host,
+        'port': port,
+        'ok': False,
+        'stage': 'dns',
+        'resolvedIps': [],
+        'dnsMs': None,
+        'tcpMs': None,
+        'tlsMs': None,
+        'upgradeMs': None,
+        'tlsVersion': None,
+        'httpStatus': None,
+        'error': None,
+    }
+    if not host:
+        diag['error'] = 'Invalid WebSocket URL (missing hostname).'
+        return diag
+
+    # Stage 1: DNS resolution
+    t_dns = time.monotonic()
+    try:
+        addr_infos = _run_with_timeout(
+            lambda: socket.getaddrinfo(host, port, type=socket.SOCK_STREAM),
+            max(0.2, deadline - time.monotonic()),
+            f'dns_{host}',
+        )
+        ipv4 = [info[4][0] for info in addr_infos if info[0] == socket.AF_INET]
+        ipv6 = [info[4][0] for info in addr_infos if info[0] == socket.AF_INET6]
+        ordered_ips = list(dict.fromkeys(ipv4 + ipv6))
+        diag['dnsMs'] = round((time.monotonic() - t_dns) * 1000, 1)
+        diag['resolvedIps'] = ordered_ips[:4]
+        if not ordered_ips:
+            diag['error'] = f'DNS returned no addresses for {host}.'
+            return diag
+    except TimeoutError:
+        diag['dnsMs'] = round((time.monotonic() - t_dns) * 1000, 1)
+        diag['error'] = f'DNS lookup timed out for {host} after {budget:.1f}s.'
+        return diag
+    except Exception as exc:
+        diag['dnsMs'] = round((time.monotonic() - t_dns) * 1000, 1)
+        diag['error'] = _sanitize_error(f'DNS lookup failed for {host}: {type(exc).__name__}: {exc}')
+        return diag
+
+    raw_sock: Optional[socket.socket] = None
+    active_sock: Any = None
+    try:
+        # Stage 2: TCP connect
+        diag['stage'] = 'tcp'
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            diag['error'] = f'TCP connect budget exhausted ({budget:.1f}s) before connecting to {host}:{port}.'
+            return diag
+        t_tcp = time.monotonic()
+        target_ip = ordered_ips[0]
+        try:
+            raw_sock = socket.create_connection((target_ip, port), timeout=remaining)
+            diag['tcpMs'] = round((time.monotonic() - t_tcp) * 1000, 1)
+        except socket.timeout:
+            diag['tcpMs'] = round((time.monotonic() - t_tcp) * 1000, 1)
+            diag['error'] = f'TCP connect timed out to {host} ({target_ip}:{port}) after {remaining:.1f}s.'
+            return diag
+        except Exception as exc:
+            diag['tcpMs'] = round((time.monotonic() - t_tcp) * 1000, 1)
+            diag['error'] = _sanitize_error(f'TCP connect failed to {host} ({target_ip}:{port}): {type(exc).__name__}: {exc}')
+            return diag
+
+        active_sock = raw_sock
+
+        # Stage 3: TLS handshake
+        if scheme in ('wss', 'https'):
+            diag['stage'] = 'tls'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                diag['error'] = f'TLS handshake budget exhausted ({budget:.1f}s) for {host}.'
+                return diag
+            t_tls = time.monotonic()
+            try:
+                raw_sock.settimeout(remaining)
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+                diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
+                diag['tlsVersion'] = tls_sock.version()
+                active_sock = tls_sock
+            except socket.timeout:
+                diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
+                diag['error'] = f'TLS handshake timed out for {host} after {remaining:.1f}s.'
+                return diag
+            except Exception as exc:
+                diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
+                diag['error'] = _sanitize_error(f'TLS handshake failed for {host}: {type(exc).__name__}: {exc}')
+                return diag
+
+        # Stage 4: Optional HTTP/1.1 WebSocket Upgrade probe
+        if include_upgrade and scheme in ('ws', 'wss'):
+            diag['stage'] = 'ws_upgrade'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                diag['error'] = f'WebSocket upgrade budget exhausted ({budget:.1f}s) for {host}.'
+                return diag
+            t_up = time.monotonic()
+            try:
+                active_sock.settimeout(remaining)
+                ws_key = base64.b64encode(os.urandom(16)).decode('ascii')
+                req_lines = [
+                    f'GET {path} HTTP/1.1',
+                    f'Host: {host}',
+                    'Upgrade: websocket',
+                    'Connection: Upgrade',
+                    f'Sec-WebSocket-Key: {ws_key}',
+                    'Sec-WebSocket-Version: 13',
+                    f'Origin: {_WS_ORIGIN}',
+                    f'User-Agent: {_WS_USER_AGENT}',
+                    '',
+                    '',
+                ]
+                active_sock.sendall('\r\n'.join(req_lines).encode('ascii'))
+                resp_buf = b''
+                while b'\r\n\r\n' not in resp_buf and len(resp_buf) < 4096:
+                    chunk = active_sock.recv(1024)
+                    if not chunk:
+                        break
+                    resp_buf += chunk
+                diag['upgradeMs'] = round((time.monotonic() - t_up) * 1000, 1)
+                status_line = resp_buf.split(b'\r\n', 1)[0].decode('latin1', errors='replace').strip()
+                parts = status_line.split(' ', 2)
+                status_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+                diag['httpStatus'] = status_code
+                if status_code != 101:
+                    diag['error'] = f'WebSocket upgrade rejected by {host}: {status_line or "empty response"}'
+                    return diag
+            except socket.timeout:
+                diag['upgradeMs'] = round((time.monotonic() - t_up) * 1000, 1)
+                diag['error'] = f'WebSocket upgrade timed out for {host} after {remaining:.1f}s.'
+                return diag
+            except Exception as exc:
+                diag['upgradeMs'] = round((time.monotonic() - t_up) * 1000, 1)
+                diag['error'] = _sanitize_error(f'WebSocket upgrade failed for {host}: {type(exc).__name__}: {exc}')
+                return diag
+
+        diag['stage'] = 'ok'
+        diag['ok'] = True
+        return diag
+    finally:
+        for sock_obj in (active_sock, raw_sock):
+            if sock_obj is not None:
+                try:
+                    sock_obj.close()
+                except Exception:
+                    pass
+
+
+def _probe_https_endpoint(url: str, timeout_seconds: Optional[float] = None) -> dict:
+    """Read-only DNS -> TCP -> TLS probe for HTTPS endpoints such as auth.iqoption.com."""
+    return _probe_ws_endpoint(url, timeout_seconds=timeout_seconds, include_upgrade=False)
 
 
 def _is_client_alive(client: Any) -> bool:
@@ -278,30 +483,88 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.close = _safe_api_close
 
-    # 5. Bounded start_websocket() wait
+    # 5. Hardened start_websocket() with 6s socket timeout, Origin/User-Agent headers, no cacert.pem, and primary->fallback routing
     def _safe_start_websocket(self):
-        global_value.check_websocket_if_connect = None
-        global_value.check_websocket_if_error = False
-        global_value.websocket_error_reason = None
+        global _active_ws_url, _last_ws_diagnostics
+        ws_timeout = _WS_CONNECT_TIMEOUT
+        candidates = _get_ws_candidates(getattr(self, 'wss_url', None))
+        attempt_diags: List[dict] = []
 
-        self.websocket_client = WebsocketClient(self)
-        self.websocket_thread = threading.Thread(
-            target=self.websocket.run_forever,
-            kwargs={'sslopt': {'check_hostname': False, 'cert_reqs': ssl.CERT_NONE, 'ca_certs': 'cacert.pem'}},
-            daemon=True,
-        )
-        self.websocket_thread.start()
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            if global_value.check_websocket_if_error:
-                return False, global_value.websocket_error_reason
-            if global_value.check_websocket_if_connect == 0:
-                return False, 'Websocket connection closed.'
-            if global_value.check_websocket_if_connect == 1:
+        try:
+            import websocket as _ws_lib
+            if hasattr(_ws_lib, 'setdefaulttimeout'):
+                _ws_lib.setdefaulttimeout(ws_timeout)
+        except Exception:
+            pass
+
+        for candidate_url in candidates:
+            probe = _probe_ws_endpoint(candidate_url, timeout_seconds=ws_timeout, include_upgrade=False)
+            if not probe.get('ok'):
+                attempt_diags.append(probe)
+                continue
+
+            global_value.check_websocket_if_connect = None
+            global_value.check_websocket_if_error = False
+            global_value.websocket_error_reason = None
+
+            self.wss_url = candidate_url
+            self.websocket_client = WebsocketClient(self)
+            wss_obj = getattr(self.websocket_client, 'wss', None)
+            if wss_obj is not None:
+                wss_obj.header = [f'User-Agent: {_WS_USER_AGENT}']
+
+            self.websocket_thread = threading.Thread(
+                target=self.websocket.run_forever,
+                kwargs={
+                    'sslopt': {'check_hostname': False, 'cert_reqs': ssl.CERT_NONE},
+                    'origin': _WS_ORIGIN,
+                },
+                daemon=True,
+            )
+            self.websocket_thread.start()
+
+            t_open = time.monotonic()
+            deadline = t_open + ws_timeout
+            opened = False
+            ws_err: Optional[str] = None
+
+            while time.monotonic() < deadline:
+                if global_value.check_websocket_if_error:
+                    ws_err = str(global_value.websocket_error_reason or 'WebSocket error callback triggered.')
+                    break
+                if global_value.check_websocket_if_connect == 0:
+                    ws_err = 'WebSocket closed during upgrade handshake.'
+                    break
+                if global_value.check_websocket_if_connect == 1:
+                    opened = True
+                    break
+                time.sleep(0.02)
+
+            if opened:
+                probe['upgradeMs'] = round((time.monotonic() - t_open) * 1000, 1)
+                probe['stage'] = 'ok'
+                probe['ok'] = True
+                attempt_diags.append(probe)
+                _active_ws_url = candidate_url
+                _last_ws_diagnostics = attempt_diags
                 return True, None
-            time.sleep(0.02)
-        self.close()
-        return False, 'Timed out opening IQ Option WebSocket.'
+
+            self.close()
+            probe['ok'] = False
+            probe['stage'] = 'ws_upgrade'
+            probe['upgradeMs'] = round((time.monotonic() - t_open) * 1000, 1)
+            probe['error'] = _sanitize_error(
+                ws_err or f'WebSocket upgrade timed out for {candidate_url} after {ws_timeout:.1f}s.'
+            )
+            attempt_diags.append(probe)
+
+        _active_ws_url = None
+        _last_ws_diagnostics = attempt_diags
+        summary = '; '.join(
+            f"{d.get('url')} [{d.get('stage')}: {d.get('error') or 'failed'}]"
+            for d in attempt_diags
+        )
+        return False, _sanitize_error(summary or f'Timed out opening IQ Option WebSocket after {ws_timeout:.1f}s.')
 
     IQOptionAPI.start_websocket = _safe_start_websocket
 
@@ -906,11 +1169,35 @@ async def health(
         'requestedMode': target_mode,
         'accountType': confirmed_mode if connected else None,
         'modeVerified': mode_verified if connected else False,
+        'activeWsUrl': _active_ws_url if connected else None,
         'orderExecutionSupported': False,
         'realTradingEnabled': False,
         'credentialsConfigured': bool(os.getenv('IQ_EMAIL') and os.getenv('IQ_PASSWORD')),
         'lastError': _last_error,
         'connectedAt': _connected_at,
+    }
+
+
+@app.get('/network-check')
+async def network_check(
+    x_connector_token: Optional[str] = Header(default=None),
+):
+    """Secure, read-only DNS/TCP/TLS/WebSocket diagnostic probe (never exposes credentials or modifies session)."""
+    _check_auth(x_connector_token)
+    ws_urls = _get_ws_candidates()
+    ws_probes = await asyncio.gather(
+        *(asyncio.to_thread(_probe_ws_endpoint, url, _WS_CONNECT_TIMEOUT, True) for url in ws_urls)
+    )
+    auth_probe = await asyncio.to_thread(_probe_https_endpoint, 'https://auth.iqoption.com', _WS_CONNECT_TIMEOUT)
+    return {
+        'status': 'ok',
+        'timeoutSeconds': _WS_CONNECT_TIMEOUT,
+        'activeWsUrl': _active_ws_url,
+        'wsEndpoints': ws_probes,
+        'authEndpoint': auth_probe,
+        'lastConnectDiagnostics': _last_ws_diagnostics,
+        'orderExecutionSupported': False,
+        'realTradingEnabled': False,
     }
 
 

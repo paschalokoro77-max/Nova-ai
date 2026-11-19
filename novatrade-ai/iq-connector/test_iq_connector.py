@@ -2,6 +2,7 @@
 Tests mode normalization, PRACTICE/REAL balance mode verification, fail-closed behavior, and order locking.
 """
 import asyncio
+import os
 import sys
 import threading
 import time
@@ -162,6 +163,8 @@ class TestIqConnectorModes(unittest.TestCase):
         app._mode_verified = False
         app._last_error = None
         app._connected_at = None
+        app._active_ws_url = None
+        app._last_ws_diagnostics = None
         app._opcodes_updated = False
 
     def test_normalize_mode(self):
@@ -594,6 +597,390 @@ class TestIqConnectorModes(unittest.TestCase):
                     sys.modules.pop(name, None)
                 else:
                     sys.modules[name] = mod
+
+    def _with_patched_ws_stubs(self, ws_behavior):
+        """Helper context installing minimal iqoptionapi/websocket stubs and returning (api_inst, records)."""
+        saved_modules = {}
+        module_names = [
+            "requests",
+            "websocket",
+            "iqoptionapi",
+            "iqoptionapi.global_value",
+            "iqoptionapi.api",
+            "iqoptionapi.stable_api",
+            "iqoptionapi.ws",
+            "iqoptionapi.ws.client",
+        ]
+        for name in module_names:
+            saved_modules[name] = sys.modules.get(name)
+
+        records = {
+            "setdefaulttimeout_calls": [],
+            "ws_attempts": [],
+            "close_calls": 0,
+        }
+
+        m_req = ModuleType("requests")
+        m_req.utils = type("U", (), {"add_dict_to_cookiejar": staticmethod(lambda *a, **k: None)})()
+
+        m_ws_lib = ModuleType("websocket")
+
+        def _setdefaulttimeout(t):
+            records["setdefaulttimeout_calls"].append(t)
+
+        m_ws_lib.setdefaulttimeout = _setdefaulttimeout
+
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_gv.check_websocket_if_connect = None
+        m_gv.check_websocket_if_error = False
+        m_gv.websocket_error_reason = None
+        m_gv.SSID = None
+        m_gv.balance_id = None
+
+        class SpyWss:
+            def __init__(self, url):
+                self.url = url
+                self.header = None
+                self.closed = False
+
+            def run_forever(self, **kwargs):
+                records["ws_attempts"].append(
+                    {
+                        "url": self.url,
+                        "header": list(self.header) if isinstance(self.header, list) else self.header,
+                        "kwargs": dict(kwargs),
+                    }
+                )
+                ws_behavior(self.url, m_gv, self)
+
+            def close(self):
+                self.closed = True
+                records["close_calls"] += 1
+
+        class StubWebsocketClient:
+            def __init__(self, api):
+                self.api = api
+                self.wss = SpyWss(api.wss_url)
+
+            def on_message(self, message):
+                return None
+
+        class StubIQOptionAPI:
+            def __init__(self):
+                self.session = type("S", (), {"request": lambda *_a, **_k: None})()
+                self.wss_url = app._WS_PRIMARY_URL
+                self.websocket_client = None
+                self.websocket_thread = None
+
+            @property
+            def websocket(self):
+                return self.websocket_client.wss
+
+        class StubIQOption:
+            def connect(self):
+                return True, None
+
+        m_api = ModuleType("iqoptionapi.api")
+        m_api.IQOptionAPI = StubIQOptionAPI
+        m_stable = ModuleType("iqoptionapi.stable_api")
+        m_stable.IQ_Option = StubIQOption
+        m_ws = ModuleType("iqoptionapi.ws")
+        m_ws_client = ModuleType("iqoptionapi.ws.client")
+        m_ws_client.WebsocketClient = StubWebsocketClient
+
+        sys.modules["requests"] = m_req
+        sys.modules["websocket"] = m_ws_lib
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.api"] = m_api
+        sys.modules["iqoptionapi.stable_api"] = m_stable
+        sys.modules["iqoptionapi.ws"] = m_ws
+        sys.modules["iqoptionapi.ws.client"] = m_ws_client
+
+        orig_patched = app._iqoptionapi_patched
+        app._iqoptionapi_patched = False
+        app._patch_iqoptionapi()
+
+        def cleanup():
+            app._iqoptionapi_patched = orig_patched
+            for name, mod in saved_modules.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+        return StubIQOptionAPI(), records, cleanup
+
+    def test_ws_primary_connection_success_headers_and_no_cacert(self):
+        probe_calls = []
+        orig_probe = app._probe_ws_endpoint
+        orig_env_ws = os.environ.pop("IQ_WS_URL", None)
+
+        def fake_probe(ws_url, timeout_seconds=None, include_upgrade=False):
+            probe_calls.append(ws_url)
+            return {
+                "url": ws_url,
+                "host": "iqoption.com",
+                "port": 443,
+                "ok": True,
+                "stage": "ok",
+                "resolvedIps": ["45.88.36.129"],
+                "dnsMs": 10.0,
+                "tcpMs": 12.0,
+                "tlsMs": 15.0,
+                "upgradeMs": None,
+                "tlsVersion": "TLSv1.3",
+                "httpStatus": None,
+                "error": None,
+            }
+
+        def ws_open_immediately(_url, gv, _wss):
+            gv.check_websocket_if_connect = 1
+
+        api_inst, records, cleanup = self._with_patched_ws_stubs(ws_open_immediately)
+        app._probe_ws_endpoint = fake_probe
+        try:
+            ok, reason = api_inst.start_websocket()
+            self.assertTrue(ok)
+            self.assertIsNone(reason)
+            self.assertEqual(probe_calls, [app._WS_PRIMARY_URL])
+            self.assertEqual(len(records["ws_attempts"]), 1)
+            attempt = records["ws_attempts"][0]
+            self.assertEqual(attempt["url"], app._WS_PRIMARY_URL)
+            # Explicit Origin and User-Agent headers must be passed
+            self.assertEqual(attempt["kwargs"].get("origin"), app._WS_ORIGIN)
+            self.assertIn(f"User-Agent: {app._WS_USER_AGENT}", attempt["header"])
+            # Nonexistent cacert.pem MUST NOT be passed in sslopt
+            sslopt = attempt["kwargs"].get("sslopt") or {}
+            self.assertNotIn("ca_certs", sslopt)
+            self.assertFalse(sslopt.get("check_hostname"))
+            self.assertEqual(app._active_ws_url, app._WS_PRIMARY_URL)
+            self.assertEqual(records["setdefaulttimeout_calls"], [app._WS_CONNECT_TIMEOUT])
+        finally:
+            app._probe_ws_endpoint = orig_probe
+            if orig_env_ws is not None:
+                os.environ["IQ_WS_URL"] = orig_env_ws
+            cleanup()
+
+    def test_ws_fallback_succeeds_when_primary_fails(self):
+        probe_calls = []
+        orig_probe = app._probe_ws_endpoint
+        orig_env_ws = os.environ.pop("IQ_WS_URL", None)
+
+        def fake_probe(ws_url, timeout_seconds=None, include_upgrade=False):
+            probe_calls.append(ws_url)
+            if ws_url == app._WS_PRIMARY_URL:
+                return {
+                    "url": ws_url,
+                    "host": "iqoption.com",
+                    "port": 443,
+                    "ok": False,
+                    "stage": "tcp",
+                    "resolvedIps": ["45.88.36.129"],
+                    "dnsMs": 12.0,
+                    "tcpMs": 6000.0,
+                    "tlsMs": None,
+                    "upgradeMs": None,
+                    "tlsVersion": None,
+                    "httpStatus": None,
+                    "error": "TCP connect timed out to iqoption.com (45.88.36.129:443) after 6.0s.",
+                }
+            return {
+                "url": ws_url,
+                "host": "ws.iqoption.com",
+                "port": 443,
+                "ok": True,
+                "stage": "ok",
+                "resolvedIps": ["104.18.16.240"],
+                "dnsMs": 5.0,
+                "tcpMs": 4.0,
+                "tlsMs": 8.0,
+                "upgradeMs": None,
+                "tlsVersion": "TLSv1.3",
+                "httpStatus": None,
+                "error": None,
+            }
+
+        def ws_open_on_fallback(url, gv, _wss):
+            if url == app._WS_FALLBACK_URL:
+                gv.check_websocket_if_connect = 1
+
+        api_inst, records, cleanup = self._with_patched_ws_stubs(ws_open_on_fallback)
+        app._probe_ws_endpoint = fake_probe
+        try:
+            ok, reason = api_inst.start_websocket()
+            self.assertTrue(ok)
+            self.assertIsNone(reason)
+            self.assertEqual(probe_calls, [app._WS_PRIMARY_URL, app._WS_FALLBACK_URL])
+            self.assertEqual(len(records["ws_attempts"]), 1)
+            self.assertEqual(records["ws_attempts"][0]["url"], app._WS_FALLBACK_URL)
+            self.assertEqual(api_inst.wss_url, app._WS_FALLBACK_URL)
+            self.assertEqual(app._active_ws_url, app._WS_FALLBACK_URL)
+            self.assertEqual(len(app._last_ws_diagnostics), 2)
+            self.assertEqual(app._last_ws_diagnostics[0]["stage"], "tcp")
+            self.assertEqual(app._last_ws_diagnostics[1]["stage"], "ok")
+        finally:
+            app._probe_ws_endpoint = orig_probe
+            if orig_env_ws is not None:
+                os.environ["IQ_WS_URL"] = orig_env_ws
+            cleanup()
+
+    def test_ws_both_endpoints_failing_reports_stage_diagnostics(self):
+        orig_probe = app._probe_ws_endpoint
+        orig_env_ws = os.environ.pop("IQ_WS_URL", None)
+
+        def fake_probe(ws_url, timeout_seconds=None, include_upgrade=False):
+            if ws_url == app._WS_PRIMARY_URL:
+                return {
+                    "url": ws_url,
+                    "host": "iqoption.com",
+                    "port": 443,
+                    "ok": False,
+                    "stage": "dns",
+                    "resolvedIps": [],
+                    "dnsMs": 15.0,
+                    "tcpMs": None,
+                    "tlsMs": None,
+                    "upgradeMs": None,
+                    "tlsVersion": None,
+                    "httpStatus": None,
+                    "error": "DNS lookup failed for iqoption.com: gaierror",
+                }
+            return {
+                "url": ws_url,
+                "host": "ws.iqoption.com",
+                "port": 443,
+                "ok": False,
+                "stage": "tls",
+                "resolvedIps": ["104.18.16.240"],
+                "dnsMs": 5.0,
+                "tcpMs": 6.0,
+                "tlsMs": 20.0,
+                "upgradeMs": None,
+                "tlsVersion": None,
+                "httpStatus": None,
+                "error": "TLS handshake failed for ws.iqoption.com: SSLError",
+            }
+
+        api_inst, records, cleanup = self._with_patched_ws_stubs(lambda *_a: None)
+        app._probe_ws_endpoint = fake_probe
+        try:
+            ok, reason = api_inst.start_websocket()
+            self.assertFalse(ok)
+            self.assertIsNotNone(reason)
+            self.assertIn(app._WS_PRIMARY_URL, reason)
+            self.assertIn("[dns:", reason)
+            self.assertIn(app._WS_FALLBACK_URL, reason)
+            self.assertIn("[tls:", reason)
+            self.assertIsNone(app._active_ws_url)
+            self.assertEqual(len(records["ws_attempts"]), 0)
+            self.assertEqual(len(app._last_ws_diagnostics), 2)
+        finally:
+            app._probe_ws_endpoint = orig_probe
+            if orig_env_ws is not None:
+                os.environ["IQ_WS_URL"] = orig_env_ws
+            cleanup()
+
+    def test_ws_timeout_handling_and_six_second_default(self):
+        # Default socket connect timeout must be strictly 6.0 seconds
+        self.assertEqual(app._WS_CONNECT_TIMEOUT, 6.0)
+
+        orig_ws_timeout = app._WS_CONNECT_TIMEOUT
+        orig_close_timeout = app._CLOSE_TIMEOUT
+        orig_probe = app._probe_ws_endpoint
+        orig_env_ws = os.environ.pop("IQ_WS_URL", None)
+        release_hang = threading.Event()
+
+        def fake_probe(ws_url, timeout_seconds=None, include_upgrade=False):
+            return {
+                "url": ws_url,
+                "host": "host",
+                "port": 443,
+                "ok": True,
+                "stage": "ok",
+                "resolvedIps": ["1.2.3.4"],
+                "dnsMs": 2.0,
+                "tcpMs": 2.0,
+                "tlsMs": 2.0,
+                "upgradeMs": None,
+                "tlsVersion": "TLSv1.3",
+                "httpStatus": None,
+                "error": None,
+            }
+
+        def ws_hang_upgrade(_url, _gv, _wss):
+            release_hang.wait(timeout=2.0)
+
+        api_inst, records, cleanup = self._with_patched_ws_stubs(ws_hang_upgrade)
+        app._probe_ws_endpoint = fake_probe
+        app._WS_CONNECT_TIMEOUT = 0.08
+        app._CLOSE_TIMEOUT = 0.05
+        try:
+            t0 = time.monotonic()
+            ok, reason = api_inst.start_websocket()
+            elapsed = time.monotonic() - t0
+            self.assertFalse(ok)
+            self.assertLess(elapsed, 1.0)
+            self.assertIn("[ws_upgrade:", reason)
+            self.assertIn("timed out", reason.lower())
+            self.assertEqual(len(records["ws_attempts"]), 2)
+            self.assertGreaterEqual(records["close_calls"], 2)
+            self.assertEqual(records["setdefaulttimeout_calls"], [0.08])
+        finally:
+            release_hang.set()
+            app._WS_CONNECT_TIMEOUT = orig_ws_timeout
+            app._CLOSE_TIMEOUT = orig_close_timeout
+            app._probe_ws_endpoint = orig_probe
+            if orig_env_ws is not None:
+                os.environ["IQ_WS_URL"] = orig_env_ws
+            cleanup()
+
+    def test_network_check_enforces_auth_and_returns_stage_diagnostics(self):
+        orig_token = os.environ.get("IQ_CONNECTOR_TOKEN")
+        orig_probe_ws = app._probe_ws_endpoint
+        orig_probe_https = app._probe_https_endpoint
+        os.environ["IQ_CONNECTOR_TOKEN"] = "secret-diag-token"
+
+        def fake_ws_probe(url, timeout_seconds=None, include_upgrade=False):
+            return {
+                "url": url,
+                "ok": url == app._WS_FALLBACK_URL,
+                "stage": "ok" if url == app._WS_FALLBACK_URL else "tcp",
+                "httpStatus": 101 if url == app._WS_FALLBACK_URL else None,
+                "error": None if url == app._WS_FALLBACK_URL else "TCP connect timed out",
+            }
+
+        def fake_https_probe(url, timeout_seconds=None):
+            return {"url": url, "ok": True, "stage": "ok", "tlsVersion": "TLSv1.3", "error": None}
+
+        app._probe_ws_endpoint = fake_ws_probe
+        app._probe_https_endpoint = fake_https_probe
+        try:
+            with self.assertRaises(app.HTTPException) as unauth_ctx:
+                asyncio.run(app.network_check(x_connector_token="wrong-token"))
+            self.assertEqual(unauth_ctx.exception.status_code, 401)
+
+            res = asyncio.run(app.network_check(x_connector_token="secret-diag-token"))
+            self.assertEqual(res["status"], "ok")
+            self.assertEqual(res["timeoutSeconds"], app._WS_CONNECT_TIMEOUT)
+            self.assertEqual(len(res["wsEndpoints"]), 2)
+            self.assertEqual(res["wsEndpoints"][0]["url"], app._WS_PRIMARY_URL)
+            self.assertEqual(res["wsEndpoints"][0]["stage"], "tcp")
+            self.assertEqual(res["wsEndpoints"][1]["url"], app._WS_FALLBACK_URL)
+            self.assertEqual(res["wsEndpoints"][1]["httpStatus"], 101)
+            self.assertTrue(res["authEndpoint"]["ok"])
+            self.assertFalse(res["orderExecutionSupported"])
+            self.assertFalse(res["realTradingEnabled"])
+        finally:
+            app._probe_ws_endpoint = orig_probe_ws
+            app._probe_https_endpoint = orig_probe_https
+            if orig_token is None:
+                os.environ.pop("IQ_CONNECTOR_TOKEN", None)
+            else:
+                os.environ["IQ_CONNECTOR_TOKEN"] = orig_token
 
 
 if __name__ == "__main__":
