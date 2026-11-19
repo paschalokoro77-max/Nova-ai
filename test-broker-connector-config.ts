@@ -70,6 +70,37 @@ async function runBrokerConfigTests() {
       return;
     }
 
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          status: 'running',
+          connected: true,
+          authenticated: true,
+          mode: 'PRACTICE',
+          accountType: 'PRACTICE',
+          modeVerified: true,
+          credentialsConfigured: true,
+          lastError: null,
+        })
+      );
+      return;
+    }
+
+    if (req.url === '/account') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          accountType: 'PRACTICE',
+          mode: 'PRACTICE',
+          modeVerified: true,
+          balance: null,
+          currency: 'USD',
+        })
+      );
+      return;
+    }
+
     if (req.url === '/candles') {
       candlesAttempts++;
       if (req.headers['x-connector-token'] !== 'valid-secret') {
@@ -77,18 +108,37 @@ async function runBrokerConfigTests() {
         res.end(JSON.stringify({ detail: 'Invalid connector token.' }));
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          symbol: 'EURUSD',
-          interval: 60,
-          candles: [
-            { time: 1700000000, open: 1.085, high: 1.086, low: 1.084, close: 1.0855, volume: 10 },
-            { time: 1700000060, open: 1.0855, high: 1.087, low: 1.085, close: 1.0865, volume: 14 },
-          ],
-          source: 'IQ_OPTION_UNOFFICIAL',
-        })
-      );
+      let rawBody = '';
+      req.on('data', (chunk) => {
+        rawBody += String(chunk);
+      });
+      req.on('end', () => {
+        const body = rawBody ? (JSON.parse(rawBody) as { symbol?: string }) : {};
+        if (body.symbol === 'INVALIDBARS') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              symbol: 'INVALIDBARS',
+              interval: 60,
+              candles: [{ time: 0, open: null, high: 0, low: -1, close: null, volume: 0 }],
+              source: 'IQ_OPTION_UNOFFICIAL',
+            })
+          );
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            symbol: 'EURUSD',
+            interval: 60,
+            candles: [
+              { time: 1700000000, open: 1.085, high: 1.086, low: 1.084, close: 1.0855, volume: 10 },
+              { time: 1700000060, open: 1.0855, high: 1.087, low: 1.085, close: 1.0865, volume: 14 },
+            ],
+            source: 'IQ_OPTION_UNOFFICIAL',
+          })
+        );
+      });
       return;
     }
 
@@ -114,6 +164,33 @@ async function runBrokerConfigTests() {
     assert.equal(candles.candles.length, 2);
     assert.equal(candles.candles[1].close, 1.0865);
     console.log('  ✅ [PASS] Candles endpoint normalizes symbol and returns historical bars');
+
+    // Malformed / invalid candles must be rejected rather than passed as valid data
+    let invalidCandleErr = '';
+    try {
+      await iqAdapter.getCandles('INVALIDBARS', 60, 2);
+    } catch (err) {
+      invalidCandleErr = err instanceof Error ? err.message : String(err);
+    }
+    assert.ok(invalidCandleErr.includes('no valid candlestick data'));
+    console.log('  ✅ [PASS] Malformed candlestick bars are rejected instead of fabricating OHLCV data');
+
+    // Missing numeric balance must stay null (never fabricated as 0) and surface an error
+    const statusWithNullBalance = await iqAdapter.getStatus();
+    assert.equal(statusWithNullBalance.balance, null);
+    assert.equal(statusWithNullBalance.equity, null);
+    assert.ok(
+      statusWithNullBalance.diagnostics?.lastConnectorError?.includes('valid numeric balance'),
+      `Expected missing-balance diagnostic, got: ${statusWithNullBalance.diagnostics?.lastConnectorError}`
+    );
+    let balanceErr = '';
+    try {
+      await iqAdapter.getBalance();
+    } catch (err) {
+      balanceErr = err instanceof Error ? err.message : String(err);
+    }
+    assert.ok(balanceErr.includes('missing or non-numeric'));
+    console.log('  ✅ [PASS] Missing/invalid broker balance stays null and never fabricates $0.00');
 
     // Non-transient 401 token failure fails fast on 1 attempt without timeout wrapping
     candlesAttempts = 0;

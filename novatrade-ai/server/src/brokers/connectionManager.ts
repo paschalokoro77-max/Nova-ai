@@ -97,6 +97,10 @@ const DEFAULT_ACCOUNT_RISK_LIMITS: BrokerAccountRiskLimits = {
   allowPut: true,
 };
 
+function toFiniteBalance(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 function maskSecret(val: string | undefined): string | null {
   const clean = (val || '').trim();
   if (!clean) return null;
@@ -1119,11 +1123,13 @@ export class BrokerConnectionManager {
     const now = new Date().toISOString();
     try {
       const res = await adapter.connect(ctx);
+      const validBalance = toFiniteBalance(res.balance);
+      const validEquity = toFiniteBalance(res.equity) ?? validBalance;
       acct.connected = res.connected;
       acct.status = res.connected ? 'CONNECTED' : 'AUTHENTICATION FAILED';
       acct.accountType = res.accountType;
-      acct.balance = res.balance;
-      acct.equity = res.equity ?? res.balance;
+      acct.balance = res.connected ? validBalance : null;
+      acct.equity = res.connected ? validEquity : null;
       acct.currency = res.currency || acct.currency;
       acct.externalAccountId = res.externalAccountId ?? acct.externalAccountId;
       acct.lastError = res.connected ? null : res.message;
@@ -1181,6 +1187,8 @@ export class BrokerConnectionManager {
 
       acct.connected = false;
       acct.status = connectionStatus;
+      acct.balance = null;
+      acct.equity = null;
       acct.lastError = msg;
       acct.lastCheckedAt = now;
       acct.updatedAt = now;
@@ -1204,6 +1212,8 @@ export class BrokerConnectionManager {
       await adapter.disconnect(this.toContext(acct)).catch(() => undefined);
     }
     acct.connected = false;
+    acct.balance = null;
+    acct.equity = null;
     const hasBridge = this.hasEnvFallback(acct.brokerId) || Boolean((this.decryptCredentials(acct.encryptedCredentials).bridgeUrl || '').trim());
     acct.status = !hasBridge ? 'NOT CONFIGURED' : 'GATEWAY OFFLINE';
     acct.lastCheckedAt = new Date().toISOString();
@@ -1236,9 +1246,11 @@ export class BrokerConnectionManager {
           : snap.diagnostics?.lastConnectorError
             ? 'AUTHENTICATION FAILED'
             : 'GATEWAY ONLINE';
-    acct.accountType = snap.accountType ?? acct.accountType;
-    acct.balance = snap.balance ?? acct.balance;
-    acct.equity = snap.equity ?? acct.equity;
+    acct.accountType = snap.connected ? (snap.accountType ?? acct.accountType) : null;
+    const nextBalance = toFiniteBalance(snap.balance);
+    const nextEquity = toFiniteBalance(snap.equity) ?? nextBalance;
+    acct.balance = snap.connected ? nextBalance : null;
+    acct.equity = snap.connected ? nextEquity : null;
     acct.currency = snap.currency ?? acct.currency;
     acct.lastCheckedAt = now;
     if (snap.connected) acct.lastSyncedAt = now;

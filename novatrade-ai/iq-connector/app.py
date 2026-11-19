@@ -8,6 +8,7 @@ import base64
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -20,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.4')
+app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.5')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
@@ -48,7 +49,9 @@ _requested_mode: str = 'PRACTICE'
 _confirmed_mode: str = 'PRACTICE'
 _mode_verified: bool = False
 _active_ws_url: Optional[str] = None
+_active_ws_via_proxy: bool = False
 _last_ws_diagnostics: Optional[List[dict]] = None
+_last_candle_check: Optional[dict] = None
 _opcodes_updated: bool = False
 _iqoptionapi_patched: bool = False
 
@@ -56,6 +59,57 @@ T = TypeVar('T')
 
 _URL_USERINFO_RE = re.compile(r'((?:https?|wss?|socks5h?)://)([^@\s/]+)@', re.IGNORECASE)
 _AUTH_HEADER_RE = re.compile(r'((?:proxy-)?authorization\s*[:=]\s*(?:basic|bearer)\s+)\S+', re.IGNORECASE)
+
+
+def _parse_finite_float(val: Any) -> Optional[float]:
+    """Return a finite float or None; rejects None, bool, NaN, Inf, and non-numeric values."""
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(num):
+        return None
+    return num
+
+
+def _normalize_candle_bar(raw: Any) -> Optional[dict]:
+    """Validate and normalize a broker candle dict; returns None if timestamp or OHLCV is invalid."""
+    if not isinstance(raw, dict):
+        return None
+    ts_raw = raw.get('from') if raw.get('from') is not None else (raw.get('time') if raw.get('time') is not None else raw.get('at'))
+    ts_num = _parse_finite_float(ts_raw)
+    if ts_num is None or ts_num <= 0:
+        return None
+    # Normalize millisecond timestamps down to Unix seconds if broker returns ms
+    ts_sec = int(ts_num / 1000) if ts_num > 1e11 else int(ts_num)
+
+    o = _parse_finite_float(raw.get('open'))
+    h = _parse_finite_float(raw.get('max') if raw.get('max') is not None else raw.get('high'))
+    l = _parse_finite_float(raw.get('min') if raw.get('min') is not None else raw.get('low'))
+    c = _parse_finite_float(raw.get('close'))
+    if o is None or h is None or l is None or c is None:
+        return None
+    if o <= 0 or h <= 0 or l <= 0 or c <= 0 or h < l:
+        return None
+
+    vol_raw = raw.get('volume')
+    if vol_raw is None:
+        vol = 0.0
+    else:
+        vol = _parse_finite_float(vol_raw)
+        if vol is None or vol < 0:
+            return None
+
+    return {
+        'time': ts_sec,
+        'open': o,
+        'high': h,
+        'low': l,
+        'close': c,
+        'volume': vol,
+    }
 
 
 def _get_proxy_url() -> Optional[str]:
@@ -70,14 +124,24 @@ def _get_proxy_url() -> Optional[str]:
     return raw
 
 
-def _is_ws_proxy_enabled() -> bool:
-    """Keep WebSocket traffic direct by default unless IQ_PROXY_WS is explicitly enabled."""
+def _get_ws_proxy_mode() -> str:
+    """Return WebSocket proxy routing mode: 'direct' (default), 'proxy' (IQ_PROXY_WS=true), or 'auto' (fallback)."""
     try:
         if not _get_proxy_url():
-            return False
+            return 'direct'
     except ValueError:
-        return False
-    return (os.environ.get('IQ_PROXY_WS') or '').strip().lower() in ('1', 'true', 'yes')
+        return 'direct'
+    raw = (os.environ.get('IQ_PROXY_WS') or '').strip().lower()
+    if raw in ('1', 'true', 'yes'):
+        return 'proxy'
+    if raw == 'auto':
+        return 'auto'
+    return 'direct'
+
+
+def _is_ws_proxy_enabled() -> bool:
+    """Keep WebSocket traffic direct by default unless IQ_PROXY_WS is explicitly enabled."""
+    return _get_ws_proxy_mode() in ('proxy', 'auto')
 
 
 def _redact_proxy_url(raw_url: Optional[str]) -> Optional[str]:
@@ -102,18 +166,19 @@ def _get_requests_proxies() -> Optional[Dict[str, str]]:
     return {'http': proxy_url, 'https': proxy_url}
 
 
-def _get_ws_proxy_kwargs() -> Dict[str, Any]:
-    """Return websocket-client proxy kwargs ONLY when both IQ_PROXY_URL and IQ_PROXY_WS=true are set."""
-    if not _is_ws_proxy_enabled():
-        return {}
-    proxy_url = _get_proxy_url()
+def _build_ws_proxy_kwargs_from_url(proxy_url: Optional[str]) -> Dict[str, Any]:
+    """Build websocket-client HTTP CONNECT proxy kwargs (compatible with websocket-client 0.56.0 + Webshare)."""
     if not proxy_url:
         return {}
     parsed = urllib.parse.urlparse(proxy_url)
-    port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 8080)
+    scheme = (parsed.scheme or '').lower()
+    if scheme != 'http' or not parsed.hostname:
+        # websocket-client==0.56.0 proxy_type='http' opens plain TCP to the proxy then sends HTTP CONNECT + TLS to target
+        return {}
+    port = parsed.port or 8080
     kwargs: Dict[str, Any] = {
         'http_proxy_host': parsed.hostname,
-        'http_proxy_port': port,
+        'http_proxy_port': int(port),
         'proxy_type': 'http',
     }
     if parsed.username is not None:
@@ -122,6 +187,13 @@ def _get_ws_proxy_kwargs() -> Dict[str, Any]:
             urllib.parse.unquote(parsed.password or ''),
         )
     return kwargs
+
+
+def _get_ws_proxy_kwargs() -> Dict[str, Any]:
+    """Return websocket-client proxy kwargs ONLY when IQ_PROXY_WS=true and IQ_PROXY_URL is an http:// proxy."""
+    if _get_ws_proxy_mode() != 'proxy':
+        return {}
+    return _build_ws_proxy_kwargs_from_url(_get_proxy_url())
 
 
 def _sanitize_error(msg: str, extra_secrets: Tuple[Optional[str], ...] = ()) -> str:
@@ -269,12 +341,13 @@ def _safe_close_client(client: Any, timeout_seconds: Optional[float] = None):
 
 
 def _invalidate_client(reason: Optional[str] = None):
-    global _client, _connected_at, _mode_verified, _active_ws_url, _opcodes_updated, _last_error
+    global _client, _connected_at, _mode_verified, _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_error
     old_client = _client
     _client = None
     _connected_at = None
     _mode_verified = False
     _active_ws_url = None
+    _active_ws_via_proxy = False
     _opcodes_updated = False
     if reason:
         _last_error = _sanitize_error(reason)
@@ -482,27 +555,36 @@ def _probe_https_via_proxy(
     target_url: str,
     proxy_url: str,
     timeout_seconds: Optional[float] = None,
+    include_upgrade: bool = False,
+    verify_tls: bool = True,
 ) -> dict:
-    """Read-only HTTP CONNECT tunnel + verified TLS probe to target_url via proxy_url (sends zero IQ credentials)."""
+    """Read-only HTTP CONNECT tunnel + TLS (-> optional WS 101 upgrade) probe via proxy_url (sends zero IQ credentials)."""
     budget = _HTTP_CONNECT_TIMEOUT if timeout_seconds is None else float(timeout_seconds)
     deadline = time.monotonic() + budget
     t_parsed = urllib.parse.urlparse(target_url)
     p_parsed = urllib.parse.urlparse(proxy_url)
     target_host = t_parsed.hostname or ''
     target_port = t_parsed.port or 443
+    target_path = t_parsed.path or '/echo/websocket'
+    if t_parsed.query:
+        target_path = f'{target_path}?{t_parsed.query}'
     proxy_host = p_parsed.hostname or ''
     proxy_port = p_parsed.port or (443 if (p_parsed.scheme or '').lower() == 'https' else 8080)
 
     diag: dict = {
+        'url': target_url,
         'proxy': _redact_proxy_url(proxy_url),
         'target': f'{target_host}:{target_port}',
+        'viaProxy': True,
         'ok': False,
         'stage': 'proxy_tcp',
         'proxyMs': None,
         'tlsMs': None,
+        'upgradeMs': None,
         'tlsVersion': None,
-        'tlsVerified': True,
+        'tlsVerified': bool(verify_tls),
         'httpStatus': None,
+        'upgradeStatus': None,
         'error': None,
     }
     if not proxy_host or not target_host:
@@ -588,7 +670,12 @@ def _probe_https_via_proxy(
         t_tls = time.monotonic()
         try:
             active_sock.settimeout(remaining)
-            ctx = ssl.create_default_context()
+            if verify_tls:
+                ctx = ssl.create_default_context()
+            else:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
             tls_sock = ctx.wrap_socket(active_sock, server_hostname=target_host)
             diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
             diag['tlsVersion'] = tls_sock.version()
@@ -602,6 +689,52 @@ def _probe_https_via_proxy(
             diag['error'] = _sanitize_error(f'TLS verification through proxy failed for {target_host}: {type(exc).__name__}: {exc}')
             return diag
 
+        if include_upgrade:
+            diag['stage'] = 'ws_upgrade'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                diag['error'] = f'WebSocket upgrade through proxy budget exhausted for {target_host}.'
+                return diag
+            t_up = time.monotonic()
+            try:
+                active_sock.settimeout(remaining)
+                ws_key = base64.b64encode(os.urandom(16)).decode('ascii')
+                up_lines = [
+                    f'GET {target_path} HTTP/1.1',
+                    f'Host: {target_host}',
+                    'Upgrade: websocket',
+                    'Connection: Upgrade',
+                    f'Sec-WebSocket-Key: {ws_key}',
+                    'Sec-WebSocket-Version: 13',
+                    f'Origin: {_WS_ORIGIN}',
+                    f'User-Agent: {_WS_USER_AGENT}',
+                    '',
+                    '',
+                ]
+                active_sock.sendall('\r\n'.join(up_lines).encode('ascii'))
+                resp_buf = b''
+                while b'\r\n\r\n' not in resp_buf and len(resp_buf) < 4096:
+                    chunk = active_sock.recv(1024)
+                    if not chunk:
+                        break
+                    resp_buf += chunk
+                diag['upgradeMs'] = round((time.monotonic() - t_up) * 1000, 1)
+                status_line = resp_buf.split(b'\r\n', 1)[0].decode('latin1', errors='replace').strip()
+                parts = status_line.split(' ', 2)
+                up_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+                diag['upgradeStatus'] = up_code
+                if up_code != 101:
+                    diag['error'] = _sanitize_error(f'Proxied WebSocket upgrade rejected by {target_host}: {status_line or "empty response"}')
+                    return diag
+            except socket.timeout:
+                diag['upgradeMs'] = round((time.monotonic() - t_up) * 1000, 1)
+                diag['error'] = f'Proxied WebSocket upgrade timed out for {target_host}.'
+                return diag
+            except Exception as exc:
+                diag['upgradeMs'] = round((time.monotonic() - t_up) * 1000, 1)
+                diag['error'] = _sanitize_error(f'Proxied WebSocket upgrade failed for {target_host}: {type(exc).__name__}: {exc}')
+                return diag
+
         diag['stage'] = 'ok'
         diag['ok'] = True
         return diag
@@ -612,6 +745,17 @@ def _probe_https_via_proxy(
                     sock_obj.close()
                 except Exception:
                     pass
+
+
+def _probe_ws_via_proxy(ws_url: str, proxy_url: str, timeout_seconds: Optional[float] = None) -> dict:
+    """Read-only HTTP CONNECT + TLS + WebSocket 101 upgrade probe through proxy_url."""
+    return _probe_https_via_proxy(
+        ws_url,
+        proxy_url,
+        timeout_seconds=timeout_seconds,
+        include_upgrade=True,
+        verify_tls=True,
+    )
 
 
 def _is_client_alive(client: Any) -> bool:
@@ -650,6 +794,52 @@ def _patch_iqoptionapi():
         from iqoptionapi.ws.client import WebsocketClient
     except Exception:
         return
+
+    # 0a. Patch TimeSync.server_timestamp so reading while unset (None) NEVER raises TypeError: NoneType / int
+    try:
+        from iqoptionapi.ws.objects.timesync import TimeSync
+
+        def _safe_get_server_timestamp(ts_self):
+            raw = getattr(ts_self, '_TimeSync__server_timestamp', None)
+            num = _parse_finite_float(raw)
+            if num is None:
+                return None
+            return num / 1000.0
+
+        def _safe_set_server_timestamp(ts_self, timestamp):
+            ts_self._TimeSync__server_timestamp = timestamp
+
+        TimeSync.server_timestamp = property(_safe_get_server_timestamp, _safe_set_server_timestamp)
+    except Exception:
+        pass
+
+    # 0b. Patch websocket-client HTTP CONNECT tunnel to send HTTP/1.1 + Host header (Webshare & strict proxy compatible)
+    try:
+        import websocket._http as _ws_http
+
+        if hasattr(_ws_http, '_tunnel') and not getattr(_ws_http._tunnel, '_novatrade_patched', False):
+            def _safe_ws_tunnel(sock, host, port, auth):
+                connect_header = f'CONNECT {host}:{int(port)} HTTP/1.1\r\nHost: {host}:{int(port)}\r\n'
+                if auth and auth[0]:
+                    auth_str = str(auth[0])
+                    if len(auth) > 1 and auth[1] is not None:
+                        auth_str += ':' + str(auth[1])
+                    encoded_str = base64.b64encode(auth_str.encode('utf-8')).decode('ascii')
+                    connect_header += f'Proxy-Authorization: Basic {encoded_str}\r\n'
+                connect_header += 'Proxy-Connection: Keep-Alive\r\n\r\n'
+                _ws_http.send(sock, connect_header)
+                try:
+                    status, _resp_headers, _status_msg = _ws_http.read_headers(sock)
+                except Exception as exc:
+                    raise _ws_http.WebSocketProxyException(_sanitize_error(str(exc)))
+                if status != 200:
+                    raise _ws_http.WebSocketProxyException(f'failed CONNECT via proxy status: {status!r}')
+                return sock
+
+            _safe_ws_tunnel._novatrade_patched = True
+            _ws_http._tunnel = _safe_ws_tunnel
+    except Exception:
+        pass
 
     # 1. Ensure WebsocketClient.on_message ALWAYS releases ssl_Mutual_exclusion on any exception
     orig_on_message = WebsocketClient.on_message
@@ -737,9 +927,9 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.close = _safe_api_close
 
-    # 5. Hardened start_websocket() with 6s socket timeout, Origin/User-Agent headers, no cacert.pem, and primary->fallback routing
+    # 5. Hardened start_websocket() with 6s socket timeout, Origin/User-Agent headers, no cacert.pem, primary->fallback, and validated WS proxy support
     def _safe_start_websocket(self):
-        global _active_ws_url, _last_ws_diagnostics
+        global _active_ws_url, _active_ws_via_proxy, _last_ws_diagnostics
         ws_timeout = _WS_CONNECT_TIMEOUT
         candidates = _get_ws_candidates(getattr(self, 'wss_url', None))
         attempt_diags: List[dict] = []
@@ -751,27 +941,41 @@ def _patch_iqoptionapi():
         except Exception:
             pass
 
-        ws_proxy_kwargs = _get_ws_proxy_kwargs()
+        ws_proxy_mode = _get_ws_proxy_mode()
+        proxy_url: Optional[str] = None
+        try:
+            proxy_url = _get_proxy_url()
+        except ValueError:
+            proxy_url = None
+        proxy_ws_kwargs = _build_ws_proxy_kwargs_from_url(proxy_url)
 
-        for candidate_url in candidates:
-            if ws_proxy_kwargs:
-                probe = {
-                    'url': candidate_url,
-                    'host': urllib.parse.urlparse(candidate_url).hostname or '',
-                    'port': urllib.parse.urlparse(candidate_url).port or 443,
-                    'ok': True,
-                    'stage': 'proxy_ws',
-                    'resolvedIps': [],
-                    'dnsMs': None,
-                    'tcpMs': None,
-                    'tlsMs': None,
-                    'upgradeMs': None,
-                    'tlsVersion': None,
-                    'httpStatus': None,
-                    'error': None,
-                }
+        # Build ordered (candidate_url, use_proxy) plan:
+        # - 'direct' (default): direct only
+        # - 'proxy': proxied only (falls back gracefully if proxy URL scheme is incompatible)
+        # - 'auto': direct first, then proxied fallback if direct fails
+        plan: List[Tuple[str, bool]] = []
+        if ws_proxy_mode == 'proxy' and proxy_ws_kwargs:
+            plan = [(u, True) for u in candidates]
+        elif ws_proxy_mode == 'auto' and proxy_ws_kwargs:
+            plan = [(u, False) for u in candidates] + [(u, True) for u in candidates]
+        else:
+            plan = [(u, False) for u in candidates]
+
+        for candidate_url, use_proxy in plan:
+            if use_proxy and proxy_url:
+                probe = _probe_https_via_proxy(
+                    candidate_url,
+                    proxy_url,
+                    timeout_seconds=ws_timeout,
+                    include_upgrade=False,
+                    verify_tls=False,
+                )
+                if not probe.get('ok'):
+                    attempt_diags.append(probe)
+                    continue
             else:
                 probe = _probe_ws_endpoint(candidate_url, timeout_seconds=ws_timeout, include_upgrade=False)
+                probe['viaProxy'] = False
                 if not probe.get('ok'):
                     attempt_diags.append(probe)
                     continue
@@ -790,8 +994,8 @@ def _patch_iqoptionapi():
                 'sslopt': {'check_hostname': False, 'cert_reqs': ssl.CERT_NONE},
                 'origin': _WS_ORIGIN,
             }
-            if ws_proxy_kwargs:
-                run_kwargs.update(ws_proxy_kwargs)
+            if use_proxy and proxy_ws_kwargs:
+                run_kwargs.update(proxy_ws_kwargs)
 
             self.websocket_thread = threading.Thread(
                 target=self.websocket.run_forever,
@@ -823,6 +1027,7 @@ def _patch_iqoptionapi():
                 probe['ok'] = True
                 attempt_diags.append(probe)
                 _active_ws_url = candidate_url
+                _active_ws_via_proxy = bool(use_proxy)
                 _last_ws_diagnostics = attempt_diags
                 return True, None
 
@@ -836,6 +1041,7 @@ def _patch_iqoptionapi():
             attempt_diags.append(probe)
 
         _active_ws_url = None
+        _active_ws_via_proxy = False
         _last_ws_diagnostics = attempt_diags
         summary = '; '.join(
             f"{d.get('url')} [{d.get('stage')}: {d.get('error') or 'failed'}]"
@@ -860,23 +1066,40 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.send_ssid = _safe_send_ssid
 
-    # 7. Bounded IQOptionAPI.connect() (no infinite timesync spin, no atexit leak, safe auth error classification)
+    # 6b. Patch get_ssid() so transport exceptions propagate cleanly without raw logger.error() secret leaks
+    orig_get_ssid = getattr(IQOptionAPI, 'get_ssid', None)
+
+    def _safe_get_ssid(self):
+        if hasattr(self, 'login') and callable(self.login):
+            return self.login(self.username, self.password)
+        if orig_get_ssid is not None:
+            return orig_get_ssid(self)
+        raise RuntimeError('IQOptionAPI has neither login() nor get_ssid().')
+
+    IQOptionAPI.get_ssid = _safe_get_ssid
+
+    # 7. Bounded IQOptionAPI.connect() (no infinite timesync spin, safe TimeSync None handling, safe auth classification)
+    def _classify_auth_exception(exc: BaseException, extra: Tuple[Optional[str], ...]) -> str:
+        cls_name = type(exc).__name__
+        low = f'{cls_name}: {exc}'.lower()
+        if 'ssl' in low or 'certificate' in low:
+            return _sanitize_error(f'IQ Option auth TLS verification failed ({cls_name}): {exc}', extra)
+        if 'proxy' in low:
+            return _sanitize_error(f'IQ Option auth proxy tunnel failed ({cls_name}): {exc}', extra)
+        if 'connecttimeout' in low or 'connect timeout' in low:
+            return _sanitize_error(f'IQ Option auth TCP connection timed out ({cls_name}): {exc}', extra)
+        if 'readtimeout' in low or 'read timeout' in low or isinstance(exc, TimeoutError):
+            return _sanitize_error(f'IQ Option auth read timed out ({cls_name}): {exc}', extra)
+        return _sanitize_error(f'IQ Option auth request failed ({cls_name}): {exc}', extra)
+
     def _fetch_ssid_safely(api_self) -> Tuple[Optional[str], Optional[str]]:
         extra = (getattr(api_self, 'username', None), getattr(api_self, 'password', None))
         try:
             response = api_self.get_ssid()
+            if isinstance(response, BaseException):
+                return None, _classify_auth_exception(response, extra)
         except Exception as exc:
-            cls_name = type(exc).__name__
-            low = f'{cls_name}: {exc}'.lower()
-            if 'ssl' in low or 'certificate' in low:
-                return None, _sanitize_error(f'IQ Option auth TLS verification failed ({cls_name}): {exc}', extra)
-            if 'proxy' in low:
-                return None, _sanitize_error(f'IQ Option auth proxy tunnel failed ({cls_name}): {exc}', extra)
-            if 'connecttimeout' in low or 'connect timeout' in low:
-                return None, _sanitize_error(f'IQ Option auth TCP connection timed out ({cls_name}): {exc}', extra)
-            if 'readtimeout' in low or 'read timeout' in low or isinstance(exc, TimeoutError):
-                return None, _sanitize_error(f'IQ Option auth read timed out ({cls_name}): {exc}', extra)
-            return None, _sanitize_error(f'IQ Option auth request failed ({cls_name}): {exc}', extra)
+            return None, _classify_auth_exception(exc, extra)
 
         try:
             ssid_val = response.cookies['ssid']
@@ -941,7 +1164,12 @@ def _patch_iqoptionapi():
         self.timesync.server_timestamp = None
         deadline = time.monotonic() + 6.0
         while time.monotonic() < deadline:
-            if self.timesync.server_timestamp is not None:
+            try:
+                ts_val = self.timesync.server_timestamp
+            except TypeError:
+                # Upstream TimeSync.server_timestamp divides __server_timestamp / 1000 while None
+                ts_val = None
+            if ts_val is not None:
                 return True, None
             if global_value.check_websocket_if_connect == 0 or global_value.check_websocket_if_error:
                 self.close()
@@ -1264,7 +1492,7 @@ def _fetch_balance_safe(
 
     if not has_low_level_api:
         try:
-            return _run_with_timeout(client.get_balance, timeout, 'get_balance')
+            raw_bal = _run_with_timeout(client.get_balance, timeout, 'get_balance')
         except TimeoutError:
             _last_error = f'Timed out retrieving IQ Option balance after {timeout:.1f}s.'
             raise HTTPException(504, 'IQ Option upstream timed out retrieving account balance.') from None
@@ -1273,6 +1501,11 @@ def _fetch_balance_safe(
         except Exception as exc:
             _last_error = _sanitize_error(f'get_balance() failed: {type(exc).__name__}: {exc}')
             raise HTTPException(502, f'Failed to retrieve account balance ({type(exc).__name__}).') from None
+        parsed_bal = _parse_finite_float(raw_bal)
+        if parsed_bal is None:
+            _last_error = 'Broker did not return a valid numeric account balance.'
+            raise HTTPException(502, 'Broker did not return a valid numeric account balance.')
+        return parsed_bal
 
     last_exc: Optional[Exception] = None
     for attempt in range(2):
@@ -1298,13 +1531,25 @@ def _fetch_balance_safe(
                     except Exception:
                         target_id = None
                     expected_type = 1 if target_mode == 'REAL' else 4
+                    matched_amount = None
+                    found_entry = False
                     for entry in msg_list:
                         if isinstance(entry, dict) and target_id is not None and entry.get('id') == target_id:
-                            return entry.get('amount')
-                    for entry in msg_list:
-                        if isinstance(entry, dict) and entry.get('type') == expected_type:
-                            return entry.get('amount')
-                    raise RuntimeError(f'Balance entry for mode {target_mode} not found.')
+                            matched_amount = entry.get('amount')
+                            found_entry = True
+                            break
+                    if not found_entry:
+                        for entry in msg_list:
+                            if isinstance(entry, dict) and entry.get('type') == expected_type:
+                                matched_amount = entry.get('amount')
+                                found_entry = True
+                                break
+                    if not found_entry:
+                        raise RuntimeError(f'Balance entry for mode {target_mode} not found.')
+                    parsed_amount = _parse_finite_float(matched_amount)
+                    if parsed_amount is None:
+                        raise RuntimeError('Broker returned missing or non-numeric balance amount.')
+                    return parsed_amount
                 if not _is_client_alive(client):
                     break
                 time.sleep(0.05)
@@ -1477,22 +1722,33 @@ async def health(
         confirmed_mode = _confirmed_mode if connected else _requested_mode
         mode_verified = bool(_mode_verified and confirmed_mode == target_mode) if connected else False
 
+    proxy_config_error: Optional[str] = None
     try:
         proxy_configured = bool(_get_proxy_url())
-    except ValueError:
+    except ValueError as exc:
         proxy_configured = False
+        proxy_config_error = _sanitize_error(str(exc))
+
+    verified_connected = connected and (target_mode != 'REAL' or mode_verified)
 
     return {
         'status': 'running',
+        'serviceAvailable': True,
         'busy': busy,
-        'connected': connected and (target_mode != 'REAL' or mode_verified),
+        'authenticated': bool(connected),
+        'connected': verified_connected,
         'mode': confirmed_mode,
         'requestedMode': target_mode,
         'accountType': confirmed_mode if connected else None,
         'modeVerified': mode_verified if connected else False,
         'activeWsUrl': _active_ws_url if connected else None,
+        'activeWsViaProxy': _active_ws_via_proxy if connected else False,
         'proxyConfigured': proxy_configured,
+        'proxyConfigError': proxy_config_error,
+        'wsProxyMode': _get_ws_proxy_mode(),
         'wsProxyEnabled': _is_ws_proxy_enabled(),
+        'candleRetrievalReady': bool(verified_connected),
+        'lastCandleCheck': _last_candle_check,
         'orderExecutionSupported': False,
         'realTradingEnabled': False,
         'credentialsConfigured': bool(os.getenv('IQ_EMAIL') and os.getenv('IQ_PASSWORD')),
@@ -1514,32 +1770,68 @@ async def network_check(
     auth_probe = await asyncio.to_thread(_probe_https_endpoint, 'https://auth.iqoption.com', _WS_CONNECT_TIMEOUT)
 
     proxy_probe: Optional[dict] = None
+    proxy_ws_probes: List[dict] = []
     proxy_configured = False
+    proxy_config_error: Optional[str] = None
     try:
         proxy_url = _get_proxy_url()
         if proxy_url:
             proxy_configured = True
-            proxy_probe = await asyncio.to_thread(
-                _probe_https_via_proxy, 'https://auth.iqoption.com', proxy_url, _HTTP_CONNECT_TIMEOUT
+            proxy_probe, *proxy_ws_probes = await asyncio.gather(
+                asyncio.to_thread(_probe_https_via_proxy, 'https://auth.iqoption.com', proxy_url, _HTTP_CONNECT_TIMEOUT),
+                *(asyncio.to_thread(_probe_ws_via_proxy, url, proxy_url, _WS_CONNECT_TIMEOUT) for url in ws_urls),
             )
     except ValueError as exc:
+        proxy_config_error = _sanitize_error(str(exc))
         proxy_probe = {
             'proxy': None,
             'target': 'auth.iqoption.com:443',
+            'viaProxy': True,
             'ok': False,
             'stage': 'config',
-            'error': _sanitize_error(str(exc)),
+            'error': proxy_config_error,
         }
+
+    proxy_auth_verified = bool(proxy_probe and proxy_probe.get('ok'))
+    proxy_ws_verified = any(bool(p.get('ok')) for p in proxy_ws_probes)
+    alive_now = _is_client_alive(_client)
 
     return {
         'status': 'ok',
+        'serviceAvailable': True,
         'timeoutSeconds': _WS_CONNECT_TIMEOUT,
         'activeWsUrl': _active_ws_url,
+        'activeWsViaProxy': _active_ws_via_proxy,
         'proxyConfigured': proxy_configured,
+        'proxyConfigError': proxy_config_error,
+        'proxyConnectivityVerified': proxy_auth_verified,
+        'wsProxyMode': _get_ws_proxy_mode(),
         'wsProxyEnabled': _is_ws_proxy_enabled(),
+        'wsProxyConnectivityVerified': proxy_ws_verified,
+        'direct': {
+            'wsEndpoints': ws_probes,
+            'authEndpoint': auth_probe,
+        },
+        'proxied': {
+            'configured': proxy_configured,
+            'verified': proxy_auth_verified,
+            'wsVerified': proxy_ws_verified,
+            'authEndpoint': proxy_probe,
+            'wsEndpoints': proxy_ws_probes,
+        },
+        'brokerSession': {
+            'authenticated': alive_now,
+            'connected': alive_now and (_requested_mode != 'REAL' or _mode_verified),
+            'mode': _confirmed_mode if alive_now else _requested_mode,
+            'modeVerified': bool(_mode_verified) if alive_now else False,
+            'candleRetrievalReady': bool(alive_now and (_requested_mode != 'REAL' or _mode_verified)),
+            'lastCandleCheck': _last_candle_check,
+            'lastError': _last_error,
+        },
         'wsEndpoints': ws_probes,
         'authEndpoint': auth_probe,
         'proxyAuthEndpoint': proxy_probe,
+        'proxyWsEndpoints': proxy_ws_probes,
         'lastConnectDiagnostics': _last_ws_diagnostics,
         'orderExecutionSupported': False,
         'realTradingEnabled': False,
@@ -1684,19 +1976,19 @@ def latest_price(
         client = connect(target_mode=target_mode)
         confirmed_mode, _ = _require_verified_mode(client, target_mode)
         rows = _fetch_candles_safe(client, clean, 60, 2, target_mode)
-        if not isinstance(rows, list) or len(rows) == 0 or not isinstance(rows[-1], dict):
+        if not isinstance(rows, list) or len(rows) == 0:
             raise HTTPException(502, f'Broker did not return valid candle price for {clean}.')
-        bar = rows[-1]
-        close_price = bar.get('close')
-        if close_price is None:
-            raise HTTPException(502, f'Broker candle for {clean} did not include a close price.')
+        normalized = [b for b in (_normalize_candle_bar(r) for r in rows) if b is not None]
+        if not normalized:
+            raise HTTPException(502, f'Broker candles for {clean} contained invalid OHLCV or timestamp values.')
+        bar = normalized[-1]
         return {
             'symbol': clean,
             'bid': None,
             'ask': None,
-            'last': close_price,
+            'last': bar['close'],
             'spread': None,
-            'time': bar.get('from'),
+            'time': bar['time'],
             'mode': confirmed_mode,
             'orderExecutionSupported': False,
             'realTradingEnabled': False,
@@ -1712,24 +2004,30 @@ def candles(
     x_iq_mode: Optional[str] = Header(default=None),
     x_connector_token: Optional[str] = Header(default=None),
 ):
+    global _last_candle_check
     _check_auth(x_connector_token)
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
     with _bounded_lock():
         client = connect(target_mode=target_mode)
         confirmed_mode, _ = _require_verified_mode(client, target_mode)
         rows = _fetch_candles_safe(client, query.symbol, query.interval, query.count, target_mode)
-        normalized = [
-            {
-                'time': c.get('from'),
-                'open': c.get('open'),
-                'high': c.get('max'),
-                'low': c.get('min'),
-                'close': c.get('close'),
-                'volume': c.get('volume', 0),
+        normalized = [b for b in (_normalize_candle_bar(c) for c in rows) if b is not None]
+        if not normalized:
+            _last_candle_check = {
+                'ok': False,
+                'symbol': query.symbol,
+                'count': 0,
+                'checkedAt': time.time(),
+                'error': f'Broker returned no valid candles for {query.symbol}.',
             }
-            for c in rows
-            if isinstance(c, dict) and c.get('close') is not None
-        ]
+            raise HTTPException(502, f'Broker returned no valid candles for {query.symbol}.')
+        _last_candle_check = {
+            'ok': True,
+            'symbol': query.symbol,
+            'count': len(normalized),
+            'checkedAt': time.time(),
+            'error': None,
+        }
         return {
             'symbol': query.symbol,
             'interval': query.interval,

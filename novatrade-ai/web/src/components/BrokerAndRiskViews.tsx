@@ -963,13 +963,21 @@ export function BrokerConnectionsView({
                   <div>
                     <p className="text-[11px] text-slate-500">{acct.environment === 'real' ? 'Account Balance' : 'Demo Balance'}</p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
-                      {acct.balance != null ? `${acct.balance.toFixed(2)} ${acct.currency || 'USD'}` : '—'}
+                      {typeof acct.balance === 'number' && Number.isFinite(acct.balance)
+                        ? `${acct.balance.toFixed(2)} ${acct.currency || 'USD'}`
+                        : acct.connected
+                          ? 'Unavailable'
+                          : '—'}
                     </p>
                   </div>
                   <div>
                     <p className="text-[11px] text-slate-500">Equity / NAV</p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
-                      {acct.equity != null ? `${acct.equity.toFixed(2)} ${acct.currency || 'USD'}` : '—'}
+                      {typeof acct.equity === 'number' && Number.isFinite(acct.equity)
+                        ? `${acct.equity.toFixed(2)} ${acct.currency || 'USD'}`
+                        : acct.connected
+                          ? 'Unavailable'
+                          : '—'}
                     </p>
                   </div>
                   <div>
@@ -1498,7 +1506,11 @@ export function BrokerConnectionsView({
           <div>
             <p className="text-[11px] text-slate-500">Practice Balance</p>
             <p className="mt-1 text-xs font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-200">
-              {broker?.balance != null ? `${broker.balance.toFixed(2)} ${broker.currency || ''}` : '—'}
+              {typeof broker?.balance === 'number' && Number.isFinite(broker.balance)
+                ? `${broker.balance.toFixed(2)} ${broker.currency || 'USD'}`
+                : broker?.connected
+                  ? 'Unavailable'
+                  : '—'}
             </p>
           </div>
           <div>

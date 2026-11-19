@@ -2598,16 +2598,29 @@ export default function App() {
                         <span>IQ Option Balance</span>
                         <Wallet className="h-3.5 w-3.5 text-slate-400" />
                       </div>
-                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
-                        {(iqAccount?.balance ?? brokerStatus?.balance) != null
-                          ? `$${(iqAccount?.balance ?? brokerStatus?.balance)!.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                          : (brokerStatus?.connected || iqAccount?.connected)
-                            ? '$0.00'
-                            : '—'}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        {iqAccountMode === 'DISCONNECTED' ? 'Account not connected' : `Connected ${iqAccountMode} Balance (${iqAccount?.currency ?? brokerStatus?.currency ?? 'USD'})`}
-                      </p>
+                      {(() => {
+                        const rawBal = iqAccount?.balance ?? brokerStatus?.balance;
+                        const validBal = typeof rawBal === 'number' && Number.isFinite(rawBal) ? rawBal : null;
+                        const isConnected = Boolean(brokerStatus?.connected || iqAccount?.connected);
+                        return (
+                          <>
+                            <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                              {validBal != null
+                                ? `$${validBal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                                : isConnected
+                                  ? 'Unavailable'
+                                  : '—'}
+                            </p>
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              {!isConnected || iqAccountMode === 'DISCONNECTED'
+                                ? 'Account not connected'
+                                : validBal == null
+                                  ? 'Broker balance unavailable'
+                                  : `Connected ${iqAccountMode} Balance (${iqAccount?.currency ?? brokerStatus?.currency ?? 'USD'})`}
+                            </p>
+                          </>
+                        );
+                      })()}
                     </div>
 
                     <div className={`${CARD_SURFACE} p-4`}>
@@ -2615,16 +2628,29 @@ export default function App() {
                         <span>IQ Option Equity</span>
                         <TrendingUp className="h-3.5 w-3.5 text-slate-400" />
                       </div>
-                      <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
-                        {(iqAccount?.equity ?? brokerStatus?.equity ?? iqAccount?.balance ?? brokerStatus?.balance) != null
-                          ? `$${(iqAccount?.equity ?? brokerStatus?.equity ?? iqAccount?.balance ?? brokerStatus?.balance)!.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-                          : (brokerStatus?.connected || iqAccount?.connected)
-                            ? '$0.00'
-                            : '—'}
-                      </p>
-                      <p className="mt-1 text-[11px] text-slate-500">
-                        {iqAccountMode === 'DISCONNECTED' ? 'No active equity' : `Synced Equity (${iqAccount?.currency ?? brokerStatus?.currency ?? 'USD'})`}
-                      </p>
+                      {(() => {
+                        const rawEq = iqAccount?.equity ?? brokerStatus?.equity ?? iqAccount?.balance ?? brokerStatus?.balance;
+                        const validEq = typeof rawEq === 'number' && Number.isFinite(rawEq) ? rawEq : null;
+                        const isConnected = Boolean(brokerStatus?.connected || iqAccount?.connected);
+                        return (
+                          <>
+                            <p className="mt-2 text-xl sm:text-2xl font-semibold font-mono tabular-nums text-slate-900 dark:text-white">
+                              {validEq != null
+                                ? `$${validEq.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                                : isConnected
+                                  ? 'Unavailable'
+                                  : '—'}
+                            </p>
+                            <p className="mt-1 text-[11px] text-slate-500">
+                              {!isConnected || iqAccountMode === 'DISCONNECTED'
+                                ? 'No active equity'
+                                : validEq == null
+                                  ? 'Broker equity unavailable'
+                                  : `Synced Equity (${iqAccount?.currency ?? brokerStatus?.currency ?? 'USD'})`}
+                            </p>
+                          </>
+                        );
+                      })()}
                     </div>
 
                     <div className={`${CARD_SURFACE} p-4`}>

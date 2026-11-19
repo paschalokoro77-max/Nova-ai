@@ -31,8 +31,21 @@ export function NovaPayView({
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
   const connectedAccounts = accounts.filter((a) => a.connected);
-  const totalBalance = accounts.reduce((sum, a) => sum + (a.balance || 0), 0);
-  const totalEquity = accounts.reduce((sum, a) => sum + (a.equity || a.balance || 0), 0);
+  const validBalanceAccounts = connectedAccounts.filter(
+    (a) => typeof a.balance === 'number' && Number.isFinite(a.balance)
+  );
+  const validEquityAccounts = connectedAccounts.filter((a) => {
+    const val = a.equity ?? a.balance;
+    return typeof val === 'number' && Number.isFinite(val);
+  });
+  const totalBalance =
+    validBalanceAccounts.length > 0
+      ? validBalanceAccounts.reduce((sum, a) => sum + (a.balance as number), 0)
+      : null;
+  const totalEquity =
+    validEquityAccounts.length > 0
+      ? validEquityAccounts.reduce((sum, a) => sum + ((a.equity ?? a.balance) as number), 0)
+      : null;
 
   async function handleSync(accountId: string) {
     setSyncingId(accountId);
@@ -100,19 +113,25 @@ export function NovaPayView({
         <div className={`${CARD_SURFACE} p-5 space-y-2`}>
           <p className="text-xs font-medium text-slate-500 dark:text-slate-400">NovaPay Total Balance</p>
           <p className="text-2xl font-bold font-mono tracking-tight text-slate-900 dark:text-white">
-            ${totalBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {totalBalance != null
+              ? `$${totalBalance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+              : 'Unavailable'}
           </p>
-          <p className="text-[11px] text-emerald-600 dark:text-emerald-400 flex items-center gap-1">
-            <ShieldCheck className="h-3 w-3" /> Genuine Broker Aggregated
+          <p className={`text-[11px] flex items-center gap-1 ${totalBalance != null ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-500 dark:text-slate-400'}`}>
+            <ShieldCheck className="h-3 w-3" /> {totalBalance != null ? 'Genuine Broker Aggregated' : 'No verified broker balance synced'}
           </p>
         </div>
 
         <div className={`${CARD_SURFACE} p-5 space-y-2`}>
           <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Total Equity / NAV</p>
           <p className="text-2xl font-bold font-mono tracking-tight text-slate-900 dark:text-white">
-            ${totalEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {totalEquity != null
+              ? `$${totalEquity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+              : 'Unavailable'}
           </p>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400">Reconciled via API Bridges</p>
+          <p className="text-[11px] text-slate-500 dark:text-slate-400">
+            {totalEquity != null ? 'Reconciled via API Bridges' : 'Awaiting verified broker equity'}
+          </p>
         </div>
 
         <div className={`${CARD_SURFACE} p-5 space-y-2`}>
@@ -200,13 +219,21 @@ export function NovaPayView({
                   <div>
                     <p className="text-[11px] text-slate-500">Genuine Balance</p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white text-sm">
-                      {acct.balance != null ? `$${acct.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${acct.currency || 'USD'}` : '—'}
+                      {typeof acct.balance === 'number' && Number.isFinite(acct.balance)
+                        ? `$${acct.balance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${acct.currency || 'USD'}`
+                        : acct.connected
+                          ? 'Unavailable'
+                          : '—'}
                     </p>
                   </div>
                   <div>
                     <p className="text-[11px] text-slate-500">Equity / NAV</p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white text-sm">
-                      {acct.equity != null ? `$${acct.equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${acct.currency || 'USD'}` : '—'}
+                      {typeof acct.equity === 'number' && Number.isFinite(acct.equity)
+                        ? `$${acct.equity.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} ${acct.currency || 'USD'}`
+                        : acct.connected
+                          ? 'Unavailable'
+                          : '—'}
                     </p>
                   </div>
                 </div>

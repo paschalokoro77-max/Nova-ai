@@ -20,6 +20,10 @@ const IQ_LIMITATIONS = [
   'Order placement on IQ Option remains locked (fail-closed) due to unofficial connector status.',
 ];
 
+function toFiniteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 export interface ParsedIqConnectorConfig {
   configured: boolean;
   url: string | null;
@@ -328,6 +332,7 @@ export class IQOptionAdapter implements BrokerAdapter {
     try {
       const health = await this.requestConnector<{
         connected?: boolean;
+        authenticated?: boolean;
         mode?: string;
         accountType?: string;
         modeVerified?: boolean;
@@ -340,8 +345,9 @@ export class IQOptionAdapter implements BrokerAdapter {
       let accountType: string | null = health.connected ? health.accountType || health.mode || requestedMode : null;
       let currency: string | null = null;
       let modeVerificationError: string | null = null;
+      let accountSyncError: string | null = null;
 
-      if (health.connected) {
+      if (health.connected && health.authenticated !== false) {
         try {
           const acct = await this.requestConnector<{
             accountType?: string;
@@ -356,15 +362,21 @@ export class IQOptionAdapter implements BrokerAdapter {
             accountType = null;
             balance = null;
           } else {
-            balance = typeof acct.balance === 'number' ? acct.balance : null;
+            balance = toFiniteNumber(acct.balance);
             accountType = reportedMode;
             currency = acct.currency || 'USD';
+            if (balance === null) {
+              accountSyncError = 'IQ Option connector did not return a valid numeric balance.';
+            }
           }
         } catch (acctErr) {
+          const msg = acctErr instanceof Error ? acctErr.message : 'IQ Option account sync failed.';
           if (requestedMode === 'REAL') {
-            modeVerificationError =
-              acctErr instanceof Error ? acctErr.message : 'IQ Option REAL account verification failed.';
+            modeVerificationError = msg;
             accountType = null;
+            balance = null;
+          } else {
+            accountSyncError = msg;
             balance = null;
           }
         }
@@ -376,7 +388,7 @@ export class IQOptionAdapter implements BrokerAdapter {
           `IQ Option connector could not verify REAL mode (mode=${health.mode || 'UNVERIFIED'}).`;
       }
 
-      const verifiedConnected = Boolean(health.connected) && !modeVerificationError;
+      const verifiedConnected = Boolean(health.connected) && health.authenticated !== false && !modeVerificationError;
       const diagnostics: BrokerConnectorDiagnostics = {
         ...baseDiagnostics,
         reachable: true,
@@ -384,7 +396,7 @@ export class IQOptionAdapter implements BrokerAdapter {
         credentialsConfigured:
           typeof health.credentialsConfigured === 'boolean' ? health.credentialsConfigured : null,
         latencyMs,
-        lastConnectorError: modeVerificationError || health.lastError || null,
+        lastConnectorError: modeVerificationError || accountSyncError || health.lastError || null,
       };
 
       const warningSuffix = cfg.warnings.length > 0 ? ` (${cfg.warnings[0]})` : '';
@@ -401,7 +413,9 @@ export class IQOptionAdapter implements BrokerAdapter {
         message: modeVerificationError
           ? modeVerificationError
           : verifiedConnected
-            ? `Connected to IQ Option connector (${accountType || requestedMode} read-only, ${latencyMs}ms). Order execution locked.${warningSuffix}`
+            ? accountSyncError
+              ? `Connected to IQ Option connector (${accountType || requestedMode} read-only, ${latencyMs}ms), but balance is unavailable (${accountSyncError}).${warningSuffix}`
+              : `Connected to IQ Option connector (${accountType || requestedMode} read-only, ${latencyMs}ms). Order execution locked.${warningSuffix}`
             : health.credentialsConfigured
               ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || `click Connect to initiate ${requestedMode} session`}).${warningSuffix}`
               : `IQ connector reachable (${latencyMs}ms), but IQ_EMAIL / IQ_PASSWORD are not set on the connector host.${warningSuffix}`,
@@ -477,10 +491,11 @@ export class IQOptionAdapter implements BrokerAdapter {
     let balance: number | null = null;
     let currency: string | null = 'USD';
     let confirmedAccountType = reportedMode || requestedMode;
+    let balanceWarning: string | null = null;
     if (res.connected) {
       try {
         const acct = await this.getBalance(ctx);
-        balance = acct.balance;
+        balance = toFiniteNumber(acct.balance);
         currency = acct.currency;
         confirmedAccountType = acct.accountType;
       } catch (err) {
@@ -495,6 +510,8 @@ export class IQOptionAdapter implements BrokerAdapter {
             message: err instanceof Error ? err.message : 'IQ Option REAL mode balance verification failed.',
           };
         }
+        balance = null;
+        balanceWarning = err instanceof Error ? err.message : 'Balance unavailable from broker.';
       }
     }
     return {
@@ -505,7 +522,9 @@ export class IQOptionAdapter implements BrokerAdapter {
       currency,
       externalAccountId: requestedMode === 'REAL' ? 'iq-real' : 'iq-practice',
       message: res.connected
-        ? `Authenticated with IQ Option connector in ${confirmedAccountType} read-only mode. Order placement remains disabled.`
+        ? balanceWarning
+          ? `Authenticated with IQ Option connector in ${confirmedAccountType} read-only mode, but balance could not be read (${balanceWarning}).`
+          : `Authenticated with IQ Option connector in ${confirmedAccountType} read-only mode. Order placement remains disabled.`
         : res.detail || 'IQ Option connector did not confirm an active session.',
     };
   }
@@ -535,7 +554,10 @@ export class IQOptionAdapter implements BrokerAdapter {
         `IQ Option REAL mode verification failed (connector reported ${reportedMode}). Refusing to treat PRACTICE balance as REAL.`
       );
     }
-    const bal = typeof acct.balance === 'number' ? acct.balance : null;
+    const bal = toFiniteNumber(acct.balance);
+    if (bal === null) {
+      throw new Error('IQ Option connector returned a missing or non-numeric account balance.');
+    }
     return {
       balance: bal,
       equity: bal,
@@ -559,14 +581,15 @@ export class IQOptionAdapter implements BrokerAdapter {
     const clean = symbol.toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     try {
       const res = await this.requestConnector<BrokerQuote>(`/price/${encodeURIComponent(clean)}`, {}, ctx);
-      if (typeof res.last === 'number' && Number.isFinite(res.last)) {
+      const last = toFiniteNumber(res.last);
+      if (last !== null && last > 0) {
         return {
           symbol: res.symbol || clean,
-          bid: typeof res.bid === 'number' ? res.bid : null,
-          ask: typeof res.ask === 'number' ? res.ask : null,
-          last: res.last,
-          spread: typeof res.spread === 'number' ? res.spread : null,
-          time: typeof res.time === 'number' ? res.time : null,
+          bid: toFiniteNumber(res.bid),
+          ask: toFiniteNumber(res.ask),
+          last,
+          spread: toFiniteNumber(res.spread),
+          time: toFiniteNumber(res.time),
           source: res.source || 'IQ_OPTION_UNOFFICIAL',
           note: res.note,
         };
@@ -617,8 +640,44 @@ export class IQOptionAdapter implements BrokerAdapter {
       },
       ctx
     );
+    const rawCandles = Array.isArray(res.candles) ? res.candles : [];
+    const validCandles: BrokerCandle[] = [];
+    for (const c of rawCandles) {
+      if (!c || typeof c !== 'object') continue;
+      const time = toFiniteNumber(c.time);
+      const open = toFiniteNumber(c.open);
+      const high = toFiniteNumber(c.high);
+      const low = toFiniteNumber(c.low);
+      const close = toFiniteNumber(c.close);
+      const vol = toFiniteNumber(c.volume);
+      if (
+        time === null ||
+        time <= 0 ||
+        open === null ||
+        open <= 0 ||
+        high === null ||
+        high <= 0 ||
+        low === null ||
+        low <= 0 ||
+        close === null ||
+        close <= 0
+      ) {
+        continue;
+      }
+      validCandles.push({
+        time: Math.trunc(time),
+        open,
+        high,
+        low,
+        close,
+        volume: vol !== null && vol >= 0 ? vol : 0,
+      });
+    }
+    if (validCandles.length === 0) {
+      throw new Error(`IQ Option connector returned no valid candlestick data for ${clean}.`);
+    }
     return {
-      candles: Array.isArray(res.candles) ? res.candles : [],
+      candles: validCandles,
       source: res.source || 'IQ_OPTION_UNOFFICIAL',
       note: res.note,
     };

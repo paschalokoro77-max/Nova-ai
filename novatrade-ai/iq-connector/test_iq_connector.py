@@ -164,7 +164,9 @@ class TestIqConnectorModes(unittest.TestCase):
         app._last_error = None
         app._connected_at = None
         app._active_ws_url = None
+        app._active_ws_via_proxy = False
         app._last_ws_diagnostics = None
+        app._last_candle_check = None
         app._opcodes_updated = False
 
     def test_normalize_mode(self):
@@ -1413,7 +1415,7 @@ class TestIqConnectorModes(unittest.TestCase):
                 "ok": False,
                 "stage": "tcp",
             }
-            app._probe_https_via_proxy = lambda target_url, proxy_url, timeout_seconds=None: {
+            app._probe_https_via_proxy = lambda target_url, proxy_url, timeout_seconds=None, **_kw: {
                 "proxy": app._redact_proxy_url(proxy_url),
                 "target": "auth.iqoption.com:443",
                 "ok": True,
@@ -1441,6 +1443,311 @@ class TestIqConnectorModes(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    def test_timesync_none_timestamp_does_not_raise_typeerror_during_connect(self):
+        """Regression test for: TypeError: unsupported operand type(s) for /: 'NoneType' and 'int'."""
+        saved_modules = {
+            name: sys.modules.get(name)
+            for name in ("iqoptionapi.ws.objects", "iqoptionapi.ws.objects.timesync")
+        }
+
+        class UpstreamTimeSync:
+            """Reproduces exact upstream iqoptionapi/ws/objects/timesync.py bug."""
+            def __init__(self):
+                self.__server_timestamp = None
+
+            @property
+            def server_timestamp(self):
+                return self.__server_timestamp / 1000
+
+            @server_timestamp.setter
+            def server_timestamp(self, timestamp):
+                self.__server_timestamp = timestamp
+
+        m_objects = ModuleType("iqoptionapi.ws.objects")
+        m_timesync = ModuleType("iqoptionapi.ws.objects.timesync")
+        m_timesync.TimeSync = UpstreamTimeSync
+        sys.modules["iqoptionapi.ws.objects"] = m_objects
+        sys.modules["iqoptionapi.ws.objects.timesync"] = m_timesync
+
+        orig_probe = app._probe_ws_endpoint
+        app._probe_ws_endpoint = lambda ws_url, timeout_seconds=None, include_upgrade=False, verify_tls=False: {
+            "url": ws_url,
+            "ok": True,
+            "stage": "ok",
+        }
+        api_cls, _gv, _records, cleanup = self._with_patched_http_auth_stubs()
+        try:
+            # Verify patched TimeSync property returns None while unset instead of crashing on None / 1000
+            ts = UpstreamTimeSync()
+            self.assertIsNone(ts.server_timestamp)
+            ts.server_timestamp = 1710000000000
+            self.assertEqual(ts.server_timestamp, 1710000000.0)
+
+            # Simulate real connect() where timeSync arrives asynchronously 50ms after ssid
+            api_inst = api_cls()
+            api_inst.timesync = UpstreamTimeSync()
+
+            def deliver_timesync():
+                time.sleep(0.05)
+                api_inst.timesync.server_timestamp = 1710000060000
+
+            t = threading.Thread(target=deliver_timesync, daemon=True)
+            t.start()
+            ok, reason = api_inst.connect()
+            t.join(timeout=1.0)
+            self.assertTrue(ok, f"Expected connect() to succeed without TypeError, got: {reason}")
+            self.assertIsNone(reason)
+
+            # Also verify _safe_api_connect survives an unpatched TimeSync-like object raising TypeError
+            class BrokenTimeSync:
+                def __init__(self):
+                    self.raw = None
+
+                @property
+                def server_timestamp(self):
+                    return self.raw / 1000
+
+                @server_timestamp.setter
+                def server_timestamp(self, val):
+                    self.raw = val
+
+            api_inst2 = api_cls()
+            api_inst2.timesync = BrokenTimeSync()
+
+            def deliver_broken_ts():
+                time.sleep(0.05)
+                api_inst2.timesync.server_timestamp = 1710000120000
+
+            t2 = threading.Thread(target=deliver_broken_ts, daemon=True)
+            t2.start()
+            ok2, reason2 = api_inst2.connect()
+            t2.join(timeout=1.0)
+            self.assertTrue(ok2, f"Expected fallback TypeError guard to succeed, got: {reason2}")
+            self.assertIsNone(reason2)
+        finally:
+            app._probe_ws_endpoint = orig_probe
+            cleanup()
+            for name, mod in saved_modules.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+    def test_get_ssid_exception_return_and_login_patch_redact_secrets(self):
+        """Ensure returned Exception objects or raised login() exceptions are classified & redacted cleanly."""
+        orig_probe = app._probe_ws_endpoint
+        app._probe_ws_endpoint = lambda ws_url, timeout_seconds=None, include_upgrade=False, verify_tls=False: {
+            "url": ws_url,
+            "ok": True,
+            "stage": "ok",
+        }
+
+        class ProxyError(Exception):
+            pass
+
+        # Case 1: get_ssid returns an Exception object (upstream iqoptionapi behavior if unpatched)
+        api_cls, _gv, _records, cleanup = self._with_patched_http_auth_stubs(
+            get_ssid_behavior=lambda _api: ProxyError("Proxy 407 for http://ws_u:ws_secret@proxy.webshare.io:80")
+        )
+        try:
+            api_inst = api_cls()
+            ok, reason = api_inst.connect()
+            self.assertFalse(ok)
+            self.assertIn("proxy tunnel failed", reason)
+            self.assertNotIn("ws_secret", reason)
+            self.assertNotIn("ws_u", reason)
+        finally:
+            cleanup()
+
+        # Case 2: instance has callable login() which raises ProxyError directly
+        api_cls2, _gv2, _records2, cleanup2 = self._with_patched_http_auth_stubs()
+        try:
+            api_inst2 = api_cls2()
+            api_inst2.login = lambda _u, _p: (_ for _ in ()).throw(
+                ProxyError("Failed via http://enc_u:enc_secret%21@proxy.webshare.io:80")
+            )
+            ok2, reason2 = api_inst2.connect()
+            self.assertFalse(ok2)
+            self.assertIn("proxy tunnel failed", reason2)
+            self.assertNotIn("enc_secret", reason2)
+            self.assertNotIn("enc_u", reason2)
+        finally:
+            app._probe_ws_endpoint = orig_probe
+            cleanup2()
+
+    def test_webshare_ws_proxy_modes_url_decoding_and_http11_tunnel_patch(self):
+        """Verify IQ_PROXY_WS=true/auto, URL-decoded Webshare credentials, HTTP/1.1 CONNECT tunnel, and direct vs proxied network-check."""
+        saved_env = {k: os.environ.get(k) for k in ("IQ_PROXY_URL", "IQ_PROXY_WS", "IQ_WS_URL", "IQ_CONNECTOR_TOKEN")}
+        proxy_url = "http://user%2Bwebshare:p%40ss%3Aword%231@p.webshare.io:80"
+        os.environ["IQ_PROXY_URL"] = proxy_url
+        os.environ["IQ_PROXY_WS"] = "true"
+        os.environ.pop("IQ_WS_URL", None)
+        os.environ["IQ_CONNECTOR_TOKEN"] = "diag-tok-1"
+
+        # Install a minimal websocket._http stub to verify _safe_ws_tunnel sends HTTP/1.1 + Host + Basic auth
+        saved_ws_http = sys.modules.get("websocket._http")
+        tunnel_sent = []
+
+        class StubWebSocketProxyException(Exception):
+            pass
+
+        m_ws_http = ModuleType("websocket._http")
+        m_ws_http.WebSocketProxyException = StubWebSocketProxyException
+        m_ws_http._tunnel = lambda sock, host, port, auth: sock
+        m_ws_http.send = lambda sock, data: tunnel_sent.append(data)
+        m_ws_http.read_headers = lambda sock: (200, {}, "Connection established")
+        sys.modules["websocket._http"] = m_ws_http
+
+        orig_probe_ws = app._probe_ws_endpoint
+        orig_probe_https = app._probe_https_endpoint
+        orig_probe_proxy = app._probe_https_via_proxy
+        orig_probe_ws_proxy = app._probe_ws_via_proxy
+
+        api_cls, _gv, records, cleanup = self._with_patched_http_auth_stubs()
+        try:
+            # 1. URL-decoded Webshare proxy credentials for websocket-client
+            ws_kwargs = app._get_ws_proxy_kwargs()
+            self.assertEqual(ws_kwargs["http_proxy_host"], "p.webshare.io")
+            self.assertEqual(ws_kwargs["http_proxy_port"], 80)
+            self.assertEqual(ws_kwargs["proxy_type"], "http")
+            self.assertEqual(ws_kwargs["http_proxy_auth"], ("user+webshare", "p@ss:word#1"))
+
+            # 2. Patched websocket._http._tunnel sends HTTP/1.1 + Host + Base64 Basic auth
+            m_ws_http._tunnel(object(), "iqoption.com", 443, ws_kwargs["http_proxy_auth"])
+            self.assertEqual(len(tunnel_sent), 1)
+            hdr = tunnel_sent[0]
+            self.assertIn("CONNECT iqoption.com:443 HTTP/1.1\r\n", hdr)
+            self.assertIn("Host: iqoption.com:443\r\n", hdr)
+            import base64
+            expected_b64 = base64.b64encode(b"user+webshare:p@ss:word#1").decode("ascii")
+            self.assertIn(f"Proxy-Authorization: Basic {expected_b64}\r\n", hdr)
+
+            # 3. IQ_PROXY_WS=true routes WS through proxy kwargs
+            app._probe_https_via_proxy = lambda target_url, p_url, timeout_seconds=None, include_upgrade=False, verify_tls=True: {
+                "url": target_url,
+                "proxy": app._redact_proxy_url(p_url),
+                "viaProxy": True,
+                "ok": True,
+                "stage": "ok",
+                "error": None,
+            }
+            api_inst = api_cls()
+            ok, reason = api_inst.start_websocket()
+            self.assertTrue(ok, f"Expected proxied WS open, got: {reason}")
+            self.assertTrue(app._active_ws_via_proxy)
+            ws_run_kw = records["ws_attempts"][0]["kwargs"]
+            self.assertEqual(ws_run_kw["http_proxy_host"], "p.webshare.io")
+            self.assertEqual(ws_run_kw["http_proxy_port"], 80)
+            self.assertEqual(ws_run_kw["proxy_type"], "http")
+            self.assertEqual(ws_run_kw["http_proxy_auth"], ("user+webshare", "p@ss:word#1"))
+
+            # 4. IQ_PROXY_WS=auto tries direct first, then falls back to proxy when direct fails
+            os.environ["IQ_PROXY_WS"] = "auto"
+            records["ws_attempts"].clear()
+            app._probe_ws_endpoint = lambda ws_url, timeout_seconds=None, include_upgrade=False, verify_tls=False: {
+                "url": ws_url,
+                "ok": False,
+                "stage": "tcp",
+                "error": "Direct TCP blocked",
+            }
+            ok_auto, reason_auto = api_inst.start_websocket()
+            self.assertTrue(ok_auto, f"Expected auto WS proxy fallback to succeed, got: {reason_auto}")
+            self.assertTrue(app._active_ws_via_proxy)
+            self.assertEqual(len(records["ws_attempts"]), 1)
+            self.assertEqual(records["ws_attempts"][0]["kwargs"]["http_proxy_host"], "p.webshare.io")
+
+            # 5. /network-check distinguishes proxyConfigured from proxyConnectivityVerified and direct vs proxied
+            app._probe_https_endpoint = lambda url, timeout_seconds=None: {
+                "url": url,
+                "ok": False,
+                "stage": "tcp",
+                "error": "Direct auth TCP timeout",
+            }
+            app._probe_https_via_proxy = lambda target_url, p_url, timeout_seconds=None: {
+                "url": target_url,
+                "proxy": app._redact_proxy_url(p_url),
+                "viaProxy": True,
+                "ok": False,
+                "stage": "proxy_connect",
+                "httpStatus": 407,
+                "error": "Proxy CONNECT rejected tunnel: HTTP 407",
+            }
+            app._probe_ws_via_proxy = lambda ws_url, p_url, timeout_seconds=None: {
+                "url": ws_url,
+                "proxy": app._redact_proxy_url(p_url),
+                "viaProxy": True,
+                "ok": False,
+                "stage": "proxy_connect",
+                "httpStatus": 407,
+                "error": "Proxy CONNECT rejected tunnel: HTTP 407",
+            }
+            net_res = asyncio.run(app.network_check(x_connector_token="diag-tok-1"))
+            self.assertTrue(net_res["proxyConfigured"])
+            # Must NOT claim proxy is working merely because IQ_PROXY_URL is configured
+            self.assertFalse(net_res["proxyConnectivityVerified"])
+            self.assertFalse(net_res["wsProxyConnectivityVerified"])
+            self.assertFalse(net_res["proxied"]["verified"])
+            self.assertFalse(net_res["direct"]["authEndpoint"]["ok"])
+            self.assertNotIn("p@ss:word#1", str(net_res))
+            self.assertNotIn("user+webshare", str(net_res))
+        finally:
+            app._probe_ws_endpoint = orig_probe_ws
+            app._probe_https_endpoint = orig_probe_https
+            app._probe_https_via_proxy = orig_probe_proxy
+            app._probe_ws_via_proxy = orig_probe_ws_proxy
+            cleanup()
+            if saved_ws_http is None:
+                sys.modules.pop("websocket._http", None)
+            else:
+                sys.modules["websocket._http"] = saved_ws_http
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_missing_or_invalid_balance_and_candles_never_fabricate_values(self):
+        """Ensure None/NaN/Inf balances and empty/malformed candles return HTTP 502 instead of fabricating 0 or empty 200."""
+        class BadBalanceClient(FakeIqClient):
+            def __init__(self, bad_balance):
+                super().__init__(initial_mode="PRACTICE")
+                self._bad_balance = bad_balance
+
+            def get_balance(self):
+                return self._bad_balance
+
+        for bad_val in (None, float("nan"), float("inf"), "not-a-number", True):
+            app._client = BadBalanceClient(bad_val)
+            with self.assertRaises(app.HTTPException) as bal_ctx:
+                app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(bal_ctx.exception.status_code, 502)
+            with self.assertRaises(app.HTTPException) as acct_ctx:
+                app.account(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+            self.assertEqual(acct_ctx.exception.status_code, 502)
+
+        # Empty candle list must raise HTTP 502 (not 200 with empty list)
+        app._client = FakeIqClient(initial_mode="PRACTICE", candles_rows=[])
+        q = app.CandlesQuery(symbol="EURUSD", interval=60, count=5)
+        with self.assertRaises(app.HTTPException) as empty_ctx:
+            app.candles(q, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+        self.assertEqual(empty_ctx.exception.status_code, 502)
+        self.assertFalse(app._last_candle_check["ok"])
+
+        # Malformed candles (None/NaN/negative/high<low) must be rejected with HTTP 502
+        bad_rows = [
+            {"from": None, "open": 1.1, "max": 1.2, "min": 1.0, "close": 1.15, "volume": 5},
+            {"from": 1700000000, "open": float("nan"), "max": 1.2, "min": 1.0, "close": 1.15, "volume": 5},
+            {"from": 1700000060, "open": 1.1, "max": 1.0, "min": 1.2, "close": 1.15, "volume": 5},
+            {"from": 1700000120, "open": -1.0, "max": 1.2, "min": 1.0, "close": 1.15, "volume": 5},
+        ]
+        app._client = FakeIqClient(initial_mode="PRACTICE", candles_rows=bad_rows)
+        with self.assertRaises(app.HTTPException) as bad_c_ctx:
+            app.candles(q, mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+        self.assertEqual(bad_c_ctx.exception.status_code, 502)
+        with self.assertRaises(app.HTTPException) as bad_p_ctx:
+            app.latest_price("EURUSD", mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
+        self.assertEqual(bad_p_ctx.exception.status_code, 502)
 
 
 if __name__ == "__main__":
