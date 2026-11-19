@@ -982,6 +982,466 @@ class TestIqConnectorModes(unittest.TestCase):
             else:
                 os.environ["IQ_CONNECTOR_TOKEN"] = orig_token
 
+    def _with_patched_http_auth_stubs(self, get_ssid_behavior=None):
+        """Helper installing stubs for IQOptionAPI HTTP session, HTTPAdapter, and auth flow."""
+        saved_modules = {}
+        module_names = [
+            "requests",
+            "requests.adapters",
+            "websocket",
+            "iqoptionapi",
+            "iqoptionapi.global_value",
+            "iqoptionapi.api",
+            "iqoptionapi.stable_api",
+            "iqoptionapi.ws",
+            "iqoptionapi.ws.client",
+        ]
+        for name in module_names:
+            saved_modules[name] = sys.modules.get(name)
+
+        records = {
+            "request_calls": [],
+            "mounted_adapters": {},
+            "get_ssid_calls": 0,
+            "ws_attempts": [],
+            "close_calls": 0,
+        }
+
+        class StubHTTPAdapter:
+            def __init__(self, pool_connections=10, pool_maxsize=10, max_retries=0):
+                self.pool_connections = pool_connections
+                self.pool_maxsize = pool_maxsize
+                self.max_retries = max_retries
+
+        m_req = ModuleType("requests")
+        m_req.utils = type("U", (), {"add_dict_to_cookiejar": staticmethod(lambda *a, **k: None)})()
+        m_req_adapters = ModuleType("requests.adapters")
+        m_req_adapters.HTTPAdapter = StubHTTPAdapter
+        m_req.adapters = m_req_adapters
+
+        m_ws_lib = ModuleType("websocket")
+        m_ws_lib.setdefaulttimeout = lambda _t: None
+
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_gv.check_websocket_if_connect = None
+        m_gv.check_websocket_if_error = False
+        m_gv.websocket_error_reason = None
+        m_gv.SSID = None
+        m_gv.balance_id = None
+
+        class StubSession:
+            def __init__(self):
+                self.verify = False  # Mirrors upstream iqoptionapi default
+                self.trust_env = True
+                self.cookies = {}
+
+            def mount(self, prefix, adapter):
+                records["mounted_adapters"][prefix] = adapter
+
+            def request(self, *args, **kwargs):
+                records["request_calls"].append({"args": args, "kwargs": dict(kwargs)})
+                return {"ok": True}
+
+        class SpyWss:
+            def __init__(self, url):
+                self.url = url
+                self.header = None
+
+            def run_forever(self, **kwargs):
+                records["ws_attempts"].append({"url": self.url, "kwargs": dict(kwargs)})
+                m_gv.check_websocket_if_connect = 1
+
+            def close(self):
+                records["close_calls"] += 1
+
+        class StubWebsocketClient:
+            def __init__(self, api):
+                self.api = api
+                self.wss = SpyWss(api.wss_url)
+
+            def on_message(self, message):
+                return None
+
+        class StubIQOptionAPI:
+            def __init__(self, host="iqoption.com", username="trader@example.com", password="iq-secret-password", proxies=None):
+                self.host = host
+                self.username = username
+                self.password = password
+                self.wss_url = app._WS_PRIMARY_URL
+                self.session = StubSession()
+                self.proxies = proxies
+                self.websocket_client = None
+                self.websocket_thread = None
+                self.profile = type("P", (), {"msg": None})()
+                self.timesync = type("T", (), {"server_timestamp": None})()
+
+            @property
+            def websocket(self):
+                return self.websocket_client.wss
+
+            def get_ssid(self):
+                records["get_ssid_calls"] += 1
+                if get_ssid_behavior is not None:
+                    return get_ssid_behavior(self)
+                return type("Resp", (), {"status_code": 200, "cookies": {"ssid": "sid-123"}, "text": "ok"})()
+
+            def ssid(self, _val):
+                self.profile.msg = {"balances": []}
+
+        class StubIQOption:
+            def connect(self):
+                return True, None
+
+        m_api = ModuleType("iqoptionapi.api")
+        m_api.IQOptionAPI = StubIQOptionAPI
+        m_stable = ModuleType("iqoptionapi.stable_api")
+        m_stable.IQ_Option = StubIQOption
+        m_ws = ModuleType("iqoptionapi.ws")
+        m_ws_client = ModuleType("iqoptionapi.ws.client")
+        m_ws_client.WebsocketClient = StubWebsocketClient
+
+        sys.modules["requests"] = m_req
+        sys.modules["requests.adapters"] = m_req_adapters
+        sys.modules["websocket"] = m_ws_lib
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.api"] = m_api
+        sys.modules["iqoptionapi.stable_api"] = m_stable
+        sys.modules["iqoptionapi.ws"] = m_ws
+        sys.modules["iqoptionapi.ws.client"] = m_ws_client
+
+        orig_patched = app._iqoptionapi_patched
+        app._iqoptionapi_patched = False
+        app._patch_iqoptionapi()
+
+        def cleanup():
+            app._iqoptionapi_patched = orig_patched
+            for name, mod in saved_modules.items():
+                if mod is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = mod
+
+        return StubIQOptionAPI, m_gv, records, cleanup
+
+    def test_proxy_disabled_by_default_and_direct_connection_preserved(self):
+        saved_env = {k: os.environ.get(k) for k in ("IQ_PROXY_URL", "IQ_PROXY_WS", "HTTPS_PROXY")}
+        os.environ.pop("IQ_PROXY_URL", None)
+        os.environ.pop("IQ_PROXY_WS", None)
+        # Even if ambient HTTPS_PROXY exists, proxy must remain opt-in/disabled by default
+        os.environ["HTTPS_PROXY"] = "http://ambient-should-be-ignored.local:8080"
+
+        api_cls, _gv, records, cleanup = self._with_patched_http_auth_stubs()
+        try:
+            self.assertIsNone(app._get_proxy_url())
+            self.assertIsNone(app._get_requests_proxies())
+            self.assertFalse(app._is_ws_proxy_enabled())
+            self.assertEqual(app._get_ws_proxy_kwargs(), {})
+
+            api_inst = api_cls()
+            self.assertIsNone(api_inst.proxies)
+            self.assertFalse(api_inst.session.trust_env)
+            self.assertTrue(api_inst.session.verify)
+            self.assertIn("https://", records["mounted_adapters"])
+            self.assertEqual(records["mounted_adapters"]["https://"].max_retries, 0)
+
+            api_inst.session.request("POST", app._AUTH_LOGIN_URL, verify=False)
+            self.assertEqual(len(records["request_calls"]), 1)
+            req_kw = records["request_calls"][0]["kwargs"]
+            # Certificate verification must stay enforced even if caller passed verify=False
+            self.assertTrue(req_kw["verify"])
+            self.assertEqual(req_kw["timeout"], (app._HTTP_CONNECT_TIMEOUT, app._HTTP_TIMEOUT))
+            self.assertNotIn("proxies", req_kw)
+
+            health_res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertFalse(health_res["proxyConfigured"])
+            self.assertFalse(health_res["wsProxyEnabled"])
+            self.assertFalse(health_res["orderExecutionSupported"])
+            self.assertFalse(health_res["realTradingEnabled"])
+        finally:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            cleanup()
+
+    def test_proxy_opt_in_routes_http_with_verified_tls_and_keeps_ws_direct_by_default(self):
+        saved_env = {k: os.environ.get(k) for k in ("IQ_PROXY_URL", "IQ_PROXY_WS", "IQ_WS_URL")}
+        proxy_url = "http://eu_user:MyProxySecret123@eu-proxy.example:8443"
+        os.environ["IQ_PROXY_URL"] = proxy_url
+        os.environ.pop("IQ_PROXY_WS", None)
+        os.environ.pop("IQ_WS_URL", None)
+
+        orig_probe = app._probe_ws_endpoint
+        api_cls, _gv, records, cleanup = self._with_patched_http_auth_stubs()
+        app._probe_ws_endpoint = lambda ws_url, timeout_seconds=None, include_upgrade=False, verify_tls=False: {
+            "url": ws_url,
+            "host": "iqoption.com",
+            "port": 443,
+            "ok": True,
+            "stage": "ok",
+            "resolvedIps": ["45.88.36.129"],
+            "dnsMs": 5.0,
+            "tcpMs": 5.0,
+            "tlsMs": 8.0,
+            "upgradeMs": None,
+            "tlsVersion": "TLSv1.3",
+            "httpStatus": None,
+            "error": None,
+        }
+        try:
+            api_inst = api_cls()
+            self.assertEqual(api_inst.proxies, {"http": proxy_url, "https": proxy_url})
+            self.assertTrue(api_inst.session.verify)
+            self.assertFalse(api_inst.session.trust_env)
+
+            api_inst.session.request("POST", app._AUTH_LOGIN_URL)
+            req_kw = records["request_calls"][0]["kwargs"]
+            self.assertTrue(req_kw["verify"])
+            self.assertEqual(req_kw["proxies"], {"http": proxy_url, "https": proxy_url})
+            self.assertEqual(req_kw["timeout"], (app._HTTP_CONNECT_TIMEOUT, app._HTTP_TIMEOUT))
+
+            # WebSocket MUST remain direct by default even when IQ_PROXY_URL is set
+            self.assertFalse(app._is_ws_proxy_enabled())
+            ok, reason = api_inst.start_websocket()
+            self.assertTrue(ok)
+            self.assertIsNone(reason)
+            self.assertEqual(len(records["ws_attempts"]), 1)
+            ws_kw = records["ws_attempts"][0]["kwargs"]
+            self.assertNotIn("http_proxy_host", ws_kw)
+            self.assertNotIn("http_proxy_port", ws_kw)
+            self.assertNotIn("http_proxy_auth", ws_kw)
+
+            # /health exposes only safe boolean flags and never proxy URL/credentials
+            health_res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+            self.assertTrue(health_res["proxyConfigured"])
+            self.assertFalse(health_res["wsProxyEnabled"])
+            self.assertNotIn("MyProxySecret123", str(health_res))
+            self.assertNotIn("eu_user", str(health_res))
+
+            # Invalid proxy scheme fails closed without echoing credentials
+            os.environ["IQ_PROXY_URL"] = "ftp://leak_user:leak_pass@bad.example:21"
+            with self.assertRaises(ValueError) as bad_ctx:
+                app._get_proxy_url()
+            self.assertNotIn("leak_pass", str(bad_ctx.exception))
+            self.assertNotIn("leak_user", str(bad_ctx.exception))
+        finally:
+            app._probe_ws_endpoint = orig_probe
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            cleanup()
+
+    def test_auth_failures_classify_errors_and_never_switch_auth_host(self):
+        orig_probe = app._probe_ws_endpoint
+        app._probe_ws_endpoint = lambda ws_url, timeout_seconds=None, include_upgrade=False, verify_tls=False: {
+            "url": ws_url,
+            "host": "iqoption.com",
+            "port": 443,
+            "ok": True,
+            "stage": "ok",
+            "resolvedIps": ["45.88.36.129"],
+            "dnsMs": 5.0,
+            "tcpMs": 5.0,
+            "tlsMs": 8.0,
+            "upgradeMs": None,
+            "tlsVersion": "TLSv1.3",
+            "httpStatus": None,
+            "error": None,
+        }
+
+        class FakeSSLError(Exception):
+            pass
+
+        class FakeProxyError(Exception):
+            pass
+
+        scenarios = [
+            (
+                "http_401",
+                lambda _api: type(
+                    "Resp",
+                    (),
+                    {
+                        "status_code": 401,
+                        "cookies": {},
+                        "text": "invalid_credentials",
+                        "json": staticmethod(lambda: {"code": "invalid_credentials"}),
+                    },
+                )(),
+                "auth.iqoption.com (HTTP 401)",
+            ),
+            (
+                "ssl_error",
+                lambda _api: (_ for _ in ()).throw(FakeSSLError("CERTIFICATE_VERIFY_FAILED")),
+                "TLS verification failed",
+            ),
+            (
+                "proxy_error",
+                lambda _api: (_ for _ in ()).throw(
+                    FakeProxyError("Cannot connect to proxy http://puser:ppass@proxy.local:8080")
+                ),
+                "proxy tunnel failed",
+            ),
+        ]
+
+        try:
+            for _label, behavior, expected_text in scenarios:
+                api_cls, _gv, records, cleanup = self._with_patched_http_auth_stubs(get_ssid_behavior=behavior)
+                try:
+                    api_inst = api_cls()
+                    ok, reason = api_inst.connect()
+                    self.assertFalse(ok)
+                    self.assertIn(expected_text, reason)
+                    # Exactly one auth attempt on canonical host; never silently switch hosts or retry
+                    self.assertEqual(records["get_ssid_calls"], 1)
+                    self.assertGreaterEqual(records["close_calls"], 1)
+                    # Proxy credentials must never leak into reason
+                    self.assertNotIn("ppass", reason)
+                    self.assertNotIn("puser", reason)
+                    self.assertNotIn("iq-secret-password", reason)
+                finally:
+                    cleanup()
+        finally:
+            app._probe_ws_endpoint = orig_probe
+
+    def test_auth_timeout_handling_bounded_no_retries_and_closes_ws(self):
+        orig_probe = app._probe_ws_endpoint
+        app._probe_ws_endpoint = lambda ws_url, timeout_seconds=None, include_upgrade=False, verify_tls=False: {
+            "url": ws_url,
+            "host": "iqoption.com",
+            "port": 443,
+            "ok": True,
+            "stage": "ok",
+            "resolvedIps": ["45.88.36.129"],
+            "dnsMs": 5.0,
+            "tcpMs": 5.0,
+            "tlsMs": 8.0,
+            "upgradeMs": None,
+            "tlsVersion": "TLSv1.3",
+            "httpStatus": None,
+            "error": None,
+        }
+
+        class ConnectTimeout(Exception):
+            pass
+
+        class ReadTimeout(Exception):
+            pass
+
+        try:
+            for exc_cls, expected_phrase in (
+                (ConnectTimeout, "TCP connection timed out"),
+                (ReadTimeout, "read timed out"),
+            ):
+                api_cls, _gv, records, cleanup = self._with_patched_http_auth_stubs(
+                    get_ssid_behavior=lambda _api, e=exc_cls: (_ for _ in ()).throw(
+                        e("auth.iqoption.com timed out")
+                    )
+                )
+                try:
+                    api_inst = api_cls()
+                    ok, reason = api_inst.connect()
+                    self.assertFalse(ok)
+                    self.assertIn(expected_phrase, reason)
+                    self.assertEqual(records["get_ssid_calls"], 1)
+                    self.assertGreaterEqual(records["close_calls"], 1)
+                finally:
+                    cleanup()
+        finally:
+            app._probe_ws_endpoint = orig_probe
+
+    def test_secret_redaction_strips_proxy_and_iq_credentials_everywhere(self):
+        saved_env = {
+            k: os.environ.get(k)
+            for k in ("IQ_EMAIL", "IQ_PASSWORD", "IQ_CONNECTOR_TOKEN", "IQ_PROXY_URL", "IQ_PROXY_WS")
+        }
+        os.environ["IQ_EMAIL"] = "private.trader@example.com"
+        os.environ["IQ_PASSWORD"] = "UltraSecretIQPass!99"
+        os.environ["IQ_CONNECTOR_TOKEN"] = "ConnTok-887766"
+        os.environ["IQ_PROXY_URL"] = "http://prox_usr:ProxPass%402026@eu-egress.example:3128"
+        os.environ.pop("IQ_PROXY_WS", None)
+
+        orig_probe_ws = app._probe_ws_endpoint
+        orig_probe_https = app._probe_https_endpoint
+        orig_probe_proxy = app._probe_https_via_proxy
+
+        try:
+            # Redacted proxy helper strips credentials and keeps only scheme://host:port
+            self.assertEqual(
+                app._redact_proxy_url(os.environ["IQ_PROXY_URL"]),
+                "http://eu-egress.example:3128",
+            )
+
+            import base64
+            basic_b64 = base64.b64encode(b"prox_usr:ProxPass@2026").decode("ascii")
+            noisy = (
+                "ProxyError connecting via http://prox_usr:ProxPass%402026@eu-egress.example:3128 "
+                f"Proxy-Authorization: Basic {basic_b64} "
+                "email=private.trader@example.com pwd=UltraSecretIQPass!99 tok=ConnTok-887766 "
+                "other=https://inline_u:inline_p@other.example:9000 raw=ProxPass@2026"
+            )
+            cleaned = app._sanitize_error(noisy)
+            for forbidden in (
+                "prox_usr",
+                "ProxPass%402026",
+                "ProxPass@2026",
+                basic_b64,
+                "private.trader@example.com",
+                "UltraSecretIQPass!99",
+                "ConnTok-887766",
+                "inline_u",
+                "inline_p",
+            ):
+                self.assertNotIn(forbidden, cleaned)
+            self.assertIn("eu-egress.example:3128", cleaned)
+
+            # Verify /network-check proxyAuthEndpoint never exposes credentials
+            app._probe_ws_endpoint = lambda url, timeout_seconds=None, include_upgrade=False: {
+                "url": url,
+                "ok": True,
+                "stage": "ok",
+            }
+            app._probe_https_endpoint = lambda url, timeout_seconds=None: {
+                "url": url,
+                "ok": False,
+                "stage": "tcp",
+            }
+            app._probe_https_via_proxy = lambda target_url, proxy_url, timeout_seconds=None: {
+                "proxy": app._redact_proxy_url(proxy_url),
+                "target": "auth.iqoption.com:443",
+                "ok": True,
+                "stage": "ok",
+                "tlsVerified": True,
+                "tlsVersion": "TLSv1.3",
+                "error": None,
+            }
+            net_res = asyncio.run(app.network_check(x_connector_token="ConnTok-887766"))
+            self.assertTrue(net_res["proxyConfigured"])
+            self.assertFalse(net_res["wsProxyEnabled"])
+            self.assertEqual(net_res["proxyAuthEndpoint"]["proxy"], "http://eu-egress.example:3128")
+            self.assertTrue(net_res["proxyAuthEndpoint"]["tlsVerified"])
+            self.assertFalse(net_res["orderExecutionSupported"])
+            self.assertFalse(net_res["realTradingEnabled"])
+            serialized = str(net_res)
+            for forbidden in ("prox_usr", "ProxPass", "UltraSecretIQPass", "private.trader@example.com", "ConnTok-887766"):
+                self.assertNotIn(forbidden, serialized)
+        finally:
+            app._probe_ws_endpoint = orig_probe_ws
+            app._probe_https_endpoint = orig_probe_https
+            app._probe_https_via_proxy = orig_probe_proxy
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
 
 if __name__ == "__main__":
     unittest.main()

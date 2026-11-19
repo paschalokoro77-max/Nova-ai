@@ -9,22 +9,24 @@ import contextlib
 import json
 import logging
 import os
+import re
 import socket
 import ssl
 import threading
 import time
 import urllib.parse
-from typing import Any, Callable, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.3')
+app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.4')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
 _WS_ORIGIN = 'https://iqoption.com'
 _WS_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+_AUTH_LOGIN_URL = 'https://auth.iqoption.com/api/v2/login'
 
 _LOCK_ACQUIRE_TIMEOUT = float(os.environ.get('IQ_LOCK_TIMEOUT_SECONDS', '2.0'))
 _WS_CONNECT_TIMEOUT = float(os.environ.get('IQ_WS_CONNECT_TIMEOUT_SECONDS', '6.0'))
@@ -35,7 +37,8 @@ _MODE_TIMEOUT = float(os.environ.get('IQ_MODE_TIMEOUT_SECONDS', '5.0'))
 _HISTORY_TIMEOUT = float(os.environ.get('IQ_HISTORY_TIMEOUT_SECONDS', '6.0'))
 _ASSETS_TIMEOUT = float(os.environ.get('IQ_ASSETS_TIMEOUT_SECONDS', '8.0'))
 _CLOSE_TIMEOUT = 1.5
-_HTTP_TIMEOUT = 10.0
+_HTTP_CONNECT_TIMEOUT = float(os.environ.get('IQ_HTTP_CONNECT_TIMEOUT_SECONDS', '6.0'))
+_HTTP_TIMEOUT = float(os.environ.get('IQ_HTTP_READ_TIMEOUT_SECONDS', '10.0'))
 
 _lock = threading.RLock()
 _client: Any = None
@@ -51,18 +54,110 @@ _iqoptionapi_patched: bool = False
 
 T = TypeVar('T')
 
+_URL_USERINFO_RE = re.compile(r'((?:https?|wss?|socks5h?)://)([^@\s/]+)@', re.IGNORECASE)
+_AUTH_HEADER_RE = re.compile(r'((?:proxy-)?authorization\s*[:=]\s*(?:basic|bearer)\s+)\S+', re.IGNORECASE)
+
+
+def _get_proxy_url() -> Optional[str]:
+    """Return validated opt-in HTTP/HTTPS CONNECT proxy URL from IQ_PROXY_URL, or None when disabled."""
+    raw = (os.environ.get('IQ_PROXY_URL') or '').strip()
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    scheme = (parsed.scheme or '').lower()
+    if scheme not in ('http', 'https') or not parsed.hostname:
+        raise ValueError('Invalid IQ_PROXY_URL configuration; expected http:// or https:// URL with hostname.')
+    return raw
+
+
+def _is_ws_proxy_enabled() -> bool:
+    """Keep WebSocket traffic direct by default unless IQ_PROXY_WS is explicitly enabled."""
+    try:
+        if not _get_proxy_url():
+            return False
+    except ValueError:
+        return False
+    return (os.environ.get('IQ_PROXY_WS') or '').strip().lower() in ('1', 'true', 'yes')
+
+
+def _redact_proxy_url(raw_url: Optional[str]) -> Optional[str]:
+    """Return scheme://host[:port] with all embedded credentials stripped."""
+    if not raw_url:
+        return None
+    try:
+        parsed = urllib.parse.urlparse(str(raw_url).strip())
+        if not parsed.scheme or not parsed.hostname:
+            return None
+        port_suffix = f':{parsed.port}' if parsed.port else ''
+        return f'{parsed.scheme.lower()}://{parsed.hostname}{port_suffix}'
+    except Exception:
+        return None
+
+
+def _get_requests_proxies() -> Optional[Dict[str, str]]:
+    """Return requests proxy dict when IQ_PROXY_URL is configured, or None for direct connections."""
+    proxy_url = _get_proxy_url()
+    if not proxy_url:
+        return None
+    return {'http': proxy_url, 'https': proxy_url}
+
+
+def _get_ws_proxy_kwargs() -> Dict[str, Any]:
+    """Return websocket-client proxy kwargs ONLY when both IQ_PROXY_URL and IQ_PROXY_WS=true are set."""
+    if not _is_ws_proxy_enabled():
+        return {}
+    proxy_url = _get_proxy_url()
+    if not proxy_url:
+        return {}
+    parsed = urllib.parse.urlparse(proxy_url)
+    port = parsed.port or (443 if parsed.scheme.lower() == 'https' else 8080)
+    kwargs: Dict[str, Any] = {
+        'http_proxy_host': parsed.hostname,
+        'http_proxy_port': port,
+        'proxy_type': 'http',
+    }
+    if parsed.username is not None:
+        kwargs['http_proxy_auth'] = (
+            urllib.parse.unquote(parsed.username),
+            urllib.parse.unquote(parsed.password or ''),
+        )
+    return kwargs
+
 
 def _sanitize_error(msg: str, extra_secrets: Tuple[Optional[str], ...] = ()) -> str:
     cleaned = str(msg or '')
-    secrets = [
+    cleaned = _URL_USERINFO_RE.sub(r'\1***@', cleaned)
+    cleaned = _AUTH_HEADER_RE.sub(r'\1***', cleaned)
+
+    secrets: List[str] = [
+        (os.environ.get('IQ_EMAIL') or '').strip(),
         (os.environ.get('IQ_PASSWORD') or '').strip(),
         (os.environ.get('IQ_CONNECTOR_TOKEN') or '').strip(),
     ]
+    raw_proxy = (os.environ.get('IQ_PROXY_URL') or '').strip()
+    if raw_proxy:
+        secrets.append(raw_proxy)
+        try:
+            parsed = urllib.parse.urlparse(raw_proxy)
+            for part in (parsed.username, parsed.password):
+                if part:
+                    secrets.append(part)
+                    unquoted = urllib.parse.unquote(part)
+                    if unquoted and unquoted != part:
+                        secrets.append(unquoted)
+            if parsed.username is not None:
+                raw_auth = f'{urllib.parse.unquote(parsed.username)}:{urllib.parse.unquote(parsed.password or "")}'
+                secrets.append(base64.b64encode(raw_auth.encode('utf-8')).decode('ascii'))
+        except Exception:
+            pass
+
     for s in extra_secrets:
         if s and str(s).strip():
             secrets.append(str(s).strip())
-    for secret in secrets:
-        if secret and secret in cleaned:
+
+    # Replace longest secrets first to avoid partial remnants
+    for secret in sorted(set(s for s in secrets if s), key=len, reverse=True):
+        if secret in cleaned:
             cleaned = cleaned.replace(secret, '***')
     return cleaned[:480]
 
@@ -208,8 +303,9 @@ def _probe_ws_endpoint(
     ws_url: str,
     timeout_seconds: Optional[float] = None,
     include_upgrade: bool = False,
+    verify_tls: bool = False,
 ) -> dict:
-    """Run bounded DNS -> TCP -> TLS (-> optional HTTP/1.1 WS Upgrade) diagnostics on a WebSocket URL."""
+    """Run bounded DNS -> TCP -> TLS (-> optional HTTP/1.1 WS Upgrade) diagnostics on an endpoint URL."""
     budget = _WS_CONNECT_TIMEOUT if timeout_seconds is None else float(timeout_seconds)
     deadline = time.monotonic() + budget
     parsed = urllib.parse.urlparse(ws_url)
@@ -299,9 +395,12 @@ def _probe_ws_endpoint(
             t_tls = time.monotonic()
             try:
                 raw_sock.settimeout(remaining)
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
+                if verify_tls:
+                    ctx = ssl.create_default_context()
+                else:
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE
                 tls_sock = ctx.wrap_socket(raw_sock, server_hostname=host)
                 diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
                 diag['tlsVersion'] = tls_sock.version()
@@ -375,8 +474,144 @@ def _probe_ws_endpoint(
 
 
 def _probe_https_endpoint(url: str, timeout_seconds: Optional[float] = None) -> dict:
-    """Read-only DNS -> TCP -> TLS probe for HTTPS endpoints such as auth.iqoption.com."""
-    return _probe_ws_endpoint(url, timeout_seconds=timeout_seconds, include_upgrade=False)
+    """Read-only DNS -> TCP -> verified TLS probe for HTTPS endpoints such as auth.iqoption.com."""
+    return _probe_ws_endpoint(url, timeout_seconds=timeout_seconds, include_upgrade=False, verify_tls=True)
+
+
+def _probe_https_via_proxy(
+    target_url: str,
+    proxy_url: str,
+    timeout_seconds: Optional[float] = None,
+) -> dict:
+    """Read-only HTTP CONNECT tunnel + verified TLS probe to target_url via proxy_url (sends zero IQ credentials)."""
+    budget = _HTTP_CONNECT_TIMEOUT if timeout_seconds is None else float(timeout_seconds)
+    deadline = time.monotonic() + budget
+    t_parsed = urllib.parse.urlparse(target_url)
+    p_parsed = urllib.parse.urlparse(proxy_url)
+    target_host = t_parsed.hostname or ''
+    target_port = t_parsed.port or 443
+    proxy_host = p_parsed.hostname or ''
+    proxy_port = p_parsed.port or (443 if (p_parsed.scheme or '').lower() == 'https' else 8080)
+
+    diag: dict = {
+        'proxy': _redact_proxy_url(proxy_url),
+        'target': f'{target_host}:{target_port}',
+        'ok': False,
+        'stage': 'proxy_tcp',
+        'proxyMs': None,
+        'tlsMs': None,
+        'tlsVersion': None,
+        'tlsVerified': True,
+        'httpStatus': None,
+        'error': None,
+    }
+    if not proxy_host or not target_host:
+        diag['error'] = 'Invalid proxy or target host.'
+        return diag
+
+    raw_sock: Optional[socket.socket] = None
+    active_sock: Any = None
+    try:
+        t_proxy = time.monotonic()
+        try:
+            raw_sock = socket.create_connection((proxy_host, proxy_port), timeout=max(0.2, deadline - time.monotonic()))
+        except socket.timeout:
+            diag['proxyMs'] = round((time.monotonic() - t_proxy) * 1000, 1)
+            diag['error'] = f'TCP connect to proxy timed out after {budget:.1f}s.'
+            return diag
+        except Exception as exc:
+            diag['proxyMs'] = round((time.monotonic() - t_proxy) * 1000, 1)
+            diag['error'] = _sanitize_error(f'TCP connect to proxy failed: {type(exc).__name__}: {exc}')
+            return diag
+
+        active_sock = raw_sock
+        if (p_parsed.scheme or '').lower() == 'https':
+            diag['stage'] = 'proxy_tls'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.05:
+                diag['error'] = 'Proxy TLS budget exhausted.'
+                return diag
+            try:
+                raw_sock.settimeout(remaining)
+                p_ctx = ssl.create_default_context()
+                active_sock = p_ctx.wrap_socket(raw_sock, server_hostname=proxy_host)
+            except Exception as exc:
+                diag['error'] = _sanitize_error(f'Proxy TLS handshake failed: {type(exc).__name__}: {exc}')
+                return diag
+
+        diag['stage'] = 'proxy_connect'
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            diag['error'] = 'Proxy CONNECT tunnel budget exhausted.'
+            return diag
+        try:
+            active_sock.settimeout(remaining)
+            req_lines = [
+                f'CONNECT {target_host}:{target_port} HTTP/1.1',
+                f'Host: {target_host}:{target_port}',
+                'Proxy-Connection: Keep-Alive',
+            ]
+            if p_parsed.username is not None:
+                creds = f'{urllib.parse.unquote(p_parsed.username)}:{urllib.parse.unquote(p_parsed.password or "")}'
+                b64 = base64.b64encode(creds.encode('utf-8')).decode('ascii')
+                req_lines.append(f'Proxy-Authorization: Basic {b64}')
+            req_lines.extend(['', ''])
+            active_sock.sendall('\r\n'.join(req_lines).encode('ascii'))
+            resp_buf = b''
+            while b'\r\n\r\n' not in resp_buf and len(resp_buf) < 4096:
+                chunk = active_sock.recv(1024)
+                if not chunk:
+                    break
+                resp_buf += chunk
+            diag['proxyMs'] = round((time.monotonic() - t_proxy) * 1000, 1)
+            status_line = resp_buf.split(b'\r\n', 1)[0].decode('latin1', errors='replace').strip()
+            parts = status_line.split(' ', 2)
+            status_code = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
+            diag['httpStatus'] = status_code
+            if status_code != 200:
+                diag['error'] = _sanitize_error(f'Proxy CONNECT rejected tunnel: HTTP {status_code or "unknown"}')
+                return diag
+        except socket.timeout:
+            diag['proxyMs'] = round((time.monotonic() - t_proxy) * 1000, 1)
+            diag['error'] = 'Proxy CONNECT handshake timed out.'
+            return diag
+        except Exception as exc:
+            diag['proxyMs'] = round((time.monotonic() - t_proxy) * 1000, 1)
+            diag['error'] = _sanitize_error(f'Proxy CONNECT failed: {type(exc).__name__}: {exc}')
+            return diag
+
+        diag['stage'] = 'tls'
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.05:
+            diag['error'] = 'Target TLS budget exhausted after proxy CONNECT.'
+            return diag
+        t_tls = time.monotonic()
+        try:
+            active_sock.settimeout(remaining)
+            ctx = ssl.create_default_context()
+            tls_sock = ctx.wrap_socket(active_sock, server_hostname=target_host)
+            diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
+            diag['tlsVersion'] = tls_sock.version()
+            active_sock = tls_sock
+        except socket.timeout:
+            diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
+            diag['error'] = f'TLS handshake through proxy timed out for {target_host}.'
+            return diag
+        except Exception as exc:
+            diag['tlsMs'] = round((time.monotonic() - t_tls) * 1000, 1)
+            diag['error'] = _sanitize_error(f'TLS verification through proxy failed for {target_host}: {type(exc).__name__}: {exc}')
+            return diag
+
+        diag['stage'] = 'ok'
+        diag['ok'] = True
+        return diag
+    finally:
+        for sock_obj in (active_sock, raw_sock):
+            if sock_obj is not None:
+                try:
+                    sock_obj.close()
+                except Exception:
+                    pass
 
 
 def _is_client_alive(client: Any) -> bool:
@@ -427,15 +662,34 @@ def _patch_iqoptionapi():
 
     WebsocketClient.on_message = _safe_on_message
 
-    # 2. Enforce HTTP timeout default on IQOptionAPI.session.request
+    # 2. Harden HTTP session: verified TLS, bounded pool/timeout, zero retry storms, optional opt-in CONNECT proxy
     orig_api_init = IQOptionAPI.__init__
 
     def _safe_api_init(self, *args, **kwargs):
         orig_api_init(self, *args, **kwargs)
+        # Keep proxy strictly opt-in via IQ_PROXY_URL (never implicitly pick up ambient env vars)
+        self.session.trust_env = False
+        # Always enforce TLS certificate verification on HTTPS requests (including over CONNECT tunnels)
+        self.session.verify = True
+        proxies = _get_requests_proxies()
+        self.proxies = proxies
+
+        try:
+            from requests.adapters import HTTPAdapter
+            if hasattr(self.session, 'mount'):
+                adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
+                self.session.mount('https://', adapter)
+                self.session.mount('http://', adapter)
+        except Exception:
+            pass
+
         orig_request = self.session.request
 
         def _timed_request(*r_args, **r_kwargs):
-            r_kwargs.setdefault('timeout', _HTTP_TIMEOUT)
+            r_kwargs.setdefault('timeout', (_HTTP_CONNECT_TIMEOUT, _HTTP_TIMEOUT))
+            r_kwargs['verify'] = True
+            if proxies is not None and r_kwargs.get('proxies') is None:
+                r_kwargs['proxies'] = proxies
             return orig_request(*r_args, **r_kwargs)
 
         self.session.request = _timed_request
@@ -497,11 +751,30 @@ def _patch_iqoptionapi():
         except Exception:
             pass
 
+        ws_proxy_kwargs = _get_ws_proxy_kwargs()
+
         for candidate_url in candidates:
-            probe = _probe_ws_endpoint(candidate_url, timeout_seconds=ws_timeout, include_upgrade=False)
-            if not probe.get('ok'):
-                attempt_diags.append(probe)
-                continue
+            if ws_proxy_kwargs:
+                probe = {
+                    'url': candidate_url,
+                    'host': urllib.parse.urlparse(candidate_url).hostname or '',
+                    'port': urllib.parse.urlparse(candidate_url).port or 443,
+                    'ok': True,
+                    'stage': 'proxy_ws',
+                    'resolvedIps': [],
+                    'dnsMs': None,
+                    'tcpMs': None,
+                    'tlsMs': None,
+                    'upgradeMs': None,
+                    'tlsVersion': None,
+                    'httpStatus': None,
+                    'error': None,
+                }
+            else:
+                probe = _probe_ws_endpoint(candidate_url, timeout_seconds=ws_timeout, include_upgrade=False)
+                if not probe.get('ok'):
+                    attempt_diags.append(probe)
+                    continue
 
             global_value.check_websocket_if_connect = None
             global_value.check_websocket_if_error = False
@@ -513,12 +786,16 @@ def _patch_iqoptionapi():
             if wss_obj is not None:
                 wss_obj.header = [f'User-Agent: {_WS_USER_AGENT}']
 
+            run_kwargs: Dict[str, Any] = {
+                'sslopt': {'check_hostname': False, 'cert_reqs': ssl.CERT_NONE},
+                'origin': _WS_ORIGIN,
+            }
+            if ws_proxy_kwargs:
+                run_kwargs.update(ws_proxy_kwargs)
+
             self.websocket_thread = threading.Thread(
                 target=self.websocket.run_forever,
-                kwargs={
-                    'sslopt': {'check_hostname': False, 'cert_reqs': ssl.CERT_NONE},
-                    'origin': _WS_ORIGIN,
-                },
+                kwargs=run_kwargs,
                 daemon=True,
             )
             self.websocket_thread.start()
@@ -583,7 +860,48 @@ def _patch_iqoptionapi():
 
     IQOptionAPI.send_ssid = _safe_send_ssid
 
-    # 7. Bounded IQOptionAPI.connect() (no infinite timesync spin, no atexit leak)
+    # 7. Bounded IQOptionAPI.connect() (no infinite timesync spin, no atexit leak, safe auth error classification)
+    def _fetch_ssid_safely(api_self) -> Tuple[Optional[str], Optional[str]]:
+        extra = (getattr(api_self, 'username', None), getattr(api_self, 'password', None))
+        try:
+            response = api_self.get_ssid()
+        except Exception as exc:
+            cls_name = type(exc).__name__
+            low = f'{cls_name}: {exc}'.lower()
+            if 'ssl' in low or 'certificate' in low:
+                return None, _sanitize_error(f'IQ Option auth TLS verification failed ({cls_name}): {exc}', extra)
+            if 'proxy' in low:
+                return None, _sanitize_error(f'IQ Option auth proxy tunnel failed ({cls_name}): {exc}', extra)
+            if 'connecttimeout' in low or 'connect timeout' in low:
+                return None, _sanitize_error(f'IQ Option auth TCP connection timed out ({cls_name}): {exc}', extra)
+            if 'readtimeout' in low or 'read timeout' in low or isinstance(exc, TimeoutError):
+                return None, _sanitize_error(f'IQ Option auth read timed out ({cls_name}): {exc}', extra)
+            return None, _sanitize_error(f'IQ Option auth request failed ({cls_name}): {exc}', extra)
+
+        try:
+            ssid_val = response.cookies['ssid']
+            if ssid_val:
+                return str(ssid_val), None
+        except Exception:
+            pass
+
+        status_code = getattr(response, 'status_code', None)
+        body_snippet = ''
+        try:
+            payload = response.json()
+            if isinstance(payload, dict):
+                code = payload.get('code') or payload.get('message')
+                if code:
+                    body_snippet = f' ({code})'
+        except Exception:
+            pass
+        if status_code is not None:
+            return None, _sanitize_error(
+                f'IQ Option authentication rejected by auth.iqoption.com (HTTP {status_code}){body_snippet}.',
+                extra,
+            )
+        return None, _sanitize_error(getattr(response, 'text', str(response)), extra)
+
     def _safe_api_connect(self):
         global_value.ssl_Mutual_exclusion = False
         global_value.ssl_Mutual_exclusion_write = False
@@ -598,12 +916,11 @@ def _patch_iqoptionapi():
         if global_value.SSID is not None:
             check_ssid = self.send_ssid()
             if not check_ssid:
-                response = self.get_ssid()
-                try:
-                    global_value.SSID = response.cookies['ssid']
-                except Exception:
+                ssid_val, auth_err = _fetch_ssid_safely(self)
+                if not ssid_val:
                     self.close()
-                    return False, getattr(response, 'text', str(response))
+                    return False, auth_err or 'IQ Option authentication failed.'
+                global_value.SSID = ssid_val
                 check_ws2, ws_reason2 = self.start_websocket()
                 if not check_ws2:
                     return False, ws_reason2
@@ -611,12 +928,11 @@ def _patch_iqoptionapi():
                     self.close()
                     return False, 'IQ Option SSID authentication timed out.'
         else:
-            response = self.get_ssid()
-            try:
-                global_value.SSID = response.cookies['ssid']
-            except Exception:
+            ssid_val, auth_err = _fetch_ssid_safely(self)
+            if not ssid_val:
                 self.close()
-                return False, getattr(response, 'text', str(response))
+                return False, auth_err or 'IQ Option authentication failed.'
+            global_value.SSID = ssid_val
             if not self.send_ssid():
                 self.close()
                 return False, 'IQ Option SSID authentication timed out.'
@@ -912,11 +1228,11 @@ def connect(
         except HTTPException:
             raise
         except TimeoutError as exc:
-            _last_error = _sanitize_error(f'Connection timed out: {exc}', (target_password,))
+            _last_error = _sanitize_error(f'Connection timed out: {exc}', (target_email, target_password))
             _invalidate_client()
             raise HTTPException(504, 'IQ Option broker connection timed out; please retry.') from None
         except Exception as exc:
-            _last_error = _sanitize_error(f'{type(exc).__name__}: {exc}', (target_password,))
+            _last_error = _sanitize_error(f'{type(exc).__name__}: {exc}', (target_email, target_password))
             raise HTTPException(502, f'Broker connection failed ({type(exc).__name__}); check connector configuration.') from None
 
 
@@ -1161,6 +1477,11 @@ async def health(
         confirmed_mode = _confirmed_mode if connected else _requested_mode
         mode_verified = bool(_mode_verified and confirmed_mode == target_mode) if connected else False
 
+    try:
+        proxy_configured = bool(_get_proxy_url())
+    except ValueError:
+        proxy_configured = False
+
     return {
         'status': 'running',
         'busy': busy,
@@ -1170,6 +1491,8 @@ async def health(
         'accountType': confirmed_mode if connected else None,
         'modeVerified': mode_verified if connected else False,
         'activeWsUrl': _active_ws_url if connected else None,
+        'proxyConfigured': proxy_configured,
+        'wsProxyEnabled': _is_ws_proxy_enabled(),
         'orderExecutionSupported': False,
         'realTradingEnabled': False,
         'credentialsConfigured': bool(os.getenv('IQ_EMAIL') and os.getenv('IQ_PASSWORD')),
@@ -1182,19 +1505,41 @@ async def health(
 async def network_check(
     x_connector_token: Optional[str] = Header(default=None),
 ):
-    """Secure, read-only DNS/TCP/TLS/WebSocket diagnostic probe (never exposes credentials or modifies session)."""
+    """Secure, read-only DNS/TCP/TLS/WebSocket/Proxy diagnostic probe (never exposes credentials or modifies session)."""
     _check_auth(x_connector_token)
     ws_urls = _get_ws_candidates()
     ws_probes = await asyncio.gather(
         *(asyncio.to_thread(_probe_ws_endpoint, url, _WS_CONNECT_TIMEOUT, True) for url in ws_urls)
     )
     auth_probe = await asyncio.to_thread(_probe_https_endpoint, 'https://auth.iqoption.com', _WS_CONNECT_TIMEOUT)
+
+    proxy_probe: Optional[dict] = None
+    proxy_configured = False
+    try:
+        proxy_url = _get_proxy_url()
+        if proxy_url:
+            proxy_configured = True
+            proxy_probe = await asyncio.to_thread(
+                _probe_https_via_proxy, 'https://auth.iqoption.com', proxy_url, _HTTP_CONNECT_TIMEOUT
+            )
+    except ValueError as exc:
+        proxy_probe = {
+            'proxy': None,
+            'target': 'auth.iqoption.com:443',
+            'ok': False,
+            'stage': 'config',
+            'error': _sanitize_error(str(exc)),
+        }
+
     return {
         'status': 'ok',
         'timeoutSeconds': _WS_CONNECT_TIMEOUT,
         'activeWsUrl': _active_ws_url,
+        'proxyConfigured': proxy_configured,
+        'wsProxyEnabled': _is_ws_proxy_enabled(),
         'wsEndpoints': ws_probes,
         'authEndpoint': auth_probe,
+        'proxyAuthEndpoint': proxy_probe,
         'lastConnectDiagnostics': _last_ws_diagnostics,
         'orderExecutionSupported': False,
         'realTradingEnabled': False,
