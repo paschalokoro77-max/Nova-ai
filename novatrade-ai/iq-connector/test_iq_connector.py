@@ -2,6 +2,7 @@
 Tests mode normalization, PRACTICE/REAL balance mode verification, fail-closed behavior, and order locking.
 """
 import asyncio
+import json
 import os
 import sys
 import threading
@@ -2620,6 +2621,140 @@ class TestIqConnectorModes(unittest.TestCase):
             self.assertEqual(ctx.exception.status_code, 409)
             self.assertEqual(client.buy_calls, [])
             self.assertEqual(client.change_balance_calls, [])
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_versioned_get_user_settings_and_nested_stringified_config_verify_practice(self):
+        """When IQ Option requires version=3 in get-user-settings body and returns nested/stringified config, PRACTICE is verified accurately."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = None
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            client = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+            seen_requests = []
+
+            def strict_versioned_send(name, msg, request_id="", no_force_send=True):
+                seen_requests.append((name, msg, request_id))
+                if name == "sendMessage" and isinstance(msg, dict) and msg.get("name") == "get-user-settings":
+                    body = msg.get("body") or {}
+                    if body.get("name") == "traderoom_gl_common" and body.get("version") == 3:
+                        # Real-world nested & JSON-stringified config with an unrelated numeric ID plus real PRACTICE balanceId
+                        client.api._nt_ws_responses[request_id] = {
+                            "name": "user-settings",
+                            "status": 2000,
+                            "request_id": request_id,
+                            "msg": {
+                                "result": {
+                                    "configs": {
+                                        "traderoom_gl_common": {
+                                            "version": 3,
+                                            "config": json.dumps({
+                                                "theme": "dark",
+                                                "unrelatedId": 999999,
+                                                "trading": {"selectedBalanceId": "444004"},
+                                            }),
+                                        }
+                                    }
+                                }
+                            },
+                        }
+                    else:
+                        client.api._nt_ws_responses[request_id] = {
+                            "name": "user-settings",
+                            "status": 4000,
+                            "request_id": request_id,
+                            "msg": {"message": "version is required"},
+                        }
+
+            client.api.send_websocket_request = strict_versioned_send
+            app._client = client
+
+            confirmed, verified = app._detect_balance_mode(client, refresh=True)
+            self.assertEqual(confirmed, "PRACTICE")
+            self.assertTrue(verified)
+            self.assertEqual(m_gv.balance_id, 444004)
+            # Clean numeric request_id used
+            self.assertTrue(all(str(rid).isdigit() for _, _, rid in seen_requests))
+
+            h = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h["connected"])
+            self.assertEqual(h["mode"], "PRACTICE")
+            self.assertEqual(h["modeDetection"]["userSettingsMatchedQuery"], "traderoom_gl_common_v3")
+            self.assertEqual(h["modeDetection"]["userSettingsResponseStatus"], 2000)
+            # Diagnostics must NEVER leak raw balance IDs or amounts
+            diag_json = json.dumps(h["modeDetection"])
+            self.assertNotIn("444004", diag_json)
+            self.assertNotIn("111001", diag_json)
+            self.assertNotIn("9850.5", diag_json)
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_http_getprofile_explicit_practice_verifies_but_legacy_real_never_assumed(self):
+        """HTTP getprofile read-only cross-check accepts explicit PRACTICE (including string '4') but NEVER assumes REAL on dual-wallet accounts."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = None
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            # Case A: WS profile omits balance_type, user-settings returns 4004, HTTP getprofile explicitly reports balance_type="4" (PRACTICE)
+            client_prac = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+            client_prac.api.profile.msg = {
+                "balances": client_prac.api.balances_raw["msg"],
+            }
+            client_prac.api.getprofile = lambda: {
+                "isSuccessful": True,
+                "result": {"balance_type": "4", "balance_id": 444004},
+            }
+            app._client = client_prac
+            confirmed, verified = app._detect_balance_mode(client_prac, refresh=True)
+            self.assertEqual(confirmed, "PRACTICE")
+            self.assertTrue(verified)
+            self.assertEqual(m_gv.balance_id, 444004)
+            self.assertEqual(app._mode_detection_diag["source"], "http_getprofile_explicit")
+
+            # Case B: HTTP getprofile reports legacy balance_type=1 (REAL) on dual-wallet account -> MUST remain UNVERIFIED!
+            client_ambig = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+            client_ambig.api.profile.msg = {
+                "balances": client_ambig.api.balances_raw["msg"],
+            }
+            client_ambig.api.getprofile = lambda: {
+                "isSuccessful": True,
+                "result": {"balance_type": 1, "balance_id": 111001},
+            }
+            app._client = client_ambig
+            confirmed2, verified2 = app._detect_balance_mode(client_ambig, refresh=True)
+            self.assertEqual(confirmed2, "UNVERIFIED")
+            self.assertFalse(verified2)
+            self.assertTrue(app._mode_detection_diag["profileDiag"]["httpProfileChecked"])
+            self.assertEqual(app._mode_detection_diag["profileDiag"]["httpProfileBalanceType"], 1)
+            self.assertEqual(app._mode_detection_diag["profileDiag"]["httpProfileBalanceIdMode"], "REAL")
         finally:
             for k, v in saved_modules.items():
                 if v is None:

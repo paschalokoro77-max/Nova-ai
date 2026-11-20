@@ -1071,11 +1071,13 @@ export function BrokerConnectionsView({
                     className={`rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${
                       acct.connected
                         ? 'border-emerald-300 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/35 text-emerald-700 dark:text-emerald-300'
-                        : acct.status === 'AUTHENTICATION FAILED' || acct.status === 'GATEWAY OFFLINE'
-                          ? 'border-red-300 dark:border-red-800/70 bg-red-50 dark:bg-red-950/35 text-red-700 dark:text-red-300'
-                          : acct.status === 'GATEWAY ONLINE'
-                            ? 'border-blue-300 dark:border-blue-800/70 bg-blue-50 dark:bg-blue-950/35 text-blue-700 dark:text-blue-300'
-                            : 'border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                        : acct.status === 'MODE UNVERIFIED'
+                          ? 'border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/35 text-amber-700 dark:text-amber-300'
+                          : acct.status === 'AUTHENTICATION FAILED' || acct.status === 'GATEWAY OFFLINE'
+                            ? 'border-red-300 dark:border-red-800/70 bg-red-50 dark:bg-red-950/35 text-red-700 dark:text-red-300'
+                            : acct.status === 'GATEWAY ONLINE'
+                              ? 'border-blue-300 dark:border-blue-800/70 bg-blue-50 dark:bg-blue-950/35 text-blue-700 dark:text-blue-300'
+                              : 'border-slate-300 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
                     }`}
                   >
                     {acct.status}
@@ -1086,14 +1088,22 @@ export function BrokerConnectionsView({
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-3 border-t border-slate-200/80 dark:border-slate-800 text-xs">
                   <div>
                     <p className="text-[11px] text-slate-500">
-                      {isVerifiedReal ? 'Account Balance' : isIqOption && displayMode === 'PRACTICE' ? 'Practice Balance' : 'Demo Balance'}
+                      {isUnverifiedIq
+                        ? 'Account Balance'
+                        : isVerifiedReal
+                          ? 'Account Balance'
+                          : isIqOption && displayMode === 'PRACTICE'
+                            ? 'Practice Balance'
+                            : 'Demo Balance'}
                     </p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
                       {typeof acct.balance === 'number' && Number.isFinite(acct.balance)
                         ? `${acct.balance.toFixed(2)} ${acct.currency || 'USD'}`
-                        : acct.connected
-                          ? 'Unavailable'
-                          : '—'}
+                        : isUnverifiedIq
+                          ? 'Withheld (Unverified)'
+                          : acct.connected
+                            ? 'Unavailable'
+                            : '—'}
                     </p>
                   </div>
                   <div>

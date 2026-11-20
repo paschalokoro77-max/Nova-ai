@@ -806,9 +806,19 @@ test('IQ Option mode verification: distinguishes PRACTICE vs REAL, clears stale 
 
     const syncedUnverified = await manager.checkHealthAndSyncBalance(userId, acct.id);
     assert.equal(syncedUnverified.connected, false);
+    assert.equal(syncedUnverified.status, 'MODE UNVERIFIED');
     assert.equal(syncedUnverified.accountType, 'UNVERIFIED');
     assert.equal(syncedUnverified.environment, 'demo');
     assert.equal(syncedUnverified.balance, null);
+
+    // Connecting while authenticated-but-unverified must report MODE UNVERIFIED (HTTP 409), NOT AUTHENTICATION FAILED (401)
+    await assert.rejects(
+      () => manager.connectAccount(userId, acct.id),
+      (err: unknown) => {
+        const e = err as { statusCode?: number; connectionStatus?: string };
+        return e.statusCode === 409 && e.connectionStatus === 'MODE UNVERIFIED';
+      }
+    );
 
     const adapter = registry.get('iq_option');
     assert.ok(adapter);
