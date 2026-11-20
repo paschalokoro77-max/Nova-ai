@@ -669,7 +669,11 @@ export default function App() {
     }
   }
 
-  async function handleOpenManualPaperTrade(symbol: string, direction: 'CALL' | 'PUT', amount: number) {
+  async function handleOpenManualPaperTrade(symbol: string, direction: 'CALL' | 'PUT', amount: number, expirySeconds?: number) {
+    if (amount > 100) {
+      pushToast('error', 'Stake Limit Exceeded', 'Maximum stake per individual trade is $100.');
+      return;
+    }
     setBusy(true);
     try {
       const res = await apiRequest<{ trade: PaperTrade; notice: string }>('/api/paper-trades', {
@@ -681,7 +685,7 @@ export default function App() {
           direction,
           amount,
           entryPrice: symbol === selectedSymbol ? candleFeed?.currentPrice ?? null : null,
-          expirySeconds: aiSettings?.expirySeconds ?? 180,
+          ...(expirySeconds ? { expirySeconds } : {}),
           mode,
         }),
       });
@@ -1262,8 +1266,13 @@ export default function App() {
     symbol: string,
     direction: 'CALL' | 'PUT',
     amount: number,
-    orderType: BrokerOrderType
+    orderType: BrokerOrderType,
+    expirySeconds?: number
   ) {
+    if (amount > 100) {
+      pushToast('error', 'Stake Limit Exceeded', 'Maximum stake per individual trade is $100.');
+      return;
+    }
     setBusy(true);
     try {
       const targetAcct = brokerAccounts.find((a) => a.id === accountId);
@@ -1279,7 +1288,7 @@ export default function App() {
           orderType,
           amount,
           entryPrice: symbol === selectedSymbol ? candleFeed?.currentPrice ?? null : null,
-          expirySeconds: aiSettings?.expirySeconds ?? 180,
+          ...(expirySeconds ? { expirySeconds } : {}),
           idempotencyKey: `${accountId}-${symbol}-${direction}-${Math.floor(Date.now() / 5000)}`,
           source: 'manual',
         }),
@@ -1332,7 +1341,8 @@ export default function App() {
     symbol: string,
     direction: 'CALL' | 'PUT',
     amount: number,
-    orderType: BrokerOrderType
+    orderType: BrokerOrderType,
+    expirySeconds?: number
   ): Promise<BrokerOrderValidationResult> {
     const targetAcct = brokerAccounts.find((a) => a.id === accountId);
     const targetEnv = targetAcct?.environment || 'demo';
@@ -1346,6 +1356,7 @@ export default function App() {
         direction,
         orderType,
         amount,
+        ...(expirySeconds ? { expirySeconds } : {}),
       }),
     });
     return res.validation;

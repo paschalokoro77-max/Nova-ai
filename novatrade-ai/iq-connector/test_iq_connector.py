@@ -2313,5 +2313,53 @@ class TestIqConnectorModes(unittest.TestCase):
             app._BALANCE_TIMEOUT = orig_timeout
 
 
+    def test_flexible_trade_duration_and_stake_limit(self):
+        client = FakeIqClient(initial_mode="PRACTICE")
+        app._client = client
+
+        # 1-minute (60s) duration -> duration_min = 1
+        req_1m = app.OrderRequest(
+            symbol="EURUSD",
+            direction="CALL",
+            amount=25.0,
+            expirySeconds=60,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-flex-1m",
+        )
+        res_1m = app.place_order(req_1m, x_connector_token=None)
+        self.assertTrue(res_1m["accepted"])
+        self.assertEqual(res_1m["expirySeconds"], 60)
+        self.assertEqual(client.buy_calls[-1][3], 1, "1-minute trade must pass duration_min=1 to IQ Option")
+
+        # 5-minute (300s) duration -> duration_min = 5
+        req_5m = app.OrderRequest(
+            symbol="EURUSD",
+            direction="CALL",
+            amount=50.0,
+            expirySeconds=300,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-flex-5m",
+        )
+        res_5m = app.place_order(req_5m, x_connector_token=None)
+        self.assertTrue(res_5m["accepted"])
+        self.assertEqual(res_5m["expirySeconds"], 300)
+        self.assertEqual(client.buy_calls[-1][3], 5, "5-minute trade must pass duration_min=5 to IQ Option")
+
+        # 15-minute (900s) duration -> duration_min = 15
+        req_15m = app.OrderRequest(
+            symbol="EURUSD",
+            direction="PUT",
+            amount=100.0,
+            expirySeconds=900,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-flex-15m",
+        )
+        res_15m = app.place_order(req_15m, x_connector_token=None)
+        self.assertTrue(res_15m["accepted"])
+        self.assertEqual(res_15m["expirySeconds"], 900)
+        self.assertEqual(client.buy_calls[-1][3], 15, "15-minute trade must pass duration_min=15 to IQ Option")
+        self.assertEqual(res_15m["amount"], 100.0, "Stake of exactly $100 must be supported")
+
+
 if __name__ == "__main__":
     unittest.main()

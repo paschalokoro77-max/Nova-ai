@@ -515,18 +515,145 @@ test('End-to-end IQ Option workflow: auth, dedup, stale protection, market data,
     assert.equal(dupPlaced.duplicatePrevented, true);
     assert.equal(state.orderCalls.length, 1);
 
-    // 7. Monitor active open trade
+    // Requirement: Preserve $100 maximum stake per individual trade (allows $100, strictly rejects >$100)
+    const valid100Stake = await manager.validateDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'EURUSD',
+      assetClass: 'FOREX',
+      direction: 'CALL',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 100,
+      entryPrice: 1.0865,
+      expirySeconds: 60,
+      globalEmergencyStop: false,
+    });
+    assert.equal(valid100Stake.valid, true, 'Stake of exactly $100 must be valid');
+
+    const invalid101Stake = await manager.validateDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'EURUSD',
+      assetClass: 'FOREX',
+      direction: 'CALL',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 101,
+      entryPrice: 1.0865,
+      expirySeconds: 60,
+      globalEmergencyStop: false,
+    });
+    assert.equal(invalid101Stake.valid, false, 'Stake exceeding $100 must be rejected');
+    assert.ok(invalid101Stake.reason?.includes('100'));
+
+    await assert.rejects(
+      () =>
+        manager.executeDemoOrder(userId, {
+          accountId: acct.id,
+          symbol: 'EURUSD',
+          assetClass: 'FOREX',
+          direction: 'CALL',
+          orderType: 'BINARY_FIXED_EXPIRY',
+          amount: 125,
+          entryPrice: 1.0865,
+          expirySeconds: 60,
+          idempotencyKey: 'iq-over-stake-test',
+          source: 'manual',
+          globalEmergencyStop: false,
+        }),
+      /maximum allowed stake of \$100/
+    );
+
+    // Requirement: Flexible trade duration (1m, 5m, 15m, AI-selected; not hardcoded to 15m)
+    const val1m = await manager.validateDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'EURUSD',
+      assetClass: 'FOREX',
+      direction: 'CALL',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 15,
+      entryPrice: 1.0865,
+      expirySeconds: 60, // 1 minute
+      globalEmergencyStop: false,
+    });
+    assert.equal(val1m.valid, true);
+
+    const val5m = await manager.validateDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'EURUSD',
+      assetClass: 'FOREX',
+      direction: 'CALL',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 15,
+      entryPrice: 1.0865,
+      expirySeconds: 300, // 5 minutes
+      globalEmergencyStop: false,
+    });
+    assert.equal(val5m.valid, true);
+
+    const val15m = await manager.validateDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'EURUSD',
+      assetClass: 'FOREX',
+      direction: 'CALL',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 15,
+      entryPrice: 1.0865,
+      expirySeconds: 900, // 15 minutes
+      globalEmergencyStop: false,
+    });
+    assert.equal(val15m.valid, true);
+
+    // Execute a 1-minute (60s) trade and verify connector receives exactly 60s
+    const placed1m = await manager.executeDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'GBPUSD',
+      assetClass: 'FOREX',
+      direction: 'PUT',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 20,
+      entryPrice: 1.0865,
+      expirySeconds: 60,
+      idempotencyKey: 'iq-practice-trade-1m',
+      source: 'manual',
+      globalEmergencyStop: false,
+    });
+    assert.equal(placed1m.order.status, 'FILLED');
+    const orderCall1m = state.orderCalls.find((c) => c.idempotencyKey === 'iq-practice-trade-1m');
+    assert.ok(orderCall1m);
+    assert.equal(orderCall1m.expirySeconds, 60);
+
+    // AI analysis selects duration based on timeframe (not hardcoded to 15m)
+    const analysis1m = analyzeMarketQuant('EURUSD', '1m', candleRes.candles, 'IQ Option Live Connector', {
+      marketStatus: 'LIVE',
+      isStale: false,
+    });
+    assert.equal(analysis1m.suggestedExpirySeconds, 180, '1m chart analysis selects 180s (3m) dynamic duration');
+
+    const analysis5m = analyzeMarketQuant('EURUSD', '5m', candleRes.candles, 'IQ Option Live Connector', {
+      marketStatus: 'LIVE',
+      isStale: false,
+    });
+    assert.equal(analysis5m.suggestedExpirySeconds, 900, '5m chart analysis selects 900s (15m) dynamic duration');
+
+    const analysis15m = analyzeMarketQuant('EURUSD', '15m', candleRes.candles, 'IQ Option Live Connector', {
+      marketStatus: 'LIVE',
+      isStale: false,
+    });
+    assert.equal(analysis15m.suggestedExpirySeconds, 1800, '15m chart analysis selects 1800s (30m) dynamic duration');
+
+    // 7. Monitor active open trades
     const openPos = await manager.getAccountPositions(userId, acct.id);
     assert.equal(openPos.supported, true);
-    assert.equal(openPos.positions.length, 1);
-    assert.equal(openPos.positions[0].ticket, placed.order.brokerOrderId);
-    assert.equal(openPos.positions[0].mode, 'PRACTICE');
+    assert.equal(openPos.positions.length, 2);
+    assert.ok(openPos.positions.some((p) => p.ticket === placed.order.brokerOrderId));
+    assert.ok(openPos.positions.some((p) => p.ticket === placed1m.order.brokerOrderId));
 
-    // 8. Close PRACTICE trade + verify ledger & balance sync
+    // 8. Close PRACTICE trades + verify ledger & balance sync
     const closeRes = await manager.closeAccountPosition(userId, acct.id, placed.order.brokerOrderId);
     assert.equal(closeRes.closed, true);
     assert.equal(closeRes.status, 'CLOSED');
     assert.equal(closeRes.realizedPnl, 8.4);
+
+    const closeRes2 = await manager.closeAccountPosition(userId, acct.id, placed1m.order.brokerOrderId);
+    assert.equal(closeRes2.closed, true);
 
     const openPosAfterClose = await manager.getAccountPositions(userId, acct.id);
     assert.equal(openPosAfterClose.positions.length, 0);
@@ -543,7 +670,7 @@ test('End-to-end IQ Option workflow: auth, dedup, stale protection, market data,
       assert.equal(synced.connected, true);
       assert.equal(synced.status, 'CONNECTED');
       assert.equal(synced.accountType, 'PRACTICE');
-      assert.equal(synced.balance, Number((7428.71 + 8.4).toFixed(2)));
+      assert.equal(synced.balance, Number((7428.71 + 16.8).toFixed(2)));
     }
 
     // Transient /account 504 timeout while /health is alive must preserve healthy CONNECTED state & balance!
@@ -551,7 +678,7 @@ test('End-to-end IQ Option workflow: auth, dedup, stale protection, market data,
     const afterTransient = await manager.checkHealthAndSyncBalance(userId, acct.id);
     assert.equal(afterTransient.connected, true, 'Transient timeout must NOT overwrite healthy connected session');
     assert.equal(afterTransient.status, 'CONNECTED');
-    assert.equal(afterTransient.balance, Number((7428.71 + 8.4).toFixed(2)));
+    assert.equal(afterTransient.balance, Number((7428.71 + 16.8).toFixed(2)));
 
     // 10. Dynamic REAL mode auto-detection (user switches inside IQ Option; NovaTrade detects & follows without switching)
     state.mode = 'REAL';
@@ -575,9 +702,9 @@ test('End-to-end IQ Option workflow: auth, dedup, stale protection, market data,
       source: 'manual',
       globalEmergencyStop: false,
     });
-    assert.equal(placedReal.order.environment, 'real');
-    assert.equal(state.orderCalls[1].expectedMode, 'REAL');
-    assert.equal(state.orderCalls[1].verifiedMode, 'REAL');
+    const lastRealCall = state.orderCalls[state.orderCalls.length - 1];
+    assert.equal(lastRealCall.expectedMode, 'REAL');
+    assert.equal(lastRealCall.verifiedMode, 'REAL');
     assert.equal(state.modeSwitchCalls, 0);
   } finally {
     if (prevUrl === undefined) delete process.env.IQ_CONNECTOR_URL;

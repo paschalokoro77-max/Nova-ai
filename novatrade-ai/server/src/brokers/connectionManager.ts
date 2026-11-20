@@ -1652,8 +1652,9 @@ export class BrokerConnectionManager {
     if (input.direction === 'PUT' && !limits.allowPut) {
       return fail(`Per-account risk guard: PUT/SELL direction is disabled on ${acct.label}.`, true);
     }
-    if (input.amount > limits.maxOrderAmount) {
-      return fail(`Stake ($${input.amount}) exceeds ${acct.label} maxOrderAmount ($${limits.maxOrderAmount}).`, true);
+    const effectiveMaxStake = Math.min(100, limits.maxOrderAmount);
+    if (input.amount > effectiveMaxStake) {
+      return fail(`Stake ($${input.amount}) exceeds the maximum allowed stake of $${effectiveMaxStake} per individual trade.`, true);
     }
     if (acct.dailyOrdersCount >= limits.maxDailyOrders) {
       return fail(`Daily order cap (${limits.maxDailyOrders}) reached on ${acct.label}.`, true);
@@ -1754,6 +1755,14 @@ export class BrokerConnectionManager {
       }
     }
 
+    const limits = acct.riskLimits;
+    const effectiveMaxStake = Math.min(100, limits.maxOrderAmount);
+    if (input.amount > effectiveMaxStake) {
+      throw new Error(
+        `Per-account risk limit: Stake ($${input.amount}) exceeds the maximum allowed stake of $${effectiveMaxStake} per individual trade.`
+      );
+    }
+
     const recentDup = store.orders.find(
       (o) =>
         o.accountId === acct.id &&
@@ -1786,17 +1795,11 @@ export class BrokerConnectionManager {
     }
 
     // 4. Per-account risk limit checks
-    const limits = acct.riskLimits;
     if (input.direction === 'CALL' && !limits.allowCall) {
       throw new Error(`Per-account risk guard: CALL/BUY direction is disabled on ${acct.label}.`);
     }
     if (input.direction === 'PUT' && !limits.allowPut) {
       throw new Error(`Per-account risk guard: PUT/SELL direction is disabled on ${acct.label}.`);
-    }
-    if (input.amount > limits.maxOrderAmount) {
-      throw new Error(
-        `Per-account risk limit: Stake ($${input.amount}) exceeds ${acct.label} maxOrderAmount ($${limits.maxOrderAmount}).`
-      );
     }
     if (acct.dailyOrdersCount >= limits.maxDailyOrders) {
       throw new Error(

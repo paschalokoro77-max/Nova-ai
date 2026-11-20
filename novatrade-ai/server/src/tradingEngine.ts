@@ -214,7 +214,7 @@ export class NovaTradeEngine {
     requireMtfAlignment: true,
     enabledAssets: ['EURUSD', 'GBPUSD', 'USDJPY', 'EURJPY', 'BTCUSD', 'ETHUSD'],
     defaultTimeframe: '5m',
-    expirySeconds: 900,
+    expirySeconds: 300,
     scanIntervalSeconds: 60,
     useGeminiCommentary: true,
   };
@@ -934,11 +934,11 @@ export class NovaTradeEngine {
     }
     const compat = analysis.timeframeExpiryCompatibility;
     if (compat) {
-      return compat.compatible
-        ? compat.requestedExpirySeconds || this.aiSettings.expirySeconds
-        : compat.recommendedExpirySeconds;
+      return compat.compatible && compat.requestedExpirySeconds
+        ? compat.requestedExpirySeconds
+        : compat.recommendedExpirySeconds || analysis.suggestedExpirySeconds;
     }
-    return this.aiSettings.expirySeconds || analysis.suggestedExpirySeconds;
+    return analysis.suggestedExpirySeconds || this.aiSettings.expirySeconds || 300;
   }
 
   async analyseAsset(
@@ -1343,10 +1343,18 @@ export class NovaTradeEngine {
     if (!risk.allowed) {
       return { ok: false, error: `Risk guard blocked trade: ${risk.reasons.join(' ')}`, risk };
     }
+    const balanceSummary = this.getVirtualBalanceSummary();
+    if (input.amount > balanceSummary.currentBalance) {
+      return {
+        ok: false,
+        error: `Insufficient available virtual balance ($${balanceSummary.currentBalance.toFixed(2)}) for stake ($${input.amount}).`,
+        risk,
+      };
+    }
     if (input.amount > this.riskSettings.maxTradeAmount) {
       return {
         ok: false,
-        error: `Stake (${input.amount}) exceeds maxTradeAmount (${this.riskSettings.maxTradeAmount}).`,
+        error: `Stake ($${input.amount}) exceeds the maximum allowed stake of $${this.riskSettings.maxTradeAmount} per individual trade.`,
         risk,
       };
     }
@@ -1355,14 +1363,6 @@ export class NovaTradeEngine {
       return {
         ok: false,
         error: `Stake (${input.amount}) exceeds remaining daily loss budget (${remainingBudget.toFixed(2)}).`,
-        risk,
-      };
-    }
-    const balanceSummary = this.getVirtualBalanceSummary();
-    if (input.amount > balanceSummary.currentBalance) {
-      return {
-        ok: false,
-        error: `Insufficient available virtual balance ($${balanceSummary.currentBalance.toFixed(2)}) for stake ($${input.amount}).`,
         risk,
       };
     }
