@@ -125,6 +125,10 @@ export interface BrokerPosition {
   sl: number | null;
   tp: number | null;
   openedAt: string | null;
+  expiresAt?: string | null;
+  instrumentType?: string | null;
+  mode?: string | null;
+  canClose?: boolean;
   comment?: string | null;
 }
 
@@ -251,6 +255,8 @@ export interface ManagedBrokerAccountPublic {
   lastCheckedAt: string | null;
   lastSyncedAt: string | null;
   lastError: string | null;
+  isAuthoritative?: boolean;
+  isStaleDuplicate?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -334,4 +340,16 @@ export interface BrokerAdapter {
     ctx: BrokerAccountContext,
     brokerOrderId: string
   ): Promise<BrokerOrderReconciliationResult>;
+  closePosition?(
+    ctx: BrokerAccountContext,
+    brokerOrderId: string
+  ): Promise<{
+    closed: boolean;
+    brokerOrderId: string;
+    status: string;
+    realizedPnl: number | null;
+    mode?: string | null;
+    message: string;
+    closedAt?: string | null;
+  }>;
 }

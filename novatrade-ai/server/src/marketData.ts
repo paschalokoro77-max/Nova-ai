@@ -206,7 +206,7 @@ async function fetchIqConnectorCandles(symbol: string, timeframe: Timeframe, lim
   // Never trigger an unsolicited broker connect or contend with an in-flight connect/operation from background market-data fallbacks
   try {
     const healthRes = await fetch(`${cfg.url}/health`, {
-      headers: { 'x-iq-mode': 'PRACTICE' },
+      headers: { 'x-iq-mode': 'AUTO' },
       signal: AbortSignal.timeout(3000),
     });
     if (!healthRes.ok) return null;
@@ -226,7 +226,7 @@ async function fetchIqConnectorCandles(symbol: string, timeframe: Timeframe, lim
   const intervalMap: Record<Timeframe, number> = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600 };
   const headers: Record<string, string> = {
     'content-type': 'application/json',
-    'x-iq-mode': 'PRACTICE',
+    'x-iq-mode': 'AUTO',
   };
   const token = (process.env.IQ_CONNECTOR_TOKEN || '').trim();
   if (token) {
@@ -346,7 +346,7 @@ export async function fetchMarketCandles(
 
   const iqCfg = parseIqConnectorConfig();
   if (iqCfg.urlValid && iqCfg.url) {
-    const iq = await attempt('IQ Option Practice Connector', async () => {
+    const iq = await attempt('IQ Option Live Connector', async () => {
       const c = await fetchIqConnectorCandles(asset.symbol, timeframe, limit);
       if (!c) throw new Error('IQ Connector returned no candles');
       return c;

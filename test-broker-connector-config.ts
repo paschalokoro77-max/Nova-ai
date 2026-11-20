@@ -36,13 +36,13 @@ async function runBrokerConfigTests() {
   assert.equal(mt5Adapter.brokerId, 'mt5');
   console.log('  ✅ [PASS] MT5 and IQ Option broker adapters are strictly separate');
 
-  // Test 4: Order execution lockdown verification
+  // Test 4: Order execution capabilities verification (IQ Option enabled for live-mode trading; MT5 protected)
   const iqCaps = await iqAdapter.getCapabilities();
   const mt5Caps = await mt5Adapter.getCapabilities();
-  assert.equal(iqCaps.orderExecutionSupported, false);
-  assert.equal(iqCaps.liveOrderPlacementSupported, false);
+  assert.equal(iqCaps.orderExecutionSupported, true);
+  assert.equal(iqCaps.demoOrderPlacementSupported, true);
   assert.equal(mt5Caps.liveOrderPlacementSupported, false);
-  console.log('  ✅ [PASS] Order execution locks and safety constraints verified across all adapters');
+  console.log('  ✅ [PASS] Order execution capabilities and safety constraints verified across all adapters');
 
   // Test 5: Price & Candles HTTP 502 HTML retry recovery + non-transient 401 fast-fail
   let priceAttempts = 0;
@@ -241,7 +241,7 @@ async function runBrokerConfigTests() {
       }, 250);
       return;
     }
-    if (req.url === '/health') {
+    if (req.url?.startsWith('/health')) {
       healthHits++;
       setTimeout(() => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -262,7 +262,7 @@ async function runBrokerConfigTests() {
       }, 100);
       return;
     }
-    if (req.url === '/account') {
+    if (req.url?.startsWith('/account')) {
       accountHits++;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(

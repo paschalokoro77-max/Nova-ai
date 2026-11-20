@@ -419,6 +419,8 @@ export interface ManagedBrokerAccountPublic {
   lastCheckedAt: string | null;
   lastSyncedAt: string | null;
   lastError: string | null;
+  isAuthoritative?: boolean;
+  isStaleDuplicate?: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -488,6 +490,10 @@ export interface BrokerPosition {
   sl: number | null;
   tp: number | null;
   openedAt: string | null;
+  expiresAt?: string | null;
+  instrumentType?: string | null;
+  mode?: 'PRACTICE' | 'REAL' | null;
+  canClose?: boolean;
   comment?: string | null;
 }
 
