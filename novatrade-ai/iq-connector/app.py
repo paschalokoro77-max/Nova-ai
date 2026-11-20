@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.2')
+app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.3')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
@@ -58,6 +58,7 @@ _connected_at: Optional[float] = None
 _requested_mode: str = 'AUTO'
 _confirmed_mode: str = 'UNVERIFIED'
 _mode_verified: bool = False
+_broker_wallet_confirmed: bool = False
 _active_balance_id: Any = None
 _active_currency: str = 'USD'
 _mode_detection_diag: Optional[dict] = None
@@ -427,7 +428,7 @@ def _invalidate_balance_cache():
 
 
 def _invalidate_client(reason: Optional[str] = None, cancel_inflight: bool = False):
-    global _client, _connected_at, _confirmed_mode, _mode_verified, _active_balance_id, _mode_detection_diag
+    global _client, _connected_at, _confirmed_mode, _mode_verified, _broker_wallet_confirmed, _active_balance_id, _mode_detection_diag
     global _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_error, _session_generation, _last_balance_cache
     with _state_lock:
         _session_generation += 1
@@ -436,6 +437,7 @@ def _invalidate_client(reason: Optional[str] = None, cancel_inflight: bool = Fal
         _connected_at = None
         _confirmed_mode = 'UNVERIFIED'
         _mode_verified = False
+        _broker_wallet_confirmed = False
         _active_balance_id = None
         _mode_detection_diag = None
         _active_ws_url = None
@@ -955,11 +957,27 @@ def _patch_iqoptionapi():
                 if api_obj is not None:
                     pending_ids = getattr(api_obj, '_nt_pending_req_ids', None)
                     if req_id and isinstance(pending_ids, set) and req_id in pending_ids:
-                        resp_map = getattr(api_obj, '_nt_ws_responses', None)
-                        if not isinstance(resp_map, dict):
-                            resp_map = {}
-                            api_obj._nt_ws_responses = resp_map
-                        resp_map[req_id] = raw_msg
+                        # IQ Option sends {"name": "result", "msg": {"success": true}} as a transport ACK
+                        # BEFORE the actual async "user-settings" frame arrives. Do NOT let a success:true ACK
+                        # short-circuit waiting for the real response frame!
+                        inner_msg = raw_msg.get('msg')
+                        is_success_ack = (
+                            msg_name == 'result'
+                            and isinstance(inner_msg, dict)
+                            and inner_msg.get('success') is True
+                        )
+                        if is_success_ack:
+                            ack_map = getattr(api_obj, '_nt_ws_acks', None)
+                            if not isinstance(ack_map, dict):
+                                ack_map = {}
+                                api_obj._nt_ws_acks = ack_map
+                            ack_map[req_id] = True
+                        else:
+                            resp_map = getattr(api_obj, '_nt_ws_responses', None)
+                            if not isinstance(resp_map, dict):
+                                resp_map = {}
+                                api_obj._nt_ws_responses = resp_map
+                            resp_map[req_id] = raw_msg
                     if msg_name in ('user-settings', 'user-settings-changed'):
                         api_obj._nt_user_settings_msg = raw_msg
                         api_obj._nt_user_settings_msg_at = time.time()
@@ -1431,6 +1449,7 @@ def _patch_iqoptionapi():
             self.order_changed_all('subscribeMessage')
             try:
                 self.api.send_websocket_request('subscribeMessage', {'name': 'user-settings-changed', 'version': '1.0'})
+                self.api.send_websocket_request('subscribeMessage', {'name': 'user-settings-changed', 'version': '2.0'})
             except Exception:
                 pass
             self.api.setOptions(1, True)
@@ -1729,6 +1748,8 @@ def _summarize_user_settings_response(resp: Any) -> dict:
     summary['msgType'] = type(msg).__name__
     if isinstance(msg, dict):
         summary['msgKeys'] = sorted(str(k) for k in list(msg.keys())[:15])
+        if summary['name'] == 'result' and isinstance(msg.get('success'), bool):
+            summary['resultSuccess'] = msg['success']
         status_int = _coerce_int(resp.get('status'))
         if status_int is not None and status_int >= 4000:
             err_hint = msg.get('code') or msg.get('message') or msg.get('error')
@@ -1870,17 +1891,22 @@ def _query_user_settings_balance_id(
         api._nt_pending_req_ids = set()
     if not isinstance(getattr(api, '_nt_ws_responses', None), dict):
         api._nt_ws_responses = {}
+    if not isinstance(getattr(api, '_nt_ws_acks', None), dict):
+        api._nt_ws_acks = {}
 
     queries: List[Tuple[str, dict]] = [
         ('traderoom_gl_common_v3', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 3}}),
+        ('traderoom_gl_common_v2', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 2}}),
+        ('traderoom_gl_common_v1', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 1}}),
         ('traderoom_gl_common_v4', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 4}}),
-        ('traderoom_gl_common_v5', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 5}}),
         ('traderoom_gl_common', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common'}}),
-        ('names_traderoom_gl_common', {'name': 'get-user-settings', 'version': '1.0', 'body': {'names': ['traderoom_gl_common']}}),
-        ('all_settings', {'name': 'get-user-settings', 'version': '1.0', 'body': {}}),
+        ('traderoom_gl_common_api_v2', {'name': 'get-user-settings', 'version': '2.0', 'body': {'name': 'traderoom_gl_common'}}),
+        ('traderoom_common_v1', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_common', 'version': 1}}),
+        ('mobile_common_v1', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'mobile_common', 'version': 1}}),
+        ('names_traderoom', {'name': 'get-user-settings', 'version': '1.0', 'body': {'names': ['traderoom_gl_common', 'traderoom_common', 'mobile_common']}}),
     ]
-    total_deadline = time.monotonic() + max(1.0, min(timeout_seconds, 3.5))
-    per_try_budget = 0.55
+    total_deadline = time.monotonic() + max(1.0, min(timeout_seconds, 3.8))
+    per_try_budget = 0.45
     req_base = int(time.time() * 1000) % 1000000000
 
     for idx, (label, msg_payload) in enumerate(queries):
@@ -1890,6 +1916,7 @@ def _query_user_settings_balance_id(
         diag['attempts'] = idx + 1
         req_id = str(req_base + idx + 1)
         api._nt_pending_req_ids.add(req_id)
+        api._nt_ws_acks.pop(req_id, None)
         before_unsolicited_at = float(getattr(api, '_nt_user_settings_msg_at', 0.0) or 0.0)
         try:
             _run_with_timeout(
@@ -1902,6 +1929,16 @@ def _query_user_settings_balance_id(
             while time.monotonic() < step_deadline:
                 resp = api._nt_ws_responses.pop(req_id, None)
                 if resp is not None:
+                    # Also guard here in case a mock or direct writer inserted a result: {success: true} ACK
+                    if (
+                        isinstance(resp, dict)
+                        and resp.get('name') == 'result'
+                        and isinstance(resp.get('msg'), dict)
+                        and resp['msg'].get('success') is True
+                    ):
+                        api._nt_ws_acks[req_id] = True
+                        time.sleep(0.02)
+                        continue
                     got_resp = resp
                     break
                 # Fallback if broker replied with a user-settings frame without echoing request_id
@@ -1915,11 +1952,14 @@ def _query_user_settings_balance_id(
                     break
                 time.sleep(0.025)
 
+            ack_seen = bool(api._nt_ws_acks.pop(req_id, False))
             if got_resp is not None:
                 diag['responseName'] = str(got_resp.get('name') or '')
                 diag['responseStatus'] = got_resp.get('status')
                 summary = _summarize_user_settings_response(got_resp)
                 summary['query'] = label
+                if ack_seen:
+                    summary['ackReceived'] = True
                 diag['attemptsSummary'].append(summary)
                 bal_id = _extract_balance_id_from_user_settings(got_resp, known_balance_ids=known_balance_ids)
                 if bal_id is not None:
@@ -1930,7 +1970,10 @@ def _query_user_settings_balance_id(
                     diag['matchedQuery'] = label
                     return (bal_id, 'user_settings', diag)
             else:
-                diag['attemptsSummary'].append({'query': label, 'timedOut': True})
+                entry = {'query': label, 'timedOut': True}
+                if ack_seen:
+                    entry['ackReceived'] = True
+                diag['attemptsSummary'].append(entry)
         except Exception as exc:
             diag['attemptsSummary'].append({'query': label, 'error': type(exc).__name__})
         finally:
@@ -2002,7 +2045,11 @@ def _extract_mode_from_profile(profile_msg: Any) -> Tuple[Optional[str], Any, Op
     bal_list = [b for b in balances if isinstance(b, dict)] if isinstance(balances, list) else []
 
     # 1. Explicit active balance flag on exactly one balance entry
-    active_entries = [b for b in bal_list if b.get('is_active') is True or b.get('active') is True]
+    active_entries = [
+        b
+        for b in bal_list
+        if any(b.get(flag) is True for flag in ('is_active', 'active', 'is_selected', 'selected', 'is_current', 'current'))
+    ]
     if len(active_entries) == 1:
         b = active_entries[0]
         btype = _coerce_int(b.get('type'))
@@ -2047,6 +2094,7 @@ def _extract_mode_from_profile(profile_msg: Any) -> Tuple[Optional[str], Any, Op
 
 def _peek_balance_mode_nonblocking(client: Any, target_mode: str = 'AUTO') -> Tuple[str, bool]:
     """Read current IQ Option active balance mode strictly from in-memory verified state (never triggers WS I/O)."""
+    global _confirmed_mode, _mode_verified, _broker_wallet_confirmed, _active_balance_id, _active_currency, _mode_detection_diag
     if client is None:
         return ('UNVERIFIED', False)
 
@@ -2056,8 +2104,30 @@ def _peek_balance_mode_nonblocking(client: Any, target_mode: str = 'AUTO') -> Tu
         settings_bal_id = getattr(api, '_nt_user_settings_balance_id', None)
         if settings_bal_id is not None:
             bal_list = _get_balances_list(client, refresh=False)
-            mode, _bid, _curr = _resolve_mode_from_balances(bal_list, settings_bal_id)
+            mode, bid, curr = _resolve_mode_from_balances(bal_list, settings_bal_id)
             if mode in ('PRACTICE', 'REAL'):
+                prev_mode = _confirmed_mode
+                prev_confirmed = _broker_wallet_confirmed
+                _confirmed_mode = mode
+                _mode_verified = True
+                _broker_wallet_confirmed = True
+                if bid is not None:
+                    _active_balance_id = bid
+                    _sync_local_balance_id(client, bid)
+                if curr:
+                    _active_currency = curr
+                if prev_mode != mode or not prev_confirmed:
+                    _invalidate_balance_cache()
+                    if isinstance(_mode_detection_diag, dict):
+                        _mode_detection_diag = {
+                            **_mode_detection_diag,
+                            'source': getattr(api, '_nt_user_settings_source', None) or 'user_settings_changed',
+                            'verified': True,
+                            'brokerWalletConfirmed': True,
+                            'realOrdersAllowed': mode == 'REAL',
+                            'userSettingsMode': mode,
+                            'lastCheckedAt': time.time(),
+                        }
                 matches = True if target_mode == 'AUTO' else (mode == target_mode)
                 return (mode, matches)
         # 2. Previously verified session mode (never assume REAL from raw legacy profile!)
@@ -2089,8 +2159,10 @@ def _detect_balance_mode(
 ) -> Tuple[str, bool]:
     """Detect whichever account mode (PRACTICE or REAL) is currently active inside IQ Option.
     NEVER calls client.change_balance(), NEVER silently switches modes, and NEVER assumes REAL when uncertain.
+    If IQ Option user-settings does not expose an active wallet on a dual-wallet account (e.g., 4004 / balance_type=0),
+    binds strictly to the verified PRACTICE (type=4) wallet only while keeping real-money orders strictly blocked.
     """
-    global _confirmed_mode, _mode_verified, _active_balance_id, _active_currency, _mode_detection_diag, _last_error
+    global _confirmed_mode, _mode_verified, _broker_wallet_confirmed, _active_balance_id, _active_currency, _mode_detection_diag, _last_error
     timeout = _MODE_TIMEOUT if timeout_seconds is None else timeout_seconds
 
     if client is None:
@@ -2125,6 +2197,10 @@ def _detect_balance_mode(
             if raw_pbid is not None and bal_list:
                 prof_bal_id_mode, _, _ = _resolve_mode_from_balances(bal_list, raw_pbid)
 
+        bal_item_keys = sorted(
+            {str(k) for b in bal_list[:4] if isinstance(b, dict) for k in b.keys()}
+        )[:20]
+
         profile_diag: dict = {
             'hasProfileMsg': isinstance(profile_msg, dict),
             'hasBalanceType': isinstance(profile_msg, dict) and profile_msg.get('balance_type') is not None,
@@ -2132,6 +2208,7 @@ def _detect_balance_mode(
             'hasBalanceId': isinstance(profile_msg, dict) and _coerce_balance_id(profile_msg.get('balance_id')) is not None,
             'balanceIdMode': prof_bal_id_mode,
             'balancesCount': len(bal_list),
+            'balanceItemKeys': bal_item_keys,
             'httpProfileChecked': False,
             'httpProfileBalanceType': None,
             'httpProfileBalanceIdMode': None,
@@ -2155,7 +2232,7 @@ def _detect_balance_mode(
         if should_query_settings:
             q_bal_id, q_src, q_diag = _query_user_settings_balance_id(
                 client,
-                timeout_seconds=min(timeout, 3.5),
+                timeout_seconds=min(timeout, 3.8),
                 known_balance_ids=known_bal_ids or None,
             )
             us_diag = q_diag
@@ -2173,11 +2250,15 @@ def _detect_balance_mode(
                     _active_currency = us_curr
                 _confirmed_mode = us_mode
                 _mode_verified = True
+                _broker_wallet_confirmed = True
+                _last_error = None
                 if prev_mode != us_mode:
                     _invalidate_balance_cache()
                 _mode_detection_diag = {
                     'source': settings_source or 'user_settings',
                     'verified': True,
+                    'brokerWalletConfirmed': True,
+                    'realOrdersAllowed': us_mode == 'REAL',
                     'userSettingsQueried': us_diag.get('queried', False),
                     'userSettingsResponseName': us_diag.get('responseName'),
                     'userSettingsResponseStatus': us_diag.get('responseStatus'),
@@ -2192,7 +2273,7 @@ def _detect_balance_mode(
                 return (us_mode, True)
 
         # 2. Unambiguous profile / balances signals (explicit active flag, single-wallet, or explicit PRACTICE)
-        #    NEVER assumes REAL on dual-wallet accounts from legacy profile_msg['balance_type'] == 1!
+        #    NEVER assumes REAL on dual-wallet accounts from legacy profile_msg['balance_type'] == 1 or 0!
         merged_profile = dict(profile_msg) if isinstance(profile_msg, dict) else {}
         if bal_list:
             merged_profile['balances'] = bal_list
@@ -2228,11 +2309,15 @@ def _detect_balance_mode(
                 _active_currency = prof_curr
             _confirmed_mode = prof_mode
             _mode_verified = True
+            _broker_wallet_confirmed = True
+            _last_error = None
             if prev_mode != prof_mode:
                 _invalidate_balance_cache()
             _mode_detection_diag = {
                 'source': prof_source,
                 'verified': True,
+                'brokerWalletConfirmed': True,
+                'realOrdersAllowed': prof_mode == 'REAL',
                 'userSettingsQueried': us_diag.get('queried', False),
                 'userSettingsResponseName': us_diag.get('responseName'),
                 'userSettingsResponseStatus': us_diag.get('responseStatus'),
@@ -2246,17 +2331,64 @@ def _detect_balance_mode(
             }
             return (prof_mode, True)
 
-        # 3. Uncertain / ambiguous dual-wallet account: NEVER assume REAL, mark UNVERIFIED & block live orders!
+        # 3. Dual-wallet account where IQ Option did NOT expose an active wallet (e.g., user-settings 4004 & balance_type=0):
+        #    NEVER assume REAL and NEVER allow real-money orders!
+        #    If a verified PRACTICE (type=4) wallet exists in balances, safely bind locally to PRACTICE (type=4) ONLY
+        #    so the user can inspect Demo balance, stream candles/AI analysis, and practice trade without blanket lockout,
+        #    while real-money orders remain strictly hard-blocked until IQ Option confirms an active REAL wallet.
+        practice_entries = [b for b in bal_list if _coerce_int(b.get('type')) == 4 and _coerce_balance_id(b.get('id')) is not None]
+        if practice_entries:
+            practice_entry = practice_entries[0]
+            practice_bal_id = _coerce_balance_id(practice_entry.get('id'))
+            practice_curr = str(practice_entry.get('currency') or 'USD').upper()
+            prev_mode = _confirmed_mode
+            _active_balance_id = practice_bal_id
+            _sync_local_balance_id(client, practice_bal_id)
+            _active_currency = practice_curr
+            _confirmed_mode = 'PRACTICE'
+            _mode_verified = True
+            _broker_wallet_confirmed = False
+            _last_error = None
+            if prev_mode != 'PRACTICE':
+                _invalidate_balance_cache()
+            _mode_detection_diag = {
+                'source': 'safe_practice_fallback',
+                'verified': True,
+                'brokerWalletConfirmed': False,
+                'realOrdersAllowed': False,
+                'note': (
+                    'IQ Option user-settings did not confirm an active wallet; safely bound locally to PRACTICE (type=4) '
+                    'wallet without changing IQ Option settings. Real-money orders remain strictly blocked until IQ Option '
+                    'confirms an active REAL wallet.'
+                ),
+                'userSettingsQueried': us_diag.get('queried', False),
+                'userSettingsResponseName': us_diag.get('responseName'),
+                'userSettingsResponseStatus': us_diag.get('responseStatus'),
+                'userSettingsMatchedQuery': us_diag.get('matchedQuery'),
+                'userSettingsAttempts': us_diag.get('attemptsSummary', []),
+                'userSettingsMode': None,
+                'profileLegacyMode': legacy_profile_mode,
+                'profileDiag': profile_diag,
+                'availableModes': available_modes,
+                'lastCheckedAt': time.time(),
+            }
+            return ('PRACTICE', True)
+
+        # 4. No verified PRACTICE wallet available AND active wallet is unknown: stay strictly UNVERIFIED & block ALL orders!
         _confirmed_mode = 'UNVERIFIED'
         _mode_verified = False
+        _broker_wallet_confirmed = False
         _active_balance_id = None
-        # Ensure local global_value.balance_id is NOT left pointing at a REAL wallet while unverified
-        practice_entries = [b for b in bal_list if _coerce_int(b.get('type')) == 4 and b.get('id') is not None]
-        if practice_entries:
-            _sync_local_balance_id(client, practice_entries[0]['id'])
+        try:
+            import iqoptionapi.global_value as _gv_clear
+            _gv_clear.balance_id = None
+        except Exception:
+            pass
         _mode_detection_diag = {
             'source': 'unverified_ambiguous_profile',
             'verified': False,
+            'brokerWalletConfirmed': False,
+            'realOrdersAllowed': False,
             'userSettingsQueried': us_diag.get('queried', False),
             'userSettingsResponseName': us_diag.get('responseName'),
             'userSettingsResponseStatus': us_diag.get('responseStatus'),
@@ -2270,7 +2402,7 @@ def _detect_balance_mode(
         }
         _last_error = (
             'IQ Option session authenticated, but active account mode could not be verified '
-            '(broker user-settings did not confirm active balanceId on dual-wallet REAL/PRACTICE account); '
+            '(no verified active wallet or PRACTICE wallet returned by broker); '
             'live orders are blocked.'
         )
         return ('UNVERIFIED', False)
@@ -2284,9 +2416,12 @@ def _detect_balance_mode(
                 if normalized in ('PRACTICE', 'REAL'):
                     _confirmed_mode = normalized
                     _mode_verified = True
+                    _broker_wallet_confirmed = True
                     _mode_detection_diag = {
                         'source': 'client_get_balance_mode',
                         'verified': True,
+                        'brokerWalletConfirmed': True,
+                        'realOrdersAllowed': normalized == 'REAL',
                         'userSettingsQueried': False,
                         'userSettingsResponseName': None,
                         'userSettingsMode': normalized,
@@ -2300,10 +2435,12 @@ def _detect_balance_mode(
                 return (_confirmed_mode, False if refresh else True)
             _confirmed_mode = 'UNVERIFIED'
             _mode_verified = False
+            _broker_wallet_confirmed = False
             return ('UNVERIFIED', False)
 
     _confirmed_mode = 'UNVERIFIED'
     _mode_verified = False
+    _broker_wallet_confirmed = False
     return ('UNVERIFIED', False)
 
 
@@ -2360,7 +2497,7 @@ def connect(
     Reuses any existing healthy authenticated session without redundant reconnects,
     coalesces concurrent callers cleanly, and follows IQ Option's active account mode.
     """
-    global _client, _last_error, _connected_at, _requested_mode, _confirmed_mode, _mode_verified
+    global _client, _last_error, _connected_at, _requested_mode, _confirmed_mode, _mode_verified, _broker_wallet_confirmed
     global _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_balance_cache
     global _session_generation, _inflight_connect, _last_connect_stage, _last_connect_duration_ms
 
@@ -2392,6 +2529,7 @@ def connect(
             _client = None
             _connected_at = None
             _mode_verified = False
+            _broker_wallet_confirmed = False
             _active_ws_url = None
             _active_ws_via_proxy = False
             _opcodes_updated = False
@@ -2411,6 +2549,7 @@ def connect(
                 _client = None
                 _connected_at = None
                 _mode_verified = False
+                _broker_wallet_confirmed = False
                 _active_ws_url = None
                 _active_ws_via_proxy = False
                 _opcodes_updated = False
@@ -3085,7 +3224,7 @@ async def health(
 
     return {
         'status': 'running',
-        'version': getattr(app, 'version', '0.5.2'),
+        'version': getattr(app, 'version', '0.5.3'),
         'serviceAvailable': True,
         'busy': busy,
         'connectInFlight': connect_in_flight,
@@ -3100,6 +3239,7 @@ async def health(
         'requestedMode': target_mode,
         'accountType': confirmed_mode if connected else None,
         'modeVerified': mode_verified if connected else False,
+        'brokerWalletConfirmed': bool(_broker_wallet_confirmed) if connected else False,
         'modeFollowsBroker': True,
         'modeDetection': _mode_detection_diag if connected else None,
         'activeWsUrl': _active_ws_url if connected else None,
@@ -3113,7 +3253,7 @@ async def health(
         'orderExecutionSupported': True,
         'positionsSupported': True,
         'closePositionSupported': True,
-        'realTradingEnabled': bool(connected and mode_verified and confirmed_mode == 'REAL'),
+        'realTradingEnabled': bool(connected and mode_verified and _broker_wallet_confirmed and confirmed_mode == 'REAL'),
         'credentialsConfigured': bool(os.getenv('IQ_EMAIL') and os.getenv('IQ_PASSWORD')),
         'lastError': _last_error,
         'connectedAt': _connected_at,
@@ -3161,7 +3301,7 @@ async def network_check(
 
     return {
         'status': 'ok',
-        'version': getattr(app, 'version', '0.5.2'),
+        'version': getattr(app, 'version', '0.5.3'),
         'serviceAvailable': True,
         'timeoutSeconds': _WS_CONNECT_TIMEOUT,
         'activeWsUrl': _active_ws_url,
@@ -3193,6 +3333,7 @@ async def network_check(
             'lastConnectDurationMs': _last_connect_duration_ms,
             'mode': _confirmed_mode if alive_now else None,
             'modeVerified': bool(_mode_verified) if alive_now else False,
+            'brokerWalletConfirmed': bool(_broker_wallet_confirmed) if alive_now else False,
             'modeFollowsBroker': True,
             'modeDetection': _mode_detection_diag if alive_now else None,
             'candleRetrievalReady': bool(alive_now and _mode_verified),
@@ -3205,7 +3346,7 @@ async def network_check(
         'proxyWsEndpoints': proxy_ws_probes,
         'lastConnectDiagnostics': _last_ws_diagnostics,
         'orderExecutionSupported': True,
-        'realTradingEnabled': bool(alive_now and _mode_verified and _confirmed_mode == 'REAL'),
+        'realTradingEnabled': bool(alive_now and _mode_verified and _broker_wallet_confirmed and _confirmed_mode == 'REAL'),
     }
 
 
@@ -3238,12 +3379,13 @@ def connect_route(
             ),
             'accountType': reported_mode,
             'modeVerified': mode_verified if is_connected else False,
+            'brokerWalletConfirmed': bool(_broker_wallet_confirmed) if is_connected else False,
             'modeFollowsBroker': True,
             'modeDetection': _mode_detection_diag if is_connected else None,
             'orderExecutionSupported': True,
             'positionsSupported': True,
             'closePositionSupported': True,
-            'realTradingEnabled': bool(is_connected and mode_verified and confirmed_mode == 'REAL'),
+            'realTradingEnabled': bool(is_connected and mode_verified and _broker_wallet_confirmed and confirmed_mode == 'REAL'),
             'detail': None if (is_connected and mode_verified) else _last_error,
             'connectedAt': _connected_at,
         }
@@ -3267,13 +3409,14 @@ def account(
             'activeMode': confirmed_mode,
             'accountType': confirmed_mode,
             'modeVerified': mode_verified,
+            'brokerWalletConfirmed': bool(_broker_wallet_confirmed),
             'modeFollowsBroker': True,
             'balance': balance_val,
             'currency': currency,
             'orderExecutionSupported': True,
             'positionsSupported': True,
             'closePositionSupported': True,
-            'realTradingEnabled': confirmed_mode == 'REAL',
+            'realTradingEnabled': bool(confirmed_mode == 'REAL' and _broker_wallet_confirmed),
             'source': 'IQ_OPTION_UNOFFICIAL',
         }
 
@@ -3297,9 +3440,10 @@ def balance(
             'activeMode': confirmed_mode,
             'accountType': confirmed_mode,
             'modeVerified': mode_verified,
+            'brokerWalletConfirmed': bool(_broker_wallet_confirmed),
             'modeFollowsBroker': True,
             'orderExecutionSupported': True,
-            'realTradingEnabled': confirmed_mode == 'REAL',
+            'realTradingEnabled': bool(confirmed_mode == 'REAL' and _broker_wallet_confirmed),
             'source': 'IQ_OPTION_UNOFFICIAL',
         }
 
@@ -3356,8 +3500,9 @@ def latest_price(
             'spread': None,
             'time': bar['time'],
             'mode': confirmed_mode,
+            'brokerWalletConfirmed': bool(_broker_wallet_confirmed),
             'orderExecutionSupported': True,
-            'realTradingEnabled': confirmed_mode == 'REAL',
+            'realTradingEnabled': bool(confirmed_mode == 'REAL' and _broker_wallet_confirmed),
             'source': 'IQ_OPTION_UNOFFICIAL',
             'note': f'Live 1m reference price from IQ Option ({confirmed_mode}).',
         }
@@ -3398,8 +3543,9 @@ def candles(
             'interval': query.interval,
             'candles': normalized,
             'mode': confirmed_mode,
+            'brokerWalletConfirmed': bool(_broker_wallet_confirmed),
             'orderExecutionSupported': True,
-            'realTradingEnabled': confirmed_mode == 'REAL',
+            'realTradingEnabled': bool(confirmed_mode == 'REAL' and _broker_wallet_confirmed),
             'source': 'IQ_OPTION_UNOFFICIAL',
             'note': f'Live candles from IQ Option ({confirmed_mode}).',
         }
@@ -3445,6 +3591,14 @@ def place_order(
         # Mandatory fresh live mode verification before every single order (never silently calls change_balance)
         confirmed_mode, mode_verified = _require_verified_mode(client, expected_mode, refresh=True)
 
+        # HARD SAFETY INVARIANT: NEVER submit a real-money (REAL) order unless IQ Option explicitly confirmed
+        # that the user's active wallet is REAL (_broker_wallet_confirmed == True).
+        if (confirmed_mode == 'REAL' or expected_mode == 'REAL') and not _broker_wallet_confirmed:
+            raise HTTPException(
+                409,
+                'Real-money order blocked: IQ Option did not confirm an active REAL wallet (active wallet unconfirmed).',
+            )
+
         # Strict pre-buy wallet-mode cross-check: guarantee iqoptionapi's bound balance_id matches confirmed_mode
         if getattr(client, 'api', None) is not None:
             bal_list = _get_balances_list(client, refresh=False)
@@ -3465,6 +3619,11 @@ def place_order(
                     409,
                     f'IQ Option wallet verification mismatch (bound wallet resolves to {resolved_mode}, expected {confirmed_mode}); order blocked.',
                 )
+            if not _broker_wallet_confirmed and resolved_mode != 'PRACTICE':
+                raise HTTPException(
+                    409,
+                    'Real-money order blocked: bound wallet is not PRACTICE while broker active wallet is unconfirmed.',
+                )
 
         action = 'call' if req.direction == 'CALL' else 'put'
         duration_min = max(1, int(round(req.expirySeconds / 60.0)))
@@ -3483,6 +3642,34 @@ def place_order(
         order_id: Any = None
         used_instrument = 'binary'
         last_reason: Optional[str] = None
+
+        # FINAL PRE-SUBMISSION INVARIANT (immediately before client.buy / client.buy_digital_spot):
+        # Re-verify no real-money order can ever be submitted when active broker wallet is unconfirmed.
+        if (confirmed_mode == 'REAL' or expected_mode == 'REAL') and not _broker_wallet_confirmed:
+            raise HTTPException(
+                409,
+                'Real-money order blocked immediately before submission: active REAL wallet is unconfirmed.',
+            )
+        if getattr(client, 'api', None) is not None:
+            try:
+                import iqoptionapi.global_value as _gv_final
+                final_gv_id = _coerce_balance_id(getattr(_gv_final, 'balance_id', None))
+            except Exception:
+                final_gv_id = _active_balance_id
+            final_mode, _, _ = _resolve_mode_from_balances(
+                _get_balances_list(client, refresh=False),
+                final_gv_id,
+            )
+            if final_gv_id is None or str(final_gv_id) != str(_active_balance_id) or final_mode != confirmed_mode:
+                raise HTTPException(
+                    409,
+                    'Order blocked immediately before submission: bound wallet changed or mismatched verified mode.',
+                )
+            if not _broker_wallet_confirmed and final_mode != 'PRACTICE':
+                raise HTTPException(
+                    409,
+                    'Real-money order blocked immediately before submission: bound wallet is not PRACTICE while broker wallet is unconfirmed.',
+                )
 
         try:
             if req.instrumentType in ('auto', 'binary') and hasattr(client, 'buy'):
@@ -3802,12 +3989,13 @@ def history(
 @app.post('/disconnect')
 def disconnect(x_connector_token: Optional[str] = Header(default=None)):
     _check_auth(x_connector_token)
-    global _requested_mode, _confirmed_mode, _mode_verified, _mode_detection_diag
+    global _requested_mode, _confirmed_mode, _mode_verified, _broker_wallet_confirmed, _mode_detection_diag
     with _bounded_lock(op_name='disconnect'):
         _invalidate_client(cancel_inflight=True)
         _requested_mode = 'AUTO'
         _confirmed_mode = 'UNVERIFIED'
         _mode_verified = False
+        _broker_wallet_confirmed = False
         _mode_detection_diag = None
     return {'connected': False}
 

@@ -166,6 +166,10 @@ export class IQOptionAdapter implements BrokerAdapter {
 
   private readonly inflightStatus = new Map<string, Promise<BrokerStatusSnapshot>>();
 
+  private readonly inflightWake = new Map<string, Promise<void>>();
+
+  private readonly lastReachableAt = new Map<string, number>();
+
   private getConfig(ctx?: BrokerAccountContext): ParsedIqConnectorConfig {
     const url = ctx?.credentials.bridgeUrl || process.env.IQ_CONNECTOR_URL || '';
     const token = ctx?.credentials.bridgeToken || process.env.IQ_CONNECTOR_TOKEN || '';
@@ -182,6 +186,41 @@ export class IQOptionAdapter implements BrokerAdapter {
     return headers;
   }
 
+  private getWakeTiming(): { budgetMs: number; baseBackoffMs: number; healthTimeoutMs: number; maxHealthAttempts: number } {
+    const envBudget = Number(process.env.IQ_CONNECTOR_WAKE_BUDGET_MS);
+    const envBackoff = Number(process.env.IQ_CONNECTOR_WAKE_BACKOFF_MS);
+    const envHealthTimeout = Number(process.env.IQ_CONNECTOR_HEALTH_TIMEOUT_MS);
+    const budgetMs = Number.isFinite(envBudget) && envBudget >= 500 && envBudget <= 90000 ? envBudget : 50000;
+    const baseBackoffMs = Number.isFinite(envBackoff) && envBackoff >= 20 && envBackoff <= 10000 ? envBackoff : 1500;
+    const healthTimeoutMs =
+      Number.isFinite(envHealthTimeout) && envHealthTimeout >= 500 && envHealthTimeout <= 45000 ? envHealthTimeout : 20000;
+    return { budgetMs, baseBackoffMs, healthTimeoutMs, maxHealthAttempts: 6 };
+  }
+
+  private async ensureConnectorAwake(ctx?: BrokerAccountContext, force = false): Promise<void> {
+    const cfg = this.getConfig(ctx);
+    if (!cfg.configured || !cfg.urlValid || !cfg.url) {
+      return;
+    }
+    const lastSeen = this.lastReachableAt.get(cfg.url) || 0;
+    if (!force && lastSeen > 0 && Date.now() - lastSeen < 60_000) {
+      return;
+    }
+    const existing = this.inflightWake.get(cfg.url);
+    if (existing) {
+      return existing;
+    }
+    const wakePromise = this.requestConnector<Record<string, unknown>>('/health', {}, ctx)
+      .then(() => undefined)
+      .finally(() => {
+        if (this.inflightWake.get(cfg.url!) === wakePromise) {
+          this.inflightWake.delete(cfg.url!);
+        }
+      });
+    this.inflightWake.set(cfg.url, wakePromise);
+    return wakePromise;
+  }
+
   private async requestConnector<T>(path: string, init: RequestInit = {}, ctx?: BrokerAccountContext): Promise<T> {
     const cfg = this.getConfig(ctx);
     if (!cfg.configured) {
@@ -193,19 +232,27 @@ export class IQOptionAdapter implements BrokerAdapter {
 
     const isHealth = path === '/health';
     const isConnect = path === '/connect';
-    const maxAttempts = 2;
-    // Align /connect client timeout (28s) above the connector's bounded connect+mode budget (~23s)
-    // so Node does not abort and pile up duplicate handshakes while the connector is still finishing.
-    const timeoutMs = isHealth ? 10000 : isConnect ? 28000 : 18000;
-    const baseBackoffMs = isConnect ? 2000 : 1200;
+    const isOrder = path === '/order';
+    const wake = this.getWakeTiming();
+    const maxAttempts = isHealth ? wake.maxHealthAttempts : isOrder ? 1 : 2;
+    // Align /health timeout (20s) above Render Free-tier cold-start spin-up (~14s measured)
+    // and /connect timeout (28s) above the connector's bounded connect+mode budget (~23s)
+    // so Node does not abort while the connector is waking or finishing the broker handshake.
+    const timeoutMs = isHealth ? wake.healthTimeoutMs : isConnect ? 28000 : 18000;
+    const baseBackoffMs = isHealth ? wake.baseBackoffMs : isConnect ? 2000 : 1200;
+    const startedAt = Date.now();
     let lastErr: unknown = null;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const elapsedMs = Date.now() - startedAt;
+      const attemptTimeoutMs = isHealth
+        ? Math.max(1000, Math.min(timeoutMs, wake.budgetMs - elapsedMs))
+        : timeoutMs;
       try {
         const res = await fetch(`${cfg.url}${path}`, {
           ...init,
           headers: { ...this.getHeaders(ctx), ...(init.headers || {}) },
-          signal: AbortSignal.timeout(timeoutMs),
+          signal: AbortSignal.timeout(attemptTimeoutMs),
         });
 
         const contentType = (res.headers.get('content-type') || '').toLowerCase();
@@ -217,15 +264,20 @@ export class IQOptionAdapter implements BrokerAdapter {
 
         if (looksHtml) {
           if (res.status === 502 || res.status === 503 || res.status === 504) {
-            if (attempt < maxAttempts) {
-              await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
+            this.lastReachableAt.delete(cfg.url);
+            const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
+            const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+            if (attempt < maxAttempts && (!isHealth || remainingBudgetMs > 250)) {
+              await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
               continue;
             }
+            const waitedSec = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
             const htmlErr = new Error(
-              `IQ Option connector gateway returned HTTP ${res.status} HTML (service cold start or upstream timeout).`
-            ) as Error & { status?: number; nonRetryable?: boolean };
+              `IQ Option connector gateway returned HTTP ${res.status} HTML after ${waitedSec}s (service cold start or upstream timeout).`
+            ) as Error & { status?: number; nonRetryable?: boolean; isGatewayColdStart?: boolean };
             htmlErr.status = res.status;
             htmlErr.nonRetryable = true;
+            htmlErr.isGatewayColdStart = true;
             throw htmlErr;
           }
           const htmlErr = new Error(`IQ Option connector returned an unexpected HTML response (HTTP ${res.status}).`) as Error & {
@@ -247,27 +299,47 @@ export class IQOptionAdapter implements BrokerAdapter {
           } catch {
             if (!res.ok) {
               if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
-                await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
-                continue;
+                this.lastReachableAt.delete(cfg.url);
+                const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
+                const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+                if (!isHealth || remainingBudgetMs > 250) {
+                  await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
+                  continue;
+                }
               }
               const parseErr = new Error(`IQ Option connector HTTP ${res.status}.`) as Error & {
                 status?: number;
                 nonRetryable?: boolean;
+                isGatewayColdStart?: boolean;
               };
               parseErr.status = res.status;
               parseErr.nonRetryable = true;
+              if (res.status === 502 || res.status === 503 || res.status === 504) {
+                parseErr.isGatewayColdStart = true;
+              }
               throw parseErr;
             }
             throw new Error('IQ Option connector returned a non-JSON response.');
           }
         }
+        // Valid JSON from the connector confirms uvicorn is awake and serving requests
+        if (res.status !== 502 && res.status !== 503 && res.status !== 504) {
+          this.lastReachableAt.set(cfg.url, Date.now());
+        }
         if (!res.ok) {
           const msg = String(json.detail || json.error || `Connector HTTP ${res.status}`);
-          // Retry once on transient 502/503 (e.g. cold start or momentary busy lock), but do not blindly retry 504 on /connect
-          const retryableStatus = isConnect ? res.status === 502 || res.status === 503 : res.status === 502 || res.status === 503 || res.status === 504;
+          // Retry on transient 502/503 (e.g. cold start or momentary busy lock), but do not blindly retry 504 on /connect or /order
+          const retryableStatus =
+            isConnect || isOrder
+              ? res.status === 502 || res.status === 503
+              : res.status === 502 || res.status === 503 || res.status === 504;
           if (retryableStatus && attempt < maxAttempts) {
-            await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
-            continue;
+            const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
+            const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+            if (!isHealth || remainingBudgetMs > 250) {
+              await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
+              continue;
+            }
           }
           const httpErr = new Error(msg) as Error & { status?: number; nonRetryable?: boolean };
           httpErr.status = res.status;
@@ -286,7 +358,7 @@ export class IQOptionAdapter implements BrokerAdapter {
           tagged?.name === 'TimeoutError' ||
           tagged?.name === 'AbortError' ||
           /aborted due to timeout|operation was aborted/i.test(msg);
-        if (isConnect && isClientTimeout) {
+        if ((isConnect || isOrder) && isClientTimeout) {
           throw new Error(
             `IQ Option connector timed out during ${path} after ${Math.round(timeoutMs / 1000)}s (broker handshake did not complete in time).`
           );
@@ -295,10 +367,14 @@ export class IQOptionAdapter implements BrokerAdapter {
         if (!isTransient) {
           throw err;
         }
-        if (attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, baseBackoffMs * attempt));
+        this.lastReachableAt.delete(cfg.url);
+        const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
+        const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+        if (attempt < maxAttempts && (!isHealth || remainingBudgetMs > 250)) {
+          await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
           continue;
         }
+        break;
       }
     }
 
@@ -415,6 +491,7 @@ export class IQOptionAdapter implements BrokerAdapter {
         activeMode?: string | null;
         accountType?: string | null;
         modeVerified?: boolean;
+        brokerWalletConfirmed?: boolean;
         orderExecutionSupported?: boolean;
         credentialsConfigured?: boolean;
         lastError?: string | null;
@@ -507,7 +584,9 @@ export class IQOptionAdapter implements BrokerAdapter {
         message: verifiedConnected
           ? accountSyncError
             ? `Connected to IQ Option (${accountType}, ${latencyMs}ms) — live balance sync delayed (${accountSyncError}).${warningSuffix}`
-            : `Connected to IQ Option (${accountType} mode detected directly from IQ Option, ${latencyMs}ms).${warningSuffix}`
+            : accountType === 'PRACTICE' && health.brokerWalletConfirmed === false
+              ? `Connected to IQ Option (PRACTICE safe fallback — broker did not specify active wallet; real-money orders blocked, ${latencyMs}ms).${warningSuffix}`
+              : `Connected to IQ Option (${accountType} mode detected directly from IQ Option, ${latencyMs}ms).${warningSuffix}`
           : accountType === 'UNVERIFIED'
             ? `IQ Option session authenticated (${latencyMs}ms), but active account mode is UNVERIFIED — live orders are blocked until broker mode is confirmed.${warningSuffix}`
             : health.connectInFlight
@@ -561,25 +640,46 @@ export class IQOptionAdapter implements BrokerAdapter {
 
   private async connectInternal(ctx?: BrokerAccountContext) {
     const creds = ctx?.credentials || {};
-    const res = await this.requestConnector<{
+    // Ensure sleeping Render connector is awake before transmitting POST /connect
+    // so Render's edge proxy does not drop /connect with HTTP 502 HTML during cold start.
+    await this.ensureConnectorAwake(ctx);
+
+    type ConnectPayload = {
       authenticated?: boolean;
       connected?: boolean;
       accountType?: string | null;
       activeMode?: string | null;
       mode?: string | null;
       modeVerified?: boolean;
+      brokerWalletConfirmed?: boolean;
       detail?: string | null;
-    }>(
-      '/connect',
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          email: creds.email || undefined,
-          password: creds.apiSecret || undefined,
-        }),
-      },
-      ctx
-    );
+    };
+
+    const sendConnect = () =>
+      this.requestConnector<ConnectPayload>(
+        '/connect',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            email: creds.email || undefined,
+            password: creds.apiSecret || undefined,
+          }),
+        },
+        ctx
+      );
+
+    let res: ConnectPayload;
+    try {
+      res = await sendConnect();
+    } catch (err) {
+      const tagged = err as Error & { isGatewayColdStart?: boolean };
+      if (!tagged?.isGatewayColdStart) {
+        throw err;
+      }
+      // Edge returned 502/503/504 HTML before uvicorn received POST /connect — wake via /health and retry once
+      await this.ensureConnectorAwake(ctx, true);
+      res = await sendConnect();
+    }
 
     const reportedMode = parseVerifiedIqMode(res.activeMode || res.accountType || res.mode, res.modeVerified);
     let balance: number | null = null;
@@ -637,7 +737,9 @@ export class IQOptionAdapter implements BrokerAdapter {
       externalAccountId: confirmedAccountType === 'REAL' ? 'iq-real' : 'iq-practice',
       message: balanceWarning
         ? `Authenticated with IQ Option in ${confirmedAccountType} mode (detected from IQ Option), but balance sync was delayed (${balanceWarning}).`
-        : `Authenticated with IQ Option in ${confirmedAccountType} mode (automatically synced from IQ Option).`,
+        : confirmedAccountType === 'PRACTICE' && res.brokerWalletConfirmed === false
+          ? 'Authenticated with IQ Option in PRACTICE safe fallback (broker did not report active wallet; real-money orders remain blocked).'
+          : `Authenticated with IQ Option in ${confirmedAccountType} mode (automatically synced from IQ Option).`,
     };
   }
 

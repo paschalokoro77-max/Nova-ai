@@ -868,3 +868,158 @@ test('IQ Option mode verification: distinguishes PRACTICE vs REAL, clears stale 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('IQ Option cold-start gateway resilience: wakes sleeping Render service through HTTP 502 HTML before POST /connect while preserving mode guards', async () => {
+  let coldStart502Remaining = 3;
+  let healthCalls = 0;
+  let connectCalls = 0;
+  let connectSawCold502 = false;
+
+  const coldStartServer = await new Promise<{ url: string; close: () => Promise<void> }>((resolve) => {
+    const server = http.createServer((req, res) => {
+      const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
+      const pathname = urlObj.pathname;
+
+      if (coldStart502Remaining > 0) {
+        coldStart502Remaining -= 1;
+        if (pathname === '/health') healthCalls += 1;
+        if (pathname === '/connect') connectSawCold502 = true;
+        res.writeHead(502, { 'content-type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>');
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/health') {
+        healthCalls += 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            status: 'running',
+            version: '0.5.3',
+            serviceAvailable: true,
+            busy: false,
+            connectInFlight: false,
+            authenticated: connectCalls > 0,
+            connected: connectCalls > 0,
+            mode: connectCalls > 0 ? 'PRACTICE' : null,
+            activeMode: connectCalls > 0 ? 'PRACTICE' : null,
+            accountType: connectCalls > 0 ? 'PRACTICE' : null,
+            modeVerified: connectCalls > 0,
+            modeFollowsBroker: true,
+            orderExecutionSupported: true,
+            credentialsConfigured: true,
+            lastError: null,
+          })
+        );
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/connect') {
+        connectCalls += 1;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            authenticated: true,
+            connected: true,
+            mode: 'PRACTICE',
+            activeMode: 'PRACTICE',
+            accountType: 'PRACTICE',
+            modeVerified: true,
+            modeFollowsBroker: true,
+            orderExecutionSupported: true,
+            detail: null,
+          })
+        );
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/account') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            connected: true,
+            mode: 'PRACTICE',
+            activeMode: 'PRACTICE',
+            accountType: 'PRACTICE',
+            modeVerified: true,
+            balance: 8123.45,
+            currency: 'USD',
+            source: 'IQ_OPTION_UNOFFICIAL',
+          })
+        );
+        return;
+      }
+
+      res.writeHead(404, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ detail: 'Not found' }));
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      assert.ok(addr && typeof addr !== 'string');
+      resolve({
+        url: `http://127.0.0.1:${addr.port}`,
+        close: () => new Promise<void>((done) => server.close(() => done())),
+      });
+    });
+  });
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'novatrade-iq-coldstart-test-'));
+  const prevUrl = process.env.IQ_CONNECTOR_URL;
+  const prevToken = process.env.IQ_CONNECTOR_TOKEN;
+  const prevBackoff = process.env.IQ_CONNECTOR_WAKE_BACKOFF_MS;
+  const prevBudget = process.env.IQ_CONNECTOR_WAKE_BUDGET_MS;
+  process.env.IQ_CONNECTOR_URL = coldStartServer.url;
+  process.env.IQ_CONNECTOR_TOKEN = 'test-token-coldstart';
+  process.env.IQ_CONNECTOR_WAKE_BACKOFF_MS = '40';
+  process.env.IQ_CONNECTOR_WAKE_BUDGET_MS = '5000';
+
+  try {
+    const manager = new BrokerConnectionManager(new BrokerRegistry(), path.join(tmpDir, 'state.json'));
+    const userId = 'user-coldstart';
+    const acct = await manager.createOrUpdateAccount(userId, {
+      brokerId: 'iq_option',
+      label: 'IQ Option (coldstart@example.com)',
+      credentials: { email: 'coldstart@example.com', apiSecret: 'valid-secret' },
+    });
+
+    // Connecting while Render returns 3 consecutive HTTP 502 HTML cold-start responses must wake via /health first
+    const connected = await manager.connectAccount(userId, acct.id);
+    assert.equal(connected.connected, true);
+    assert.equal(connected.status, 'CONNECTED');
+    assert.equal(connected.accountType, 'PRACTICE');
+    assert.equal(connected.environment, 'demo');
+    assert.equal(connected.balance, 8123.45);
+    assert.equal(healthCalls, 4, 'Expected 3 HTTP 502 HTML cold-start health probes + 1 healthy wake response');
+    assert.equal(connectCalls, 1, 'POST /connect must execute cleanly once after service wakes');
+    assert.equal(connectSawCold502, false, 'POST /connect must NOT be fired before /health confirms service is awake');
+
+    // Genuine persistent HTTP 502 HTML outage must still fail cleanly with GATEWAY OFFLINE
+    coldStart502Remaining = 99;
+    // Create a fresh manager with empty lastReachableAt to test persistent outage
+    const outageManager = new BrokerConnectionManager(new BrokerRegistry(), path.join(tmpDir, 'state-outage.json'));
+    const outageAcct = await outageManager.createOrUpdateAccount(userId, {
+      brokerId: 'iq_option',
+      label: 'IQ Option (outage@example.com)',
+      credentials: { email: 'outage@example.com', apiSecret: 'valid-secret' },
+    });
+    await assert.rejects(
+      () => outageManager.connectAccount(userId, outageAcct.id),
+      (err: unknown) => {
+        const e = err as { statusCode?: number; connectionStatus?: string; message?: string };
+        return e.statusCode === 424 && e.connectionStatus === 'GATEWAY OFFLINE' && /HTTP 502 HTML/i.test(e.message || '');
+      }
+    );
+  } finally {
+    if (prevUrl === undefined) delete process.env.IQ_CONNECTOR_URL;
+    else process.env.IQ_CONNECTOR_URL = prevUrl;
+    if (prevToken === undefined) delete process.env.IQ_CONNECTOR_TOKEN;
+    else process.env.IQ_CONNECTOR_TOKEN = prevToken;
+    if (prevBackoff === undefined) delete process.env.IQ_CONNECTOR_WAKE_BACKOFF_MS;
+    else process.env.IQ_CONNECTOR_WAKE_BACKOFF_MS = prevBackoff;
+    if (prevBudget === undefined) delete process.env.IQ_CONNECTOR_WAKE_BUDGET_MS;
+    else process.env.IQ_CONNECTOR_WAKE_BUDGET_MS = prevBudget;
+    await coldStartServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

@@ -2573,8 +2573,216 @@ class TestIqConnectorModes(unittest.TestCase):
                 else:
                     sys.modules[k] = v
 
-    def test_dual_wallet_ambiguous_profile_without_user_settings_returns_unverified_and_blocks_orders(self):
-        """When get-user-settings does not confirm balanceId on a dual-wallet account, NEVER assume REAL and block all orders."""
+    def test_dual_wallet_ambiguous_profile_uses_safe_practice_fallback_and_blocks_real_orders(self):
+        """When user-settings returns 4004 and balance_type=0 on a dual-wallet account, safely bind locally to PRACTICE (type=4), NEVER assume REAL, and hard-block all REAL orders until IQ Option confirms an active wallet."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = 111001  # Simulate legacy REAL binding before mode verification
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            client = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+            # Match exact production profile shape: balance_type=0 with legacy balance_id pointing to REAL
+            client.api.profile.msg["balance_type"] = 0
+            client.api.profile.msg["balance_id"] = 111001
+            app._client = client
+
+            confirmed, verified = app._detect_balance_mode(client, refresh=True)
+            self.assertEqual(confirmed, "PRACTICE")
+            self.assertTrue(verified)
+            self.assertFalse(app._broker_wallet_confirmed)
+            # Must bind locally ONLY to verified type=4 PRACTICE wallet 444004, NEVER REAL wallet 111001
+            self.assertEqual(m_gv.balance_id, 444004)
+            self.assertEqual(client.change_balance_calls, [])
+
+            h = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h["authenticated"])
+            self.assertTrue(h["connected"])
+            self.assertEqual(h["mode"], "PRACTICE")
+            self.assertEqual(h["accountType"], "PRACTICE")
+            self.assertTrue(h["modeVerified"])
+            self.assertFalse(h["brokerWalletConfirmed"])
+            self.assertFalse(h["realTradingEnabled"])
+            self.assertEqual(h["modeDetection"]["source"], "safe_practice_fallback")
+            self.assertFalse(h["modeDetection"]["realOrdersAllowed"])
+
+            acc = app.account(fresh=True, x_connector_token=None)
+            self.assertEqual(acc["mode"], "PRACTICE")
+            self.assertEqual(acc["balance"], 9850.5)
+            self.assertFalse(acc["brokerWalletConfirmed"])
+            self.assertFalse(acc["realTradingEnabled"])
+
+            # 1. REAL order MUST be hard-blocked with HTTP 409 and zero buy() calls
+            with self.assertRaises(app.HTTPException) as ctx_real:
+                app.place_order(
+                    app.OrderRequest(
+                        symbol="EURUSD",
+                        direction="CALL",
+                        amount=10.0,
+                        expirySeconds=60,
+                        expectedMode="REAL",
+                        idempotencyKey="fallback-real-block-1",
+                    ),
+                    x_connector_token=None,
+                )
+            self.assertEqual(ctx_real.exception.status_code, 409)
+            self.assertEqual(client.buy_calls, [])
+
+            # 2. Defense-in-depth: even if internal mode state were coerced to REAL while _broker_wallet_confirmed is False,
+            #    place_order MUST STILL hard-block with HTTP 409 and zero buy() calls.
+            saved_confirmed = app._confirmed_mode
+            saved_verified = app._mode_verified
+            saved_broker_conf = app._broker_wallet_confirmed
+            orig_require = app._require_verified_mode
+            try:
+                app._confirmed_mode = "REAL"
+                app._mode_verified = True
+                app._broker_wallet_confirmed = False
+                app._require_verified_mode = lambda _c, target_mode="AUTO", refresh=False: ("REAL", True)
+                with self.assertRaises(app.HTTPException) as ctx_tamper:
+                    app.place_order(
+                        app.OrderRequest(
+                            symbol="EURUSD",
+                            direction="CALL",
+                            amount=10.0,
+                            expirySeconds=60,
+                            expectedMode="REAL",
+                            idempotencyKey="fallback-tamper-real-block-2",
+                        ),
+                        x_connector_token=None,
+                    )
+                self.assertEqual(ctx_tamper.exception.status_code, 409)
+                self.assertEqual(client.buy_calls, [])
+            finally:
+                app._require_verified_mode = orig_require
+                app._confirmed_mode = saved_confirmed
+                app._mode_verified = saved_verified
+                app._broker_wallet_confirmed = saved_broker_conf
+
+            # 3. PRACTICE order executes strictly against verified PRACTICE wallet 444004
+            prac_res = app.place_order(
+                app.OrderRequest(
+                    symbol="EURUSD",
+                    direction="CALL",
+                    amount=10.0,
+                    expirySeconds=60,
+                    expectedMode="PRACTICE",
+                    idempotencyKey="fallback-practice-ok-1",
+                ),
+                x_connector_token=None,
+            )
+            self.assertTrue(prac_res["accepted"])
+            self.assertEqual(prac_res["mode"], "PRACTICE")
+            self.assertEqual(client.buy_calls[-1][4], 444004)
+            self.assertEqual(client.change_balance_calls, [])
+
+            # 4. Once user switches wallet inside IQ Option (live user-settings-changed push to REAL 111001),
+            #    NovaTrade automatically follows and promotes brokerWalletConfirmed -> True with zero change_balance() calls
+            client.api.settings_balance_id = 111001
+            client.api._nt_user_settings_balance_id = 111001
+            client.api._nt_user_settings_source = "user-settings-changed"
+            client.api._nt_user_settings_at = time.time()
+
+            h_live = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h_live["connected"])
+            self.assertEqual(h_live["mode"], "REAL")
+            self.assertTrue(h_live["modeVerified"])
+            self.assertTrue(h_live["brokerWalletConfirmed"])
+            self.assertTrue(h_live["realTradingEnabled"])
+            self.assertEqual(m_gv.balance_id, 111001)
+            self.assertEqual(client.change_balance_calls, [])
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_user_settings_result_ack_waits_for_real_user_settings_frame(self):
+        """A {'name': 'result', 'msg': {'success': true}} transport ACK must NOT abort waiting for the async user-settings frame."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = None
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            client = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+
+            def ack_then_async_user_settings(name, msg, request_id="", no_force_send=True):
+                if name == "sendMessage" and isinstance(msg, dict) and msg.get("name") == "get-user-settings":
+                    body = msg.get("body") or {}
+                    if body.get("name") == "traderoom_gl_common" and body.get("version") == 3:
+                        # Step 1: simulate transport ACK recorded by _safe_on_message (success: True)
+                        ack_map = getattr(client.api, "_nt_ws_acks", None)
+                        if not isinstance(ack_map, dict):
+                            ack_map = {}
+                            client.api._nt_ws_acks = ack_map
+                        ack_map[str(request_id)] = True
+
+                        # Step 2: deliver the real async user-settings frame 50ms later
+                        def _deliver():
+                            time.sleep(0.05)
+                            client.api._nt_ws_responses[str(request_id)] = {
+                                "name": "user-settings",
+                                "status": 2000,
+                                "request_id": str(request_id),
+                                "msg": {
+                                    "result": {
+                                        "configs": {
+                                            "traderoom_gl_common": {
+                                                "version": 3,
+                                                "config": {"balanceId": 444004},
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+
+                        threading.Thread(target=_deliver, daemon=True).start()
+                    else:
+                        client.api._nt_ws_responses[str(request_id)] = {
+                            "name": "user-settings",
+                            "status": 4004,
+                            "request_id": str(request_id),
+                            "msg": {"error": "user settings not found"},
+                        }
+
+            client.api.send_websocket_request = ack_then_async_user_settings
+            app._client = client
+
+            confirmed, verified = app._detect_balance_mode(client, refresh=True)
+            self.assertEqual(confirmed, "PRACTICE")
+            self.assertTrue(verified)
+            self.assertTrue(app._broker_wallet_confirmed)
+            self.assertEqual(m_gv.balance_id, 444004)
+            self.assertEqual(app._mode_detection_diag["source"], "user_settings")
+            self.assertEqual(app._mode_detection_diag["userSettingsMatchedQuery"], "traderoom_gl_common_v3")
+            self.assertEqual(client.change_balance_calls, [])
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_unknown_wallet_without_practice_wallet_remains_unverified_and_blocks_all_orders(self):
+        """When active wallet is unknown AND no verified PRACTICE (type=4) wallet exists, stay strictly UNVERIFIED and block ALL orders."""
         saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
         m_iq = ModuleType("iqoptionapi")
         m_gv = ModuleType("iqoptionapi.global_value")
@@ -2590,23 +2798,26 @@ class TestIqConnectorModes(unittest.TestCase):
 
         try:
             client = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+            # Remove all wallet entries so no verified PRACTICE wallet exists and active wallet is unknown
+            client.api.balances_raw = {"msg": []}
+            client.api.get_balances = lambda: None
+            client.api.profile.msg = {"balance_type": 0, "balance_id": None, "balances": []}
             app._client = client
 
             confirmed, verified = app._detect_balance_mode(client, refresh=True)
             self.assertEqual(confirmed, "UNVERIFIED")
             self.assertFalse(verified)
-            # Must NEVER leave global_value.balance_id pointing at REAL wallet 111001 while unverified
+            self.assertFalse(app._broker_wallet_confirmed)
             self.assertNotEqual(m_gv.balance_id, 111001)
 
             h = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
             self.assertTrue(h["authenticated"])
             self.assertFalse(h["connected"])
             self.assertEqual(h["mode"], "UNVERIFIED")
-            self.assertEqual(h["accountType"], "UNVERIFIED")
             self.assertFalse(h["modeVerified"])
+            self.assertFalse(h["brokerWalletConfirmed"])
             self.assertFalse(h["realTradingEnabled"])
 
-            # Live order MUST be blocked with HTTP 409 and zero buy() calls
             with self.assertRaises(app.HTTPException) as ctx:
                 app.place_order(
                     app.OrderRequest(
@@ -2614,7 +2825,7 @@ class TestIqConnectorModes(unittest.TestCase):
                         direction="CALL",
                         amount=10.0,
                         expirySeconds=60,
-                        idempotencyKey="unverified-order-block-1",
+                        idempotencyKey="unknown-no-practice-block-1",
                     ),
                     x_connector_token=None,
                 )
@@ -2693,6 +2904,7 @@ class TestIqConnectorModes(unittest.TestCase):
             h = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
             self.assertTrue(h["connected"])
             self.assertEqual(h["mode"], "PRACTICE")
+            self.assertTrue(h["brokerWalletConfirmed"])
             self.assertEqual(h["modeDetection"]["userSettingsMatchedQuery"], "traderoom_gl_common_v3")
             self.assertEqual(h["modeDetection"]["userSettingsResponseStatus"], 2000)
             # Diagnostics must NEVER leak raw balance IDs or amounts
@@ -2736,10 +2948,12 @@ class TestIqConnectorModes(unittest.TestCase):
             confirmed, verified = app._detect_balance_mode(client_prac, refresh=True)
             self.assertEqual(confirmed, "PRACTICE")
             self.assertTrue(verified)
+            self.assertTrue(app._broker_wallet_confirmed)
             self.assertEqual(m_gv.balance_id, 444004)
             self.assertEqual(app._mode_detection_diag["source"], "http_getprofile_explicit")
 
-            # Case B: HTTP getprofile reports legacy balance_type=1 (REAL) on dual-wallet account -> MUST remain UNVERIFIED!
+            # Case B: HTTP getprofile reports legacy balance_type=1 (REAL) on dual-wallet account -> MUST NEVER assume REAL!
+            # Falls back safely to PRACTICE (type=4) with brokerWalletConfirmed=False and realOrdersAllowed=False.
             client_ambig = self._make_dual_wallet_protocol_client(settings_balance_id=None)
             client_ambig.api.profile.msg = {
                 "balances": client_ambig.api.balances_raw["msg"],
@@ -2750,8 +2964,12 @@ class TestIqConnectorModes(unittest.TestCase):
             }
             app._client = client_ambig
             confirmed2, verified2 = app._detect_balance_mode(client_ambig, refresh=True)
-            self.assertEqual(confirmed2, "UNVERIFIED")
-            self.assertFalse(verified2)
+            self.assertEqual(confirmed2, "PRACTICE")
+            self.assertTrue(verified2)
+            self.assertFalse(app._broker_wallet_confirmed)
+            self.assertEqual(m_gv.balance_id, 444004)
+            self.assertEqual(app._mode_detection_diag["source"], "safe_practice_fallback")
+            self.assertFalse(app._mode_detection_diag["realOrdersAllowed"])
             self.assertTrue(app._mode_detection_diag["profileDiag"]["httpProfileChecked"])
             self.assertEqual(app._mode_detection_diag["profileDiag"]["httpProfileBalanceType"], 1)
             self.assertEqual(app._mode_detection_diag["profileDiag"]["httpProfileBalanceIdMode"], "REAL")
