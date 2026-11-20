@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.0')
+app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.1')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
@@ -56,10 +56,11 @@ _last_connect_duration_ms: Optional[float] = None
 _last_error: Optional[str] = None
 _connected_at: Optional[float] = None
 _requested_mode: str = 'AUTO'
-_confirmed_mode: str = 'PRACTICE'
+_confirmed_mode: str = 'UNVERIFIED'
 _mode_verified: bool = False
 _active_balance_id: Any = None
 _active_currency: str = 'USD'
+_mode_detection_diag: Optional[dict] = None
 _active_ws_url: Optional[str] = None
 _active_ws_via_proxy: bool = False
 _last_ws_diagnostics: Optional[List[dict]] = None
@@ -426,15 +427,17 @@ def _invalidate_balance_cache():
 
 
 def _invalidate_client(reason: Optional[str] = None, cancel_inflight: bool = False):
-    global _client, _connected_at, _mode_verified, _active_balance_id, _active_ws_url, _active_ws_via_proxy
-    global _opcodes_updated, _last_error, _session_generation, _last_balance_cache
+    global _client, _connected_at, _confirmed_mode, _mode_verified, _active_balance_id, _mode_detection_diag
+    global _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_error, _session_generation, _last_balance_cache
     with _state_lock:
         _session_generation += 1
         old_client = _client
         _client = None
         _connected_at = None
+        _confirmed_mode = 'UNVERIFIED'
         _mode_verified = False
         _active_balance_id = None
+        _mode_detection_diag = None
         _active_ws_url = None
         _active_ws_via_proxy = False
         _opcodes_updated = False
@@ -939,9 +942,35 @@ def _patch_iqoptionapi():
         pass
 
     # 1. Ensure WebsocketClient.on_message ALWAYS releases ssl_Mutual_exclusion on any exception
+    #    and captures live IQ Option user-settings / user-settings-changed frames for authoritative mode tracking.
     orig_on_message = WebsocketClient.on_message
 
     def _safe_on_message(self, message):
+        try:
+            raw_msg = json.loads(message) if isinstance(message, str) else message
+            if isinstance(raw_msg, dict):
+                msg_name = str(raw_msg.get('name') or '')
+                req_id = str(raw_msg.get('request_id') or '')
+                api_obj = getattr(self, 'api', None)
+                if api_obj is not None:
+                    pending_ids = getattr(api_obj, '_nt_pending_req_ids', None)
+                    if req_id and isinstance(pending_ids, set) and req_id in pending_ids:
+                        resp_map = getattr(api_obj, '_nt_ws_responses', None)
+                        if not isinstance(resp_map, dict):
+                            resp_map = {}
+                            api_obj._nt_ws_responses = resp_map
+                        resp_map[req_id] = raw_msg
+                    if msg_name in ('user-settings', 'user-settings-changed'):
+                        api_obj._nt_user_settings_msg = raw_msg
+                        extracted_id = _extract_balance_id_from_user_settings(raw_msg)
+                        if extracted_id is not None:
+                            api_obj._nt_user_settings_balance_id = extracted_id
+                            api_obj._nt_user_settings_source = msg_name
+                            api_obj._nt_user_settings_at = time.time()
+                            # Keep cached balance invalid when user switches mode inside IQ Option
+                            _invalidate_balance_cache()
+        except Exception:
+            pass
         try:
             return orig_on_message(self, message)
         finally:
@@ -1369,26 +1398,22 @@ def _patch_iqoptionapi():
                     return False, 'Connection attempt cancelled after timeout.'
                 profile_msg = getattr(getattr(self.api, 'profile', None), 'msg', None)
                 if isinstance(profile_msg, dict):
-                    # Follow IQ Option's own active selected balance_id first (NEVER override user's REAL/PRACTICE choice!)
-                    active_bal_id = profile_msg.get('balance_id')
-                    if active_bal_id is not None:
-                        global_value.balance_id = active_bal_id
-                    elif isinstance(profile_msg.get('balances'), list):
-                        pref_type = profile_msg.get('balance_type')
-                        if pref_type in (1, 4):
-                            for bal in profile_msg['balances']:
-                                if isinstance(bal, dict) and bal.get('type') == pref_type and bal.get('id') is not None:
-                                    global_value.balance_id = bal['id']
-                                    break
-                        if global_value.balance_id is None:
-                            for bal in profile_msg['balances']:
-                                if isinstance(bal, dict) and bal.get('type') == 4 and bal.get('id') is not None:
-                                    global_value.balance_id = bal['id']
-                                    break
-                        if global_value.balance_id is None and profile_msg['balances']:
-                            first = profile_msg['balances'][0]
-                            if isinstance(first, dict) and first.get('id') is not None:
-                                global_value.balance_id = first['id']
+                    # NEVER blindly bind global_value.balance_id to legacy profile_msg['balance_id'] (which IQ Option
+                    # sends as type==1 REAL even when the user is on PRACTICE in the traderoom!).
+                    # Temporarily prefer PRACTICE (type==4) for initial stream subscription; authoritative mode detection
+                    # in _detect_balance_mode() will resolve the true active balanceId from IQ Option user-settings.
+                    balances_list = profile_msg.get('balances')
+                    if isinstance(balances_list, list):
+                        for bal in balances_list:
+                            if isinstance(bal, dict) and bal.get('type') == 4 and bal.get('id') is not None:
+                                global_value.balance_id = bal['id']
+                                break
+                        if global_value.balance_id is None and len(balances_list) == 1:
+                            only_bal = balances_list[0]
+                            if isinstance(only_bal, dict) and only_bal.get('id') is not None:
+                                global_value.balance_id = only_bal['id']
+                    if global_value.balance_id is None and profile_msg.get('balance_type') == 4 and profile_msg.get('balance_id') is not None:
+                        global_value.balance_id = profile_msg.get('balance_id')
                 if global_value.balance_id is not None:
                     break
                 if global_value.check_websocket_if_connect == 0 or global_value.check_websocket_if_error:
@@ -1403,6 +1428,10 @@ def _patch_iqoptionapi():
                 return False, 'Timed out waiting for IQ Option balance profile.'
             self.position_change_all('subscribeMessage', global_value.balance_id)
             self.order_changed_all('subscribeMessage')
+            try:
+                self.api.send_websocket_request('subscribeMessage', {'name': 'user-settings-changed', 'version': '1.0'})
+            except Exception:
+                pass
             self.api.setOptions(1, True)
             return True, None
         return False, reason
@@ -1520,59 +1549,330 @@ def _resolve_target_mode(
     )
 
 
+def _coerce_balance_id(raw_val: Any) -> Any:
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, int):
+        return raw_val
+    if isinstance(raw_val, float) and math.isfinite(raw_val) and raw_val.is_integer():
+        return int(raw_val)
+    s = str(raw_val).strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    return s
+
+
+def _extract_balance_id_from_user_settings(payload: Any) -> Any:
+    """Extract the user's currently selected traderoom balanceId from IQ Option user-settings / user-settings-changed."""
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            return None
+
+    def _from_config_obj(cfg: Any) -> Any:
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:
+                return None
+        if isinstance(cfg, dict):
+            for key in ('balanceId', 'balance_id', 'activeBalanceId', 'active_balance_id'):
+                val = _coerce_balance_id(cfg.get(key))
+                if val is not None:
+                    return val
+        return None
+
+    if isinstance(payload, dict):
+        # Unwrap WebSocket envelope {'name': 'user-settings', 'msg': ...}
+        if 'msg' in payload and payload.get('msg') is not None:
+            inner = _extract_balance_id_from_user_settings(payload.get('msg'))
+            if inner is not None:
+                return inner
+        if 'result' in payload and payload.get('result') is not None:
+            inner = _extract_balance_id_from_user_settings(payload.get('result'))
+            if inner is not None:
+                return inner
+
+        # Shape A: {'name': 'traderoom_gl_common', 'config': {'balanceId': 123}}
+        if payload.get('name') == 'traderoom_gl_common' or payload.get('setting_name') == 'traderoom_gl_common':
+            val = _from_config_obj(payload.get('config'))
+            if val is not None:
+                return val
+
+        # Shape B: {'configs': {'traderoom_gl_common': {'config': {'balanceId': 123}}}} or {'configs': [...]}
+        configs = payload.get('configs')
+        if isinstance(configs, dict):
+            tr = configs.get('traderoom_gl_common')
+            if isinstance(tr, dict):
+                val = _from_config_obj(tr.get('config') if 'config' in tr else tr)
+                if val is not None:
+                    return val
+            for cfg_entry in configs.values():
+                val = _extract_balance_id_from_user_settings(cfg_entry)
+                if val is not None:
+                    return val
+        elif isinstance(configs, list):
+            for entry in configs:
+                if isinstance(entry, dict) and entry.get('name') == 'traderoom_gl_common':
+                    val = _from_config_obj(entry.get('config') if 'config' in entry else entry)
+                    if val is not None:
+                        return val
+
+        # Shape C: direct {'config': {'balanceId': 123}} or {'traderoom_gl_common': ...}
+        if 'traderoom_gl_common' in payload:
+            val = _extract_balance_id_from_user_settings(payload.get('traderoom_gl_common'))
+            if val is not None:
+                return val
+        if 'config' in payload:
+            val = _from_config_obj(payload.get('config'))
+            if val is not None:
+                return val
+
+        # Shape D: direct {'balanceId': 123} / {'balance_id': 123}
+        direct = _from_config_obj(payload)
+        if direct is not None:
+            return direct
+
+    elif isinstance(payload, list):
+        # Prefer explicit traderoom_gl_common entry first
+        for entry in payload:
+            if isinstance(entry, dict) and entry.get('name') == 'traderoom_gl_common':
+                val = _from_config_obj(entry.get('config') if 'config' in entry else entry)
+                if val is not None:
+                    return val
+        for entry in payload:
+            val = _extract_balance_id_from_user_settings(entry)
+            if val is not None:
+                return val
+
+    return None
+
+
+def _resolve_mode_from_balances(
+    balances: Any,
+    target_balance_id: Any,
+) -> Tuple[Optional[str], Any, Optional[str]]:
+    """Map a specific balance_id to ('PRACTICE' | 'REAL', balance_id, currency) using IQ Option's balances list."""
+    norm_target = _coerce_balance_id(target_balance_id)
+    if norm_target is None or not isinstance(balances, list):
+        return (None, None, None)
+    for bal in balances:
+        if not isinstance(bal, dict):
+            continue
+        bid = _coerce_balance_id(bal.get('id'))
+        if bid is not None and str(bid) == str(norm_target):
+            btype = bal.get('type')
+            curr = str(bal.get('currency') or 'USD').upper()
+            if btype == 1:
+                return ('REAL', bid, curr)
+            if btype == 4:
+                return ('PRACTICE', bid, curr)
+    return (None, None, None)
+
+
+def _get_balances_list(client: Any, refresh: bool = False, timeout_seconds: float = 2.5) -> List[dict]:
+    """Return list of IQ Option balance dicts from live get-balances (when refreshing) or profile.msg."""
+    api = getattr(client, 'api', None)
+    if api is None:
+        return []
+    if refresh and hasattr(api, 'get_balances') and _is_client_alive(client):
+        try:
+            _reset_iq_global_locks()
+            api.balances_raw = None
+            _run_with_timeout(api.get_balances, min(timeout_seconds, 2.0), 'mode_get_balances')
+            deadline = time.monotonic() + min(timeout_seconds, 2.5)
+            while time.monotonic() < deadline:
+                raw = getattr(api, 'balances_raw', None)
+                if isinstance(raw, dict) and isinstance(raw.get('msg'), list):
+                    return [b for b in raw['msg'] if isinstance(b, dict)]
+                if not _is_client_alive(client):
+                    break
+                time.sleep(0.03)
+        except Exception:
+            pass
+    raw_cached = getattr(api, 'balances_raw', None)
+    if isinstance(raw_cached, dict) and isinstance(raw_cached.get('msg'), list) and raw_cached['msg']:
+        return [b for b in raw_cached['msg'] if isinstance(b, dict)]
+    profile_msg = getattr(getattr(api, 'profile', None), 'msg', None)
+    if isinstance(profile_msg, dict) and isinstance(profile_msg.get('balances'), list):
+        return [b for b in profile_msg['balances'] if isinstance(b, dict)]
+    return []
+
+
+def _query_user_settings_balance_id(
+    client: Any,
+    timeout_seconds: float = 2.5,
+) -> Tuple[Any, Optional[str], dict]:
+    """Read-only WebSocket query for IQ Option's traderoom_gl_common.config.balanceId.
+    NEVER calls set-user-settings or change_balance.
+    """
+    diag: dict = {
+        'queried': False,
+        'attempts': 0,
+        'responseName': None,
+        'foundBalanceId': False,
+    }
+    api = getattr(client, 'api', None)
+    if api is None or not hasattr(api, 'send_websocket_request') or not _is_client_alive(client):
+        return (None, None, diag)
+
+    if not isinstance(getattr(api, '_nt_pending_req_ids', None), set):
+        api._nt_pending_req_ids = set()
+    if not isinstance(getattr(api, '_nt_ws_responses', None), dict):
+        api._nt_ws_responses = {}
+
+    queries = [
+        {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common'}},
+        {'name': 'get-user-settings', 'version': '1.0', 'body': {'names': ['traderoom_gl_common']}},
+        {'name': 'get-user-settings', 'version': '1.0', 'body': {}},
+    ]
+    per_try_budget = max(0.5, min(1.5, timeout_seconds / 2.0))
+
+    for idx, msg_payload in enumerate(queries):
+        if not _is_client_alive(client):
+            break
+        diag['queried'] = True
+        diag['attempts'] = idx + 1
+        req_id = f'nt_us_{int(time.time() * 1000)}_{idx}'
+        api._nt_pending_req_ids.add(req_id)
+        try:
+            _run_with_timeout(
+                lambda p=msg_payload, rid=req_id: api.send_websocket_request('sendMessage', p, request_id=rid),
+                min(per_try_budget, 1.5),
+                'get_user_settings',
+            )
+            deadline = time.monotonic() + per_try_budget
+            while time.monotonic() < deadline:
+                resp = api._nt_ws_responses.pop(req_id, None)
+                if resp is not None:
+                    diag['responseName'] = str(resp.get('name') or '')
+                    bal_id = _extract_balance_id_from_user_settings(resp)
+                    if bal_id is not None:
+                        api._nt_user_settings_balance_id = bal_id
+                        api._nt_user_settings_source = 'user_settings'
+                        api._nt_user_settings_at = time.time()
+                        diag['foundBalanceId'] = True
+                        return (bal_id, 'user_settings', diag)
+                    break
+                if not _is_client_alive(client):
+                    break
+                time.sleep(0.03)
+        except Exception:
+            pass
+        finally:
+            api._nt_pending_req_ids.discard(req_id)
+
+    return (None, None, diag)
+
+
+def _sync_local_balance_id(client: Any, verified_balance_id: Any) -> None:
+    """Align local iqoptionapi global_value.balance_id with the verified active balance_id from IQ Option.
+    NEVER calls client.change_balance() or set_user_settings() on IQ Option.
+    """
+    norm_id = _coerce_balance_id(verified_balance_id)
+    if norm_id is None:
+        return
+    try:
+        import iqoptionapi.global_value as global_value
+        prev_id = getattr(global_value, 'balance_id', None)
+        global_value.balance_id = norm_id
+        if prev_id != norm_id and client is not None and hasattr(client, 'position_change_all'):
+            try:
+                if prev_id is not None:
+                    client.position_change_all('unsubscribeMessage', prev_id)
+                client.position_change_all('subscribeMessage', norm_id)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _extract_mode_from_profile(profile_msg: Any) -> Tuple[Optional[str], Any, Optional[str]]:
-    """Inspect IQ Option profile payload to determine the user's currently selected mode, balance_id, and currency."""
+    """Inspect IQ Option profile payload conservatively.
+    IMPORTANT: IQ Option's WebSocket `profile` message often returns legacy `balance_type: 1` (REAL) and
+    the primary REAL `balance_id` EVEN WHEN the user has switched to PRACTICE inside IQ Option's traderoom.
+    Therefore, on a dual-wallet account (both REAL type=1 and PRACTICE type=4 present), this function
+    NEVER assumes REAL from legacy profile fields alone — it only returns a mode when unambiguous:
+      1. Exactly one balance entry has an explicit `is_active` / `active` == True flag.
+      2. The account has ONLY a single wallet type (only PRACTICE or only REAL).
+      3. Profile explicitly indicates PRACTICE (balance_type == 4, balance_id -> type 4, or is_demo == True).
+    Otherwise returns (None, None, None) so _detect_balance_mode() requires live user-settings verification.
+    """
     if not isinstance(profile_msg, dict):
         return (None, None, None)
 
-    bal_id = profile_msg.get('balance_id')
-    if bal_id is None:
-        try:
-            import iqoptionapi.global_value as global_value
-            bal_id = getattr(global_value, 'balance_id', None)
-        except Exception:
-            bal_id = None
-
     balances = profile_msg.get('balances')
-    if isinstance(balances, list):
-        if bal_id is not None:
-            for bal in balances:
-                if isinstance(bal, dict) and bal.get('id') == bal_id:
-                    btype = bal.get('type')
-                    curr = str(bal.get('currency') or 'USD').upper()
-                    if btype == 1:
-                        return ('REAL', bal_id, curr)
-                    if btype == 4:
-                        return ('PRACTICE', bal_id, curr)
-        pref_type = profile_msg.get('balance_type')
-        if pref_type in (1, 4):
-            for bal in balances:
-                if isinstance(bal, dict) and bal.get('type') == pref_type:
-                    curr = str(bal.get('currency') or 'USD').upper()
-                    return ('REAL' if pref_type == 1 else 'PRACTICE', bal.get('id'), curr)
+    bal_list = [b for b in balances if isinstance(b, dict)] if isinstance(balances, list) else []
+
+    # 1. Explicit active balance flag on exactly one balance entry
+    active_entries = [b for b in bal_list if b.get('is_active') is True or b.get('active') is True]
+    if len(active_entries) == 1:
+        b = active_entries[0]
+        btype = b.get('type')
+        curr = str(b.get('currency') or 'USD').upper()
+        if btype == 1:
+            return ('REAL', _coerce_balance_id(b.get('id')), curr)
+        if btype == 4:
+            return ('PRACTICE', _coerce_balance_id(b.get('id')), curr)
+
+    real_entries = [b for b in bal_list if b.get('type') == 1]
+    practice_entries = [b for b in bal_list if b.get('type') == 4]
+
+    # 2. Single-wallet account (unambiguous)
+    if practice_entries and not real_entries:
+        b = practice_entries[0]
+        return ('PRACTICE', _coerce_balance_id(b.get('id')), str(b.get('currency') or 'USD').upper())
+    if real_entries and not practice_entries:
+        b = real_entries[0]
+        return ('REAL', _coerce_balance_id(b.get('id')), str(b.get('currency') or 'USD').upper())
+
+    # 3. Explicit PRACTICE signal in profile (safe — never assumes REAL)
+    prof_bal_id = _coerce_balance_id(profile_msg.get('balance_id'))
+    if prof_bal_id is not None and bal_list:
+        m, bid, curr = _resolve_mode_from_balances(bal_list, prof_bal_id)
+        if m == 'PRACTICE':
+            return ('PRACTICE', bid, curr)
 
     bal_type = profile_msg.get('balance_type')
-    if bal_type == 1:
-        return ('REAL', bal_id, str(profile_msg.get('currency') or 'USD').upper())
-    if bal_type == 4:
-        return ('PRACTICE', bal_id, str(profile_msg.get('currency') or 'USD').upper())
-    return (None, bal_id, None)
+    if bal_type == 4 or profile_msg.get('is_demo') is True:
+        if practice_entries:
+            b = practice_entries[0]
+            return ('PRACTICE', _coerce_balance_id(b.get('id')), str(b.get('currency') or 'USD').upper())
+        return ('PRACTICE', prof_bal_id, str(profile_msg.get('currency') or 'USD').upper())
+
+    # 4. Dual-wallet account with legacy balance_type == 1: AMBIGUOUS — do NOT assume REAL!
+    if real_entries and practice_entries:
+        return (None, None, None)
+
+    # 5. Profile without balances array: only trust explicit PRACTICE; never assume REAL without balances list
+    return (None, None, None)
 
 
 def _peek_balance_mode_nonblocking(client: Any, target_mode: str = 'AUTO') -> Tuple[str, bool]:
-    """Read current IQ Option active balance mode strictly from in-memory state (never triggers WS I/O or waits)."""
+    """Read current IQ Option active balance mode strictly from in-memory verified state (never triggers WS I/O)."""
     if client is None:
         return ('UNVERIFIED', False)
 
     api = getattr(client, 'api', None)
     if api is not None:
-        profile_msg = getattr(getattr(api, 'profile', None), 'msg', None)
-        mode, _bal_id, _curr = _extract_mode_from_profile(profile_msg)
-        if mode in ('PRACTICE', 'REAL'):
-            matches = True if target_mode == 'AUTO' else (mode == target_mode)
-            return (mode, matches)
-        matches = _mode_verified and (target_mode == 'AUTO' or _confirmed_mode == target_mode)
-        return (_confirmed_mode, bool(matches))
+        # 1. Live user-settings / user-settings-changed balanceId captured on WebSocket
+        settings_bal_id = getattr(api, '_nt_user_settings_balance_id', None)
+        if settings_bal_id is not None:
+            bal_list = _get_balances_list(client, refresh=False)
+            mode, _bid, _curr = _resolve_mode_from_balances(bal_list, settings_bal_id)
+            if mode in ('PRACTICE', 'REAL'):
+                matches = True if target_mode == 'AUTO' else (mode == target_mode)
+                return (mode, matches)
+        # 2. Previously verified session mode (never assume REAL from raw legacy profile!)
+        if _mode_verified and _confirmed_mode in ('PRACTICE', 'REAL'):
+            matches = True if target_mode == 'AUTO' else (_confirmed_mode == target_mode)
+            return (_confirmed_mode, bool(matches))
+        return ('UNVERIFIED', False)
 
     # Non-iqoptionapi mock client in unit tests
     if hasattr(client, 'get_balance_mode'):
@@ -1585,7 +1885,9 @@ def _peek_balance_mode_nonblocking(client: Any, target_mode: str = 'AUTO') -> Tu
                     return (confirmed, matches)
         except Exception:
             return ('UNVERIFIED', False)
-    return (_confirmed_mode, bool(_mode_verified and (target_mode == 'AUTO' or _confirmed_mode == target_mode)))
+    if _mode_verified and _confirmed_mode in ('PRACTICE', 'REAL'):
+        return (_confirmed_mode, bool(target_mode == 'AUTO' or _confirmed_mode == target_mode))
+    return ('UNVERIFIED', False)
 
 
 def _detect_balance_mode(
@@ -1594,9 +1896,9 @@ def _detect_balance_mode(
     refresh: bool = False,
 ) -> Tuple[str, bool]:
     """Detect whichever account mode (PRACTICE or REAL) is currently active inside IQ Option.
-    NEVER calls client.change_balance() and NEVER silently overrides the user's selected mode.
+    NEVER calls client.change_balance(), NEVER silently switches modes, and NEVER assumes REAL when uncertain.
     """
-    global _confirmed_mode, _mode_verified, _active_balance_id, _active_currency
+    global _confirmed_mode, _mode_verified, _active_balance_id, _active_currency, _mode_detection_diag, _last_error
     timeout = _MODE_TIMEOUT if timeout_seconds is None else timeout_seconds
 
     if client is None:
@@ -1604,42 +1906,121 @@ def _detect_balance_mode(
 
     api = getattr(client, 'api', None)
 
-    # Optionally refresh live profile from IQ Option without wiping prior valid profile on timeout
-    if refresh and api is not None and hasattr(api, 'get_profile') and hasattr(api, 'profile'):
-        prev_msg = getattr(api.profile, 'msg', None)
-        try:
-            api.profile.msg = None
-            _run_with_timeout(api.get_profile, min(timeout, 3.0), 'get_profile')
-            deadline = time.monotonic() + min(timeout, 3.0)
-            while getattr(api.profile, 'msg', None) is None and time.monotonic() < deadline:
-                if not _is_client_alive(client):
-                    break
-                time.sleep(0.03)
-            if getattr(api.profile, 'msg', None) is None and prev_msg is not None:
-                api.profile.msg = prev_msg
-        except Exception:
-            if getattr(api.profile, 'msg', None) is None and prev_msg is not None:
-                api.profile.msg = prev_msg
-
-    # 1. Inspect live profile payload first (authoritative IQ Option active balance_id / balance_type)
     if api is not None:
+        bal_list = _get_balances_list(client, refresh=refresh, timeout_seconds=min(timeout, 2.5))
         profile_msg = getattr(getattr(api, 'profile', None), 'msg', None)
-        prof_mode, prof_bal_id, prof_curr = _extract_mode_from_profile(profile_msg)
-        if prof_bal_id is not None:
-            _active_balance_id = prof_bal_id
-            try:
-                import iqoptionapi.global_value as global_value
-                global_value.balance_id = prof_bal_id
-            except Exception:
-                pass
-        if prof_curr:
-            _active_currency = prof_curr
+        available_modes: List[str] = []
+        if any(b.get('type') == 1 for b in bal_list):
+            available_modes.append('REAL')
+        if any(b.get('type') == 4 for b in bal_list):
+            available_modes.append('PRACTICE')
+
+        legacy_profile_mode: Optional[str] = None
+        if isinstance(profile_msg, dict):
+            if profile_msg.get('balance_type') == 1:
+                legacy_profile_mode = 'REAL'
+            elif profile_msg.get('balance_type') == 4:
+                legacy_profile_mode = 'PRACTICE'
+
+        # 1. Authoritative: IQ Option traderoom_gl_common user-settings (live push or fresh WS query)
+        settings_bal_id = getattr(api, '_nt_user_settings_balance_id', None)
+        settings_source = getattr(api, '_nt_user_settings_source', None)
+        settings_age = time.time() - float(getattr(api, '_nt_user_settings_at', 0.0) or 0.0)
+        us_diag: dict = {
+            'queried': False,
+            'attempts': 0,
+            'responseName': None,
+            'foundBalanceId': settings_bal_id is not None,
+        }
+
+        should_query_settings = refresh or settings_bal_id is None or settings_age > 30.0
+        if should_query_settings:
+            q_bal_id, q_src, q_diag = _query_user_settings_balance_id(client, timeout_seconds=min(timeout, 3.0))
+            us_diag = q_diag
+            if q_bal_id is not None:
+                settings_bal_id = q_bal_id
+                settings_source = q_src or 'user_settings'
+
+        if settings_bal_id is not None:
+            us_mode, us_bid, us_curr = _resolve_mode_from_balances(bal_list, settings_bal_id)
+            if us_mode in ('PRACTICE', 'REAL'):
+                prev_mode = _confirmed_mode
+                _active_balance_id = us_bid
+                _sync_local_balance_id(client, us_bid)
+                if us_curr:
+                    _active_currency = us_curr
+                _confirmed_mode = us_mode
+                _mode_verified = True
+                if prev_mode != us_mode:
+                    _invalidate_balance_cache()
+                _mode_detection_diag = {
+                    'source': settings_source or 'user_settings',
+                    'verified': True,
+                    'userSettingsQueried': us_diag.get('queried', False),
+                    'userSettingsResponseName': us_diag.get('responseName'),
+                    'userSettingsMode': us_mode,
+                    'profileLegacyMode': legacy_profile_mode,
+                    'availableModes': available_modes,
+                    'lastCheckedAt': time.time(),
+                }
+                return (us_mode, True)
+
+        # 2. Unambiguous profile / balances signals (explicit active flag, single-wallet, or explicit PRACTICE)
+        #    NEVER assumes REAL on dual-wallet accounts from legacy profile_msg['balance_type'] == 1!
+        merged_profile = dict(profile_msg) if isinstance(profile_msg, dict) else {}
+        if bal_list and 'balances' not in merged_profile:
+            merged_profile['balances'] = bal_list
+        elif bal_list:
+            merged_profile['balances'] = bal_list
+        prof_mode, prof_bal_id, prof_curr = _extract_mode_from_profile(merged_profile)
         if prof_mode in ('PRACTICE', 'REAL'):
+            prev_mode = _confirmed_mode
+            if prof_bal_id is not None:
+                _active_balance_id = prof_bal_id
+                _sync_local_balance_id(client, prof_bal_id)
+            if prof_curr:
+                _active_currency = prof_curr
             _confirmed_mode = prof_mode
             _mode_verified = True
+            if prev_mode != prof_mode:
+                _invalidate_balance_cache()
+            _mode_detection_diag = {
+                'source': 'single_wallet_or_explicit_profile',
+                'verified': True,
+                'userSettingsQueried': us_diag.get('queried', False),
+                'userSettingsResponseName': us_diag.get('responseName'),
+                'userSettingsMode': None,
+                'profileLegacyMode': legacy_profile_mode,
+                'availableModes': available_modes,
+                'lastCheckedAt': time.time(),
+            }
             return (prof_mode, True)
 
-    # 2. Fall back to client.get_balance_mode() (read-only query, never mutates mode)
+        # 3. Uncertain / ambiguous dual-wallet account: NEVER assume REAL, mark UNVERIFIED & block live orders!
+        _confirmed_mode = 'UNVERIFIED'
+        _mode_verified = False
+        _active_balance_id = None
+        # Ensure local global_value.balance_id is NOT left pointing at a REAL wallet while unverified
+        practice_entries = [b for b in bal_list if b.get('type') == 4 and b.get('id') is not None]
+        if practice_entries:
+            _sync_local_balance_id(client, practice_entries[0]['id'])
+        _mode_detection_diag = {
+            'source': 'unverified_ambiguous_profile',
+            'verified': False,
+            'userSettingsQueried': us_diag.get('queried', False),
+            'userSettingsResponseName': us_diag.get('responseName'),
+            'userSettingsMode': None,
+            'profileLegacyMode': legacy_profile_mode,
+            'availableModes': available_modes,
+            'lastCheckedAt': time.time(),
+        }
+        _last_error = (
+            'IQ Option active account mode could not be verified (broker user-settings did not confirm '
+            'active balanceId on dual-wallet REAL/PRACTICE account); live orders are blocked.'
+        )
+        return ('UNVERIFIED', False)
+
+    # Non-iqoptionapi mock/test client without `.api`: read-only query via client.get_balance_mode()
     if hasattr(client, 'get_balance_mode'):
         try:
             raw_cur = _run_with_timeout(client.get_balance_mode, timeout, 'get_balance_mode')
@@ -1648,15 +2029,26 @@ def _detect_balance_mode(
                 if normalized in ('PRACTICE', 'REAL'):
                     _confirmed_mode = normalized
                     _mode_verified = True
+                    _mode_detection_diag = {
+                        'source': 'client_get_balance_mode',
+                        'verified': True,
+                        'userSettingsQueried': False,
+                        'userSettingsResponseName': None,
+                        'userSettingsMode': normalized,
+                        'profileLegacyMode': None,
+                        'availableModes': [normalized],
+                        'lastCheckedAt': time.time(),
+                    }
                     return (normalized, True)
         except Exception:
-            # Transient read timeout on an alive client must not corrupt previously verified mode
             if _is_client_alive(client) and _mode_verified and _confirmed_mode in ('PRACTICE', 'REAL'):
                 return (_confirmed_mode, False if refresh else True)
+            _confirmed_mode = 'UNVERIFIED'
+            _mode_verified = False
             return ('UNVERIFIED', False)
 
-    if _mode_verified and _confirmed_mode in ('PRACTICE', 'REAL'):
-        return (_confirmed_mode, True)
+    _confirmed_mode = 'UNVERIFIED'
+    _mode_verified = False
     return ('UNVERIFIED', False)
 
 
@@ -1936,6 +2328,11 @@ def _fetch_balance_safe(
     Returns (balance_float, currency_code).
     """
     global _last_error, _last_balance_cache, _active_currency
+    if active_mode not in ('PRACTICE', 'REAL'):
+        raise HTTPException(
+            409,
+            f'Cannot fetch IQ Option account balance while active mode is {active_mode}.',
+        )
     timeout = _BALANCE_TIMEOUT if timeout_seconds is None else timeout_seconds
 
     if allow_cache and _BALANCE_CACHE_TTL_SECONDS > 0:
@@ -2433,7 +2830,7 @@ async def health(
 
     return {
         'status': 'running',
-        'version': getattr(app, 'version', '0.5.0'),
+        'version': getattr(app, 'version', '0.5.1'),
         'serviceAvailable': True,
         'busy': busy,
         'connectInFlight': connect_in_flight,
@@ -2449,6 +2846,7 @@ async def health(
         'accountType': confirmed_mode if connected else None,
         'modeVerified': mode_verified if connected else False,
         'modeFollowsBroker': True,
+        'modeDetection': _mode_detection_diag if connected else None,
         'activeWsUrl': _active_ws_url if connected else None,
         'activeWsViaProxy': _active_ws_via_proxy if connected else False,
         'proxyConfigured': proxy_configured,
@@ -2508,7 +2906,7 @@ async def network_check(
 
     return {
         'status': 'ok',
-        'version': getattr(app, 'version', '0.5.0'),
+        'version': getattr(app, 'version', '0.5.1'),
         'serviceAvailable': True,
         'timeoutSeconds': _WS_CONNECT_TIMEOUT,
         'activeWsUrl': _active_ws_url,
@@ -2541,6 +2939,7 @@ async def network_check(
             'mode': _confirmed_mode if alive_now else None,
             'modeVerified': bool(_mode_verified) if alive_now else False,
             'modeFollowsBroker': True,
+            'modeDetection': _mode_detection_diag if alive_now else None,
             'candleRetrievalReady': bool(alive_now and _mode_verified),
             'lastCandleCheck': _last_candle_check,
             'lastError': _last_error,
@@ -2571,22 +2970,26 @@ def connect_route(
     with _bounded_lock(op_name='connect_verify'):
         is_connected = _is_client_alive(client)
         confirmed_mode, mode_verified = _detect_balance_mode(client, refresh=True)
+        reported_mode = confirmed_mode if (is_connected and mode_verified) else ('UNVERIFIED' if is_connected else None)
         return {
+            'authenticated': is_connected,
             'connected': is_connected and mode_verified,
-            'mode': confirmed_mode if mode_verified else None,
-            'activeMode': confirmed_mode if mode_verified else None,
+            'mode': reported_mode,
+            'activeMode': reported_mode,
             'requestedMode': _resolve_target_mode(
                 explicit_mode=body.mode if body else None,
                 x_iq_mode=x_iq_mode,
                 query_mode=mode,
             ),
-            'accountType': confirmed_mode if mode_verified else None,
-            'modeVerified': mode_verified,
+            'accountType': reported_mode,
+            'modeVerified': mode_verified if is_connected else False,
             'modeFollowsBroker': True,
+            'modeDetection': _mode_detection_diag if is_connected else None,
             'orderExecutionSupported': True,
             'positionsSupported': True,
             'closePositionSupported': True,
             'realTradingEnabled': bool(is_connected and mode_verified and confirmed_mode == 'REAL'),
+            'detail': None if (is_connected and mode_verified) else _last_error,
             'connectedAt': _connected_at,
         }
 
@@ -2786,6 +3189,28 @@ def place_order(
     with _bounded_lock(op_name='place_order'):
         # Mandatory fresh live mode verification before every single order (never silently calls change_balance)
         confirmed_mode, mode_verified = _require_verified_mode(client, expected_mode, refresh=True)
+
+        # Strict pre-buy wallet-mode cross-check: guarantee iqoptionapi's bound balance_id matches confirmed_mode
+        if getattr(client, 'api', None) is not None:
+            bal_list = _get_balances_list(client, refresh=False)
+            bound_id = _active_balance_id
+            try:
+                import iqoptionapi.global_value as global_value
+                gv_id = _coerce_balance_id(getattr(global_value, 'balance_id', None))
+            except Exception:
+                gv_id = bound_id
+            if bound_id is None or gv_id is None or str(gv_id) != str(bound_id):
+                raise HTTPException(
+                    409,
+                    'IQ Option active balance_id is unverified or mismatched with detected account mode; order blocked.',
+                )
+            resolved_mode, _rbid, _rcurr = _resolve_mode_from_balances(bal_list, bound_id)
+            if resolved_mode != confirmed_mode:
+                raise HTTPException(
+                    409,
+                    f'IQ Option wallet verification mismatch (bound wallet resolves to {resolved_mode}, expected {confirmed_mode}); order blocked.',
+                )
+
         action = 'call' if req.direction == 'CALL' else 'put'
         duration_min = max(1, int(round(req.expirySeconds / 60.0)))
         clean_symbol = req.symbol
@@ -3122,10 +3547,12 @@ def history(
 @app.post('/disconnect')
 def disconnect(x_connector_token: Optional[str] = Header(default=None)):
     _check_auth(x_connector_token)
-    global _requested_mode, _confirmed_mode
+    global _requested_mode, _confirmed_mode, _mode_verified, _mode_detection_diag
     with _bounded_lock(op_name='disconnect'):
         _invalidate_client(cancel_inflight=True)
         _requested_mode = 'AUTO'
-        _confirmed_mode = 'PRACTICE'
+        _confirmed_mode = 'UNVERIFIED'
+        _mode_verified = False
+        _mode_detection_diag = None
     return {'connected': False}
 

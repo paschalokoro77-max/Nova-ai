@@ -11,7 +11,9 @@ import type { Candle } from '../marketData.ts';
 
 interface MockConnectorState {
   connected: boolean;
-  mode: 'PRACTICE' | 'REAL';
+  authenticated?: boolean;
+  modeVerified?: boolean;
+  mode: 'PRACTICE' | 'REAL' | 'UNVERIFIED';
   practiceBalance: number;
   realBalance: number;
   accountTransientTimeoutCount: number;
@@ -63,24 +65,28 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
         const currentBalance = state.mode === 'REAL' ? state.realBalance : state.practiceBalance;
 
         if (req.method === 'GET' && pathname === '/health') {
+          const isAuth = state.authenticated ?? state.connected;
+          const isVerified = state.modeVerified ?? (state.connected && (state.mode === 'PRACTICE' || state.mode === 'REAL'));
+          const isVerifiedConn = Boolean(isAuth && isVerified && (state.mode === 'PRACTICE' || state.mode === 'REAL'));
           return send(200, {
             status: 'running',
-            version: '0.5.0',
+            version: '0.5.1',
             serviceAvailable: true,
             busy: false,
             connectInFlight: false,
-            authenticated: state.connected,
-            connected: state.connected,
-            mode: state.connected ? state.mode : null,
-            activeMode: state.connected ? state.mode : null,
-            accountType: state.connected ? state.mode : null,
-            modeVerified: state.connected,
+            authenticated: isAuth,
+            connected: isVerifiedConn,
+            mode: isAuth ? state.mode : null,
+            activeMode: isAuth ? state.mode : null,
+            accountType: isAuth ? state.mode : null,
+            modeVerified: isAuth ? isVerified : false,
             modeFollowsBroker: true,
             orderExecutionSupported: true,
             positionsSupported: true,
             closePositionSupported: true,
-            realTradingEnabled: state.connected && state.mode === 'REAL',
+            realTradingEnabled: isVerifiedConn && state.mode === 'REAL',
             credentialsConfigured: true,
+            lastError: isAuth && !isVerified ? 'IQ Option active account mode could not be verified (UNVERIFIED); live orders are blocked.' : null,
           });
         }
 
@@ -89,24 +95,29 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
           if (body.password === 'wrong-password') {
             return send(401, { detail: 'IQ Option authentication failed: invalid credentials.' });
           }
-          state.connected = true;
+          const isVerified = state.modeVerified ?? (state.mode === 'PRACTICE' || state.mode === 'REAL');
+          state.authenticated = true;
+          state.connected = Boolean(isVerified && (state.mode === 'PRACTICE' || state.mode === 'REAL'));
           return send(200, {
-            connected: true,
+            authenticated: true,
+            connected: state.connected,
             mode: state.mode,
             activeMode: state.mode,
             accountType: state.mode,
-            modeVerified: true,
+            modeVerified: isVerified,
             modeFollowsBroker: true,
             orderExecutionSupported: true,
             positionsSupported: true,
             closePositionSupported: true,
-            realTradingEnabled: state.mode === 'REAL',
+            realTradingEnabled: state.connected && state.mode === 'REAL',
+            detail: state.connected ? null : 'IQ Option active account mode could not be verified (UNVERIFIED); live orders are blocked.',
           });
         }
 
         if (req.method === 'POST' && pathname === '/disconnect') {
           state.disconnectCalls += 1;
           state.connected = false;
+          state.authenticated = false;
           return send(200, { disconnected: true });
         }
 
@@ -114,6 +125,10 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
           if (state.accountTransientTimeoutCount > 0) {
             state.accountTransientTimeoutCount -= 1;
             return send(504, { detail: 'IQ Option upstream timed out retrieving balance.' });
+          }
+          const isVerified = state.modeVerified ?? (state.mode === 'PRACTICE' || state.mode === 'REAL');
+          if (!isVerified || state.mode === 'UNVERIFIED') {
+            return send(409, { detail: 'IQ Option connector could not verify active account mode (reported UNVERIFIED).' });
           }
           if (!state.connected) {
             return send(401, { detail: 'Not connected' });
@@ -183,10 +198,17 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
         }
 
         if (req.method === 'POST' && pathname === '/order') {
-          const expectedMode = body.expectedMode ? String(body.expectedMode).toUpperCase() : null;
-          if (expectedMode && expectedMode !== state.mode) {
+          const isVerified = state.modeVerified ?? (state.mode === 'PRACTICE' || state.mode === 'REAL');
+          if (!isVerified || state.mode === 'UNVERIFIED') {
             return send(409, {
-              detail: `IQ Option active account mode mismatch: expected ${expectedMode}, live is ${state.mode}.`,
+              detail: 'IQ Option active account mode is UNVERIFIED; live orders are blocked.',
+            });
+          }
+          const verifiedMode: 'PRACTICE' | 'REAL' = state.mode;
+          const expectedMode = body.expectedMode ? String(body.expectedMode).toUpperCase() : null;
+          if (expectedMode && expectedMode !== verifiedMode) {
+            return send(409, {
+              detail: `IQ Option active account mode mismatch: expected ${expectedMode}, live is ${verifiedMode}.`,
             });
           }
           const oid = String(state.nextOrderId++);
@@ -194,8 +216,8 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
           const direction = String(body.direction || 'CALL').toUpperCase();
           const amount = Number(body.amount || 10);
           const expirySeconds = Number(body.expirySeconds || 180);
-          state.orderCalls.push({ ...body, verifiedMode: state.mode, brokerOrderId: oid });
-          if (state.mode === 'REAL') {
+          state.orderCalls.push({ ...body, verifiedMode, brokerOrderId: oid });
+          if (verifiedMode === 'REAL') {
             state.realBalance = Number((state.realBalance - amount).toFixed(2));
           } else {
             state.practiceBalance = Number((state.practiceBalance - amount).toFixed(2));
@@ -211,7 +233,7 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
             openedAt: new Date().toISOString(),
             expiresAt: new Date(Date.now() + expirySeconds * 1000).toISOString(),
             instrumentType: 'binary',
-            mode: state.mode,
+            mode: verifiedMode,
             canClose: true,
           });
           return send(200, {
@@ -223,13 +245,13 @@ function startMockIqConnector(state: MockConnectorState): Promise<{ url: string;
             amount,
             expirySeconds,
             instrumentType: 'binary',
-            mode: state.mode,
-            accountType: state.mode,
+            mode: verifiedMode,
+            accountType: verifiedMode,
             modeVerified: true,
             filledPrice: 1.0865,
             filledUnits: amount,
             rawStatus: 'OPEN',
-            message: `Opened ${direction} ${symbol} on IQ Option (${state.mode}).`,
+            message: `Opened ${direction} ${symbol} on IQ Option (${verifiedMode}).`,
             submittedAt: new Date().toISOString(),
           });
         }
@@ -706,6 +728,127 @@ test('End-to-end IQ Option workflow: auth, dedup, stale protection, market data,
     assert.equal(lastRealCall.expectedMode, 'REAL');
     assert.equal(lastRealCall.verifiedMode, 'REAL');
     assert.equal(state.modeSwitchCalls, 0);
+  } finally {
+    if (prevUrl === undefined) delete process.env.IQ_CONNECTOR_URL;
+    else process.env.IQ_CONNECTOR_URL = prevUrl;
+    if (prevToken === undefined) delete process.env.IQ_CONNECTOR_TOKEN;
+    else process.env.IQ_CONNECTOR_TOKEN = prevToken;
+    await mockServer.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('IQ Option mode verification: distinguishes PRACTICE vs REAL, clears stale REAL, and blocks orders when UNVERIFIED', async () => {
+  const state: MockConnectorState = {
+    connected: false,
+    authenticated: false,
+    modeVerified: true,
+    mode: 'PRACTICE',
+    practiceBalance: 9500.0,
+    realBalance: 120.0,
+    accountTransientTimeoutCount: 0,
+    connectCalls: 0,
+    disconnectCalls: 0,
+    modeSwitchCalls: 0,
+    orderCalls: [],
+    openPositions: [],
+    closedHistory: [],
+    nextOrderId: 9501,
+  };
+
+  const mockServer = await startMockIqConnector(state);
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'novatrade-iq-mode-test-'));
+  const prevUrl = process.env.IQ_CONNECTOR_URL;
+  const prevToken = process.env.IQ_CONNECTOR_TOKEN;
+  process.env.IQ_CONNECTOR_URL = mockServer.url;
+  process.env.IQ_CONNECTOR_TOKEN = 'test-token-mode';
+
+  try {
+    const registry = new BrokerRegistry();
+    const manager = new BrokerConnectionManager(registry, path.join(tmpDir, 'state.json'));
+    const userId = 'user-mode-verify';
+
+    // Even if account record initially had environment='real', connecting to a PRACTICE IQ Option session must sync PRACTICE/demo
+    const acct = await manager.createOrUpdateAccount(userId, {
+      brokerId: 'iq_option',
+      label: 'IQ Option (mode-test@example.com)',
+      environment: 'real',
+      credentials: { email: 'mode-test@example.com', apiSecret: 'valid-secret' },
+    });
+
+    const connectedPractice = await manager.connectAccount(userId, acct.id);
+    assert.equal(connectedPractice.connected, true);
+    assert.equal(connectedPractice.accountType, 'PRACTICE');
+    assert.equal(connectedPractice.environment, 'demo');
+    assert.equal(connectedPractice.balance, 9500.0);
+
+    // Switching to REAL inside IQ Option updates accountType='REAL' and environment='real'
+    state.mode = 'REAL';
+    const syncedReal = await manager.checkHealthAndSyncBalance(userId, acct.id);
+    assert.equal(syncedReal.connected, true);
+    assert.equal(syncedReal.accountType, 'REAL');
+    assert.equal(syncedReal.environment, 'real');
+    assert.equal(syncedReal.balance, 120.0);
+
+    // Switching back to PRACTICE inside IQ Option clears stale environment='real' back to 'demo'
+    state.mode = 'PRACTICE';
+    const syncedPracticeAgain = await manager.checkHealthAndSyncBalance(userId, acct.id);
+    assert.equal(syncedPracticeAgain.connected, true);
+    assert.equal(syncedPracticeAgain.accountType, 'PRACTICE');
+    assert.equal(syncedPracticeAgain.environment, 'demo');
+    assert.equal(syncedPracticeAgain.balance, 9500.0);
+
+    // If connector reports UNVERIFIED (authenticated but modeVerified=false), NEVER assume REAL and strictly block live orders
+    state.mode = 'UNVERIFIED';
+    state.authenticated = true;
+    state.modeVerified = false;
+    state.connected = false;
+
+    const syncedUnverified = await manager.checkHealthAndSyncBalance(userId, acct.id);
+    assert.equal(syncedUnverified.connected, false);
+    assert.equal(syncedUnverified.accountType, 'UNVERIFIED');
+    assert.equal(syncedUnverified.environment, 'demo');
+    assert.equal(syncedUnverified.balance, null);
+
+    const adapter = registry.get('iq_option');
+    assert.ok(adapter);
+    const rawStatus = await adapter.getStatus();
+    assert.equal(rawStatus.connected, false);
+    assert.equal(rawStatus.executionEnabled, false);
+    assert.equal(rawStatus.accountType, 'UNVERIFIED');
+    assert.equal(rawStatus.environment, 'demo');
+
+    const validationUnverified = await manager.validateDemoOrder(userId, {
+      accountId: acct.id,
+      symbol: 'EURUSD',
+      assetClass: 'FOREX',
+      direction: 'CALL',
+      orderType: 'BINARY_FIXED_EXPIRY',
+      amount: 10,
+      entryPrice: 1.0865,
+      expirySeconds: 60,
+      globalEmergencyStop: false,
+    });
+    assert.equal(validationUnverified.valid, false);
+
+    await assert.rejects(
+      () =>
+        manager.executeDemoOrder(userId, {
+          accountId: acct.id,
+          symbol: 'EURUSD',
+          assetClass: 'FOREX',
+          direction: 'CALL',
+          orderType: 'BINARY_FIXED_EXPIRY',
+          amount: 10,
+          entryPrice: 1.0865,
+          expirySeconds: 60,
+          idempotencyKey: 'blocked-unverified-order-1',
+          source: 'manual',
+          globalEmergencyStop: false,
+        }),
+      /not connected|UNVERIFIED/i
+    );
+    assert.equal(state.orderCalls.length, 0, 'Zero orders may reach /order while account mode is UNVERIFIED');
   } finally {
     if (prevUrl === undefined) delete process.env.IQ_CONNECTOR_URL;
     else process.env.IQ_CONNECTOR_URL = prevUrl;

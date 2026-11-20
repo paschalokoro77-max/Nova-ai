@@ -1126,7 +1126,16 @@ export class BrokerConnectionManager {
       };
     }
 
-    if (rawAccountType && acct.environment === 'demo' && rawAccountType !== 'PRACTICE' && rawAccountType !== 'DEMO') {
+    if (rawAccountType !== 'PRACTICE' && rawAccountType !== 'REAL') {
+      return {
+        verified: false,
+        mode: 'UNKNOWN',
+        source: 'UNVERIFIED',
+        brokerAccountId: null,
+        reason: `IQ Option active account mode is ${rawAccountType || 'UNVERIFIED'}; live orders are blocked until mode is verified directly from IQ Option.`,
+      };
+    }
+    if (acct.environment === 'demo' && rawAccountType !== 'PRACTICE') {
       return {
         verified: false,
         mode: 'UNKNOWN',
@@ -1135,7 +1144,7 @@ export class BrokerConnectionManager {
         reason: `IQ Option session mode conflict: configured environment is DEMO but connector reported ${rawAccountType}.`,
       };
     }
-    if (rawAccountType && acct.environment === 'real' && rawAccountType !== 'REAL') {
+    if (acct.environment === 'real' && rawAccountType !== 'REAL') {
       return {
         verified: false,
         mode: 'UNKNOWN',
@@ -1146,7 +1155,7 @@ export class BrokerConnectionManager {
     }
     return {
       verified: true,
-      mode: acct.environment === 'real' ? 'REAL' : 'PRACTICE',
+      mode: rawAccountType === 'REAL' ? 'REAL' : 'PRACTICE',
       source: 'IQ_CONNECTOR',
       brokerAccountId: acct.id,
     };
@@ -1202,6 +1211,12 @@ export class BrokerConnectionManager {
     const acct = store.accounts.find((a) => a.id === store.activeAccountId);
     if (!acct || !acct.connected) {
       throw new Error('Active execution account must be a connected broker account.');
+    }
+    if (acct.brokerId === 'iq_option') {
+      const iqType = (acct.accountType || '').trim().toUpperCase();
+      if (iqType !== 'PRACTICE' && iqType !== 'REAL') {
+        throw new Error('IQ Option active account mode is UNVERIFIED; automatic execution is blocked until mode is verified.');
+      }
     }
     const adapter = this.registry.get(acct.brokerId);
     const caps = adapter ? await adapter.getCapabilities(this.toContext(acct)) : null;
@@ -1272,25 +1287,38 @@ export class BrokerConnectionManager {
       const res = await adapter.connect(ctx);
       const validBalance = toFiniteBalance(res.balance);
       const validEquity = toFiniteBalance(res.equity) ?? validBalance;
-      acct.connected = res.connected;
-      acct.status = res.connected ? 'CONNECTED' : 'AUTHENTICATION FAILED';
-      acct.accountType = res.accountType;
-      if (acct.brokerId === 'iq_option' && res.connected && res.accountType) {
-        acct.environment = res.accountType.toUpperCase() === 'REAL' ? 'real' : 'demo';
+      const iqNormalizedType = (res.accountType || '').trim().toUpperCase();
+      const iqVerified =
+        acct.brokerId !== 'iq_option' || (res.connected && (iqNormalizedType === 'REAL' || iqNormalizedType === 'PRACTICE'));
+      const effectiveConnected = Boolean(res.connected && iqVerified);
+
+      acct.connected = effectiveConnected;
+      acct.status = effectiveConnected ? 'CONNECTED' : 'AUTHENTICATION FAILED';
+      if (acct.brokerId === 'iq_option') {
+        acct.accountType = effectiveConnected
+          ? iqNormalizedType
+          : iqNormalizedType === 'UNVERIFIED'
+            ? 'UNVERIFIED'
+            : null;
+        acct.environment = effectiveConnected && iqNormalizedType === 'REAL' ? 'real' : 'demo';
+      } else {
+        acct.accountType = res.accountType;
       }
-      acct.balance = res.connected ? (validBalance ?? acct.balance) : null;
-      acct.equity = res.connected ? (validEquity ?? acct.equity ?? acct.balance) : null;
+      acct.balance = effectiveConnected ? (validBalance ?? acct.balance) : null;
+      acct.equity = effectiveConnected ? (validEquity ?? acct.equity ?? acct.balance) : null;
       acct.currency = res.currency || acct.currency;
       acct.externalAccountId = res.externalAccountId ?? acct.externalAccountId;
-      acct.lastError = res.connected ? null : res.message;
+      acct.lastError = effectiveConnected
+        ? null
+        : res.message || 'IQ Option active account mode could not be verified (UNVERIFIED).';
       acct.lastCheckedAt = now;
-      acct.lastSyncedAt = res.connected ? now : acct.lastSyncedAt;
+      acct.lastSyncedAt = effectiveConnected ? now : acct.lastSyncedAt;
       acct.updatedAt = now;
       this.saveStore(userId, store, false);
       await this.persistStoreToSupabase(userId, store);
 
       let statusSnap: BrokerStatusSnapshot;
-      if (acct.brokerId === 'iq_option' && res.connected) {
+      if (acct.brokerId === 'iq_option' && effectiveConnected) {
         const caps = await adapter.getCapabilities(this.toContext(acct));
         statusSnap = {
           ...caps,
@@ -1329,12 +1357,15 @@ export class BrokerConnectionManager {
         publicAccount.isAuthoritative = acct.id === authIqId;
         publicAccount.isStaleDuplicate = acct.id !== authIqId && !acct.connected;
       }
-      if (!res.connected) {
-        throw new BrokerConnectionError(res.message || 'Broker authentication failed.', {
-          statusCode: 401,
-          connectionStatus: 'AUTHENTICATION FAILED',
-          account: publicAccount,
-        });
+      if (!effectiveConnected) {
+        throw new BrokerConnectionError(
+          res.message || 'Broker authentication or mode verification failed.',
+          {
+            statusCode: 401,
+            connectionStatus: 'AUTHENTICATION FAILED',
+            account: publicAccount,
+          }
+        );
       }
       return publicAccount;
     } catch (err) {
@@ -1425,6 +1456,10 @@ export class BrokerConnectionManager {
     acct.connected = false;
     acct.balance = null;
     acct.equity = null;
+    if (acct.brokerId === 'iq_option') {
+      acct.accountType = null;
+      acct.environment = 'demo';
+    }
     const hasBridge = this.hasEnvFallback(acct.brokerId) || Boolean((this.decryptCredentials(acct.encryptedCredentials).bridgeUrl || '').trim());
     acct.status = !hasBridge ? 'NOT CONFIGURED' : 'GATEWAY OFFLINE';
     acct.lastCheckedAt = new Date().toISOString();
@@ -1478,29 +1513,43 @@ export class BrokerConnectionManager {
       acct.lastError = `Temporary connector timeout (${snap.diagnostics?.lastConnectorError || 'delayed response'}); healthy session preserved.`;
       acct.updatedAt = now;
     } else {
-      acct.connected = snap.connected;
-      acct.status = snap.connected
-        ? 'CONNECTED'
-        : !snap.connectorConfigured
-          ? 'NOT CONFIGURED'
-          : !snap.diagnostics?.reachable
-            ? 'GATEWAY OFFLINE'
-            : snap.diagnostics?.lastConnectorError
-              ? 'AUTHENTICATION FAILED'
-              : 'GATEWAY ONLINE';
-      acct.accountType = snap.connected ? (snap.accountType ?? acct.accountType) : null;
-      if (acct.brokerId === 'iq_option' && snap.connected && acct.accountType) {
-        acct.environment = acct.accountType.toUpperCase() === 'REAL' ? 'real' : 'demo';
+      if (acct.brokerId === 'iq_option') {
+        const snapType = (snap.accountType || '').trim().toUpperCase();
+        const verifiedIq = snap.connected && (snapType === 'REAL' || snapType === 'PRACTICE');
+        acct.connected = verifiedIq;
+        acct.status = verifiedIq
+          ? 'CONNECTED'
+          : !snap.connectorConfigured
+            ? 'NOT CONFIGURED'
+            : !snap.diagnostics?.reachable
+              ? 'GATEWAY OFFLINE'
+              : snapType === 'UNVERIFIED' || snap.diagnostics?.lastConnectorError
+                ? 'AUTHENTICATION FAILED'
+                : 'GATEWAY ONLINE';
+        acct.accountType = verifiedIq ? snapType : snapType === 'UNVERIFIED' ? 'UNVERIFIED' : null;
+        acct.environment = verifiedIq && snapType === 'REAL' ? 'real' : 'demo';
+      } else {
+        acct.connected = snap.connected;
+        acct.status = snap.connected
+          ? 'CONNECTED'
+          : !snap.connectorConfigured
+            ? 'NOT CONFIGURED'
+            : !snap.diagnostics?.reachable
+              ? 'GATEWAY OFFLINE'
+              : snap.diagnostics?.lastConnectorError
+                ? 'AUTHENTICATION FAILED'
+                : 'GATEWAY ONLINE';
+        acct.accountType = snap.connected ? (snap.accountType ?? acct.accountType) : null;
       }
       const nextBalance = toFiniteBalance(snap.balance);
       const nextEquity = toFiniteBalance(snap.equity) ?? nextBalance;
       // Preserve last valid balance if connected session had a temporary balance-read timeout
-      acct.balance = snap.connected ? (nextBalance ?? acct.balance) : null;
-      acct.equity = snap.connected ? (nextEquity ?? acct.equity ?? acct.balance) : null;
+      acct.balance = acct.connected ? (nextBalance ?? acct.balance) : null;
+      acct.equity = acct.connected ? (nextEquity ?? acct.equity ?? acct.balance) : null;
       acct.currency = snap.currency ?? acct.currency;
       acct.lastCheckedAt = now;
-      if (snap.connected) acct.lastSyncedAt = now;
-      acct.lastError = snap.diagnostics?.lastConnectorError || (snap.connected ? null : snap.message);
+      if (acct.connected) acct.lastSyncedAt = now;
+      acct.lastError = snap.diagnostics?.lastConnectorError || (acct.connected ? null : snap.message);
       acct.updatedAt = now;
       if (!acct.connected && store.activeAccountId === acct.id) {
         store.autoExecuteBrokerDemo = false;
@@ -1665,6 +1714,12 @@ export class BrokerConnectionManager {
     if (!acct.connected) {
       return fail(`${acct.label} is not connected. Connect the ${acct.environment.toUpperCase()} session to run terminal validation.`, true);
     }
+    if (acct.brokerId === 'iq_option') {
+      const iqType = (acct.accountType || '').trim().toUpperCase();
+      if (iqType !== 'PRACTICE' && iqType !== 'REAL') {
+        return fail('IQ Option active account mode is UNVERIFIED; live orders are blocked until mode is verified directly from IQ Option.', true);
+      }
+    }
 
     if (adapter.validateOrder) {
       const orderReq: BrokerOrderRequest = {
@@ -1729,6 +1784,12 @@ export class BrokerConnectionManager {
     // 1. Validate account connection (execution destination strictly follows the user's selected account & environment)
     if (!acct.connected) {
       throw new Error(`${acct.label} is not connected. Connect the ${acct.environment.toUpperCase()} session first.`);
+    }
+    if (acct.brokerId === 'iq_option') {
+      const iqType = (acct.accountType || '').trim().toUpperCase();
+      if (iqType !== 'PRACTICE' && iqType !== 'REAL') {
+        throw new Error('IQ Option active account mode is UNVERIFIED; live orders are blocked until mode is verified directly from IQ Option.');
+      }
     }
 
     // 2. Duplicate-order protection via explicit idempotencyKey + short 8s (account, symbol, direction) window
