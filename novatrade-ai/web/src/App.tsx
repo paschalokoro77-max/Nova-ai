@@ -1505,13 +1505,20 @@ export default function App() {
     );
   }, [brokerAccounts]);
 
-  const iqAccountMode: 'PRACTICE' | 'REAL' | 'DISCONNECTED' = useMemo(() => {
+  const iqAccountMode: 'PRACTICE' | 'REAL' | 'UNVERIFIED' | 'DISCONNECTED' = useMemo(() => {
+    const acctType = (iqAccount?.accountType || '').trim().toUpperCase();
+    const statusType = (brokerStatus?.accountType || '').trim().toUpperCase();
+    if (acctType === 'UNVERIFIED' || statusType === 'UNVERIFIED') {
+      return 'UNVERIFIED';
+    }
     const isConnected = Boolean((iqAccount && iqAccount.connected) || brokerStatus?.connected);
     if (!isConnected) return 'DISCONNECTED';
-    const env = (iqAccount?.environment || brokerStatus?.environment || '').toLowerCase();
-    const type = (iqAccount?.accountType || brokerStatus?.accountType || '').toUpperCase();
-    if (env === 'real' || type === 'REAL') return 'REAL';
-    return 'PRACTICE';
+    const verifiedType =
+      (iqAccount?.connected && (acctType === 'PRACTICE' || acctType === 'REAL') ? acctType : '') ||
+      (brokerStatus?.connected && (statusType === 'PRACTICE' || statusType === 'REAL') ? statusType : '');
+    if (verifiedType === 'PRACTICE') return 'PRACTICE';
+    if (verifiedType === 'REAL') return 'REAL';
+    return 'UNVERIFIED';
   }, [iqAccount, brokerStatus]);
 
   const iqAccountModeLabel =
@@ -2183,7 +2190,9 @@ export default function App() {
                           ? 'bg-amber-100 dark:bg-amber-950/70 text-amber-800 dark:text-amber-300 border border-amber-300/50 dark:border-amber-800/50'
                           : iqAccountMode === 'PRACTICE'
                             ? 'bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300 border border-emerald-300/50 dark:border-emerald-800/50'
-                            : 'bg-slate-200/60 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
+                            : iqAccountMode === 'UNVERIFIED'
+                              ? 'bg-red-100 dark:bg-red-950/70 text-red-700 dark:text-red-300 border border-red-300/50 dark:border-red-800/50'
+                              : 'bg-slate-200/60 dark:bg-slate-800 text-slate-500 dark:text-slate-400'
                       }`}
                     >
                       {iqAccountModeLabel}
@@ -2838,16 +2847,20 @@ export default function App() {
                   </div>
 
                   {/* IQ Option Connection State Handling */}
-                  {!(brokerStatus?.connected || iqAccount?.connected) ? (
+                  {!(brokerStatus?.connected || iqAccount?.connected) || iqAccountMode === 'UNVERIFIED' ? (
                     <div className={`${CARD_SURFACE} p-6 text-center space-y-3`}>
                       <div className="mx-auto w-12 h-12 rounded-2xl bg-amber-50 dark:bg-amber-950/40 flex items-center justify-center text-amber-600 dark:text-amber-400">
                         <Cable className="h-6 w-6" />
                       </div>
                       <h3 className="text-base font-semibold text-slate-900 dark:text-white">
-                        IQ Option is Not Connected
+                        {iqAccountMode === 'UNVERIFIED'
+                          ? 'IQ Option Account Mode Unverified — Orders Blocked'
+                          : 'IQ Option is Not Connected'}
                       </h3>
                       <p className="text-xs text-slate-600 dark:text-slate-400 max-w-md mx-auto leading-relaxed">
-                        Connect the IQ Option connector in Broker Connections to synchronize your Practice or Real balance, inspect open assets, and monitor market feeds.
+                        {iqAccountMode === 'UNVERIFIED'
+                          ? 'NovaTrade could not confirm whether your IQ Option session is in PRACTICE or REAL mode. Live orders are strictly blocked until mode verification succeeds.'
+                          : 'Connect the IQ Option connector in Broker Connections to synchronize your Practice or Real balance, inspect open assets, and monitor market feeds.'}
                       </p>
                       <div className="pt-2">
                         <button

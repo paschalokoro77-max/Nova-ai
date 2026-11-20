@@ -2360,6 +2360,273 @@ class TestIqConnectorModes(unittest.TestCase):
         self.assertEqual(client.buy_calls[-1][3], 15, "15-minute trade must pass duration_min=15 to IQ Option")
         self.assertEqual(res_15m["amount"], 100.0, "Stake of exactly $100 must be supported")
 
+    def _make_dual_wallet_protocol_client(
+        self,
+        settings_balance_id=444004,
+        legacy_profile_balance_id=111001,
+        legacy_profile_balance_type=1,
+    ):
+        """Build a realistic iqoptionapi-shaped dual-wallet client (REAL=111001 type 1, PRACTICE=444004 type 4)."""
+        balances = [
+            {"id": 111001, "type": 1, "amount": 15.0, "currency": "USD"},
+            {"id": 444004, "type": 4, "amount": 9850.5, "currency": "USD"},
+        ]
+
+        class DualWalletApi:
+            def __init__(self):
+                self.profile = type(
+                    "Profile",
+                    (),
+                    {
+                        "msg": {
+                            "balance_id": legacy_profile_balance_id,
+                            "balance_type": legacy_profile_balance_type,
+                            "currency": "USD",
+                            "balances": list(balances),
+                        }
+                    },
+                )()
+                self.balances_raw = {"msg": list(balances)}
+                self.candles = type("Candles", (), {"candles_data": None})()
+                self.websocket_thread = type("T", (), {"is_alive": staticmethod(lambda: True)})()
+                self._nt_pending_req_ids = set()
+                self._nt_ws_responses = {}
+                self._nt_user_settings_balance_id = None
+                self._nt_user_settings_source = None
+                self._nt_user_settings_at = 0.0
+                self.ws_sent = []
+                self.settings_balance_id = settings_balance_id
+
+            def get_balances(self):
+                self.balances_raw = {"msg": list(balances)}
+
+            def getcandles(self, active_id, interval, count, end_ts):
+                self.candles.candles_data = [
+                    {"from": end_ts - 60, "open": 1.1, "max": 1.11, "min": 1.09, "close": 1.105, "volume": 10}
+                ]
+
+            def send_websocket_request(self, name, msg, request_id=""):
+                self.ws_sent.append((name, msg, request_id))
+                if isinstance(msg, dict) and msg.get("name") == "get-user-settings" and request_id:
+                    if self.settings_balance_id is not None:
+                        self._nt_ws_responses[request_id] = {
+                            "name": "user-settings",
+                            "request_id": request_id,
+                            "msg": {
+                                "result": {
+                                    "configs": [
+                                        {
+                                            "name": "traderoom_gl_common",
+                                            "version": 3,
+                                            "config": {"balanceId": self.settings_balance_id},
+                                        }
+                                    ]
+                                }
+                            },
+                        }
+                    else:
+                        self._nt_ws_responses[request_id] = {
+                            "name": "user-settings",
+                            "request_id": request_id,
+                            "msg": {"result": {"configs": []}},
+                        }
+
+        class DualWalletClient:
+            def __init__(self):
+                self.api = DualWalletApi()
+                self.change_balance_calls = []
+                self.buy_calls = []
+                self.alive = True
+
+            def check_connect(self):
+                return self.alive
+
+            def change_balance(self, mode):
+                self.change_balance_calls.append(mode)
+                raise AssertionError("NovaTrade must NEVER call change_balance() on IQ Option!")
+
+            def buy(self, amount, symbol, action, duration):
+                import iqoptionapi.global_value as gv
+                self.buy_calls.append((amount, symbol, action, duration, getattr(gv, "balance_id", None)))
+                return (True, 88001)
+
+        return DualWalletClient()
+
+    def test_dual_wallet_practice_detected_via_user_settings_despite_legacy_real_profile(self):
+        """Regression test for v0.5.0 bug: legacy profile has balance_type=1 (REAL) while IQ Option traderoom is in PRACTICE."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = 111001  # Simulate legacy REAL binding before mode verification
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            client = self._make_dual_wallet_protocol_client(settings_balance_id=444004)
+            app._client = client
+
+            confirmed, verified = app._detect_balance_mode(client, refresh=True)
+            self.assertEqual(confirmed, "PRACTICE")
+            self.assertTrue(verified)
+            self.assertEqual(m_gv.balance_id, 444004, "Local global_value.balance_id must bind to PRACTICE wallet 444004")
+            self.assertEqual(client.change_balance_calls, [])
+
+            h = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h["connected"])
+            self.assertEqual(h["mode"], "PRACTICE")
+            self.assertEqual(h["accountType"], "PRACTICE")
+            self.assertTrue(h["modeVerified"])
+            self.assertFalse(h["realTradingEnabled"])
+            self.assertEqual(h["modeDetection"]["source"], "user_settings")
+            self.assertEqual(h["modeDetection"]["userSettingsMode"], "PRACTICE")
+            self.assertEqual(h["modeDetection"]["profileLegacyMode"], "REAL")
+
+            acc = app.account(fresh=True, x_connector_token=None)
+            self.assertEqual(acc["mode"], "PRACTICE")
+            self.assertEqual(acc["balance"], 9850.5)
+            self.assertFalse(acc["realTradingEnabled"])
+
+            order_res = app.place_order(
+                app.OrderRequest(
+                    symbol="EURUSD",
+                    direction="CALL",
+                    amount=10.0,
+                    expirySeconds=60,
+                    expectedMode="PRACTICE",
+                    idempotencyKey="dual-wallet-practice-1",
+                ),
+                x_connector_token=None,
+            )
+            self.assertTrue(order_res["accepted"])
+            self.assertEqual(order_res["mode"], "PRACTICE")
+            self.assertEqual(client.buy_calls[-1][4], 444004)
+            self.assertEqual(client.change_balance_calls, [])
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_dual_wallet_real_detected_via_user_settings_and_live_switch_back_to_practice(self):
+        """Dual-wallet account detects REAL when traderoom_gl_common points to REAL wallet, and follows live switch to PRACTICE."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = None
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            client = self._make_dual_wallet_protocol_client(settings_balance_id=111001)
+            app._client = client
+
+            confirmed, verified = app._detect_balance_mode(client, refresh=True)
+            self.assertEqual(confirmed, "REAL")
+            self.assertTrue(verified)
+            self.assertEqual(m_gv.balance_id, 111001)
+
+            h_real = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h_real["connected"])
+            self.assertEqual(h_real["mode"], "REAL")
+            self.assertTrue(h_real["modeVerified"])
+            self.assertTrue(h_real["realTradingEnabled"])
+
+            acc_real = app.account(fresh=True, x_connector_token=None)
+            self.assertEqual(acc_real["mode"], "REAL")
+            self.assertEqual(acc_real["balance"], 15.0)
+            self.assertTrue(acc_real["realTradingEnabled"])
+
+            # User switches to PRACTICE inside IQ Option -> live user-settings-changed push updates immediately
+            client.api.settings_balance_id = 444004
+            client.api._nt_user_settings_balance_id = 444004
+            client.api._nt_user_settings_source = "user_settings_changed"
+            client.api._nt_user_settings_at = time.time()
+
+            h_prac = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h_prac["connected"])
+            self.assertEqual(h_prac["mode"], "PRACTICE")
+            self.assertFalse(h_prac["realTradingEnabled"])
+
+            acc_prac = app.account(fresh=True, x_connector_token=None)
+            self.assertEqual(acc_prac["mode"], "PRACTICE")
+            self.assertEqual(acc_prac["balance"], 9850.5)
+            self.assertEqual(m_gv.balance_id, 444004)
+            self.assertEqual(client.change_balance_calls, [])
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
+    def test_dual_wallet_ambiguous_profile_without_user_settings_returns_unverified_and_blocks_orders(self):
+        """When get-user-settings does not confirm balanceId on a dual-wallet account, NEVER assume REAL and block all orders."""
+        saved_modules = {k: sys.modules.get(k) for k in ("iqoptionapi", "iqoptionapi.global_value", "iqoptionapi.constants")}
+        m_iq = ModuleType("iqoptionapi")
+        m_gv = ModuleType("iqoptionapi.global_value")
+        m_gv.balance_id = 111001
+        m_gv.check_websocket_if_connect = 1
+        m_gv.ssl_Mutual_exclusion = False
+        m_gv.ssl_Mutual_exclusion_write = False
+        m_const = ModuleType("iqoptionapi.constants")
+        m_const.ACTIVES = {"EURUSD": 1}
+        sys.modules["iqoptionapi"] = m_iq
+        sys.modules["iqoptionapi.global_value"] = m_gv
+        sys.modules["iqoptionapi.constants"] = m_const
+
+        try:
+            client = self._make_dual_wallet_protocol_client(settings_balance_id=None)
+            app._client = client
+
+            confirmed, verified = app._detect_balance_mode(client, refresh=True)
+            self.assertEqual(confirmed, "UNVERIFIED")
+            self.assertFalse(verified)
+            # Must NEVER leave global_value.balance_id pointing at REAL wallet 111001 while unverified
+            self.assertNotEqual(m_gv.balance_id, 111001)
+
+            h = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+            self.assertTrue(h["authenticated"])
+            self.assertFalse(h["connected"])
+            self.assertEqual(h["mode"], "UNVERIFIED")
+            self.assertEqual(h["accountType"], "UNVERIFIED")
+            self.assertFalse(h["modeVerified"])
+            self.assertFalse(h["realTradingEnabled"])
+
+            # Live order MUST be blocked with HTTP 409 and zero buy() calls
+            with self.assertRaises(app.HTTPException) as ctx:
+                app.place_order(
+                    app.OrderRequest(
+                        symbol="EURUSD",
+                        direction="CALL",
+                        amount=10.0,
+                        expirySeconds=60,
+                        idempotencyKey="unverified-order-block-1",
+                    ),
+                    x_connector_token=None,
+                )
+            self.assertEqual(ctx.exception.status_code, 409)
+            self.assertEqual(client.buy_calls, [])
+            self.assertEqual(client.change_balance_calls, [])
+        finally:
+            for k, v in saved_modules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
 
 if __name__ == "__main__":
     unittest.main()

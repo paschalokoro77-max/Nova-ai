@@ -29,6 +29,16 @@ function toFiniteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+export type VerifiedIqAccountMode = 'PRACTICE' | 'REAL' | 'UNVERIFIED';
+
+export function parseVerifiedIqMode(rawMode: unknown, modeVerified?: boolean): VerifiedIqAccountMode {
+  if (modeVerified === false) return 'UNVERIFIED';
+  const normalized = String(rawMode || '').trim().toUpperCase();
+  if (normalized === 'PRACTICE') return 'PRACTICE';
+  if (normalized === 'REAL') return 'REAL';
+  return 'UNVERIFIED';
+}
+
 export interface ParsedIqConnectorConfig {
   configured: boolean;
   url: string | null;
@@ -401,9 +411,9 @@ export class IQOptionAdapter implements BrokerAdapter {
         authenticated?: boolean;
         busy?: boolean;
         connectInFlight?: boolean;
-        mode?: string;
-        activeMode?: string;
-        accountType?: string;
+        mode?: string | null;
+        activeMode?: string | null;
+        accountType?: string | null;
         modeVerified?: boolean;
         orderExecutionSupported?: boolean;
         credentialsConfigured?: boolean;
@@ -411,14 +421,27 @@ export class IQOptionAdapter implements BrokerAdapter {
       }>('/health', {}, ctx);
       const latencyMs = Date.now() - started;
 
-      let balance: number | null = null;
-      let accountType: string | null = health.connected
-        ? String(health.activeMode || health.accountType || health.mode || 'PRACTICE').toUpperCase()
-        : null;
-      let currency: string | null = null;
-      let accountSyncError: string | null = null;
+      const healthAuthenticated = Boolean(health.authenticated ?? health.connected);
+      const healthParsedMode = parseVerifiedIqMode(
+        health.activeMode || health.accountType || health.mode,
+        health.modeVerified
+      );
+      const isAuthenticatedUnverified =
+        healthAuthenticated && (health.modeVerified === false || healthParsedMode === 'UNVERIFIED');
 
-      if (health.connected && health.authenticated !== false && !health.connectInFlight) {
+      let balance: number | null = null;
+      let accountType: string | null = isAuthenticatedUnverified
+        ? 'UNVERIFIED'
+        : health.connected && healthParsedMode !== 'UNVERIFIED'
+          ? healthParsedMode
+          : null;
+      let currency: string | null = null;
+      let accountSyncError: string | null = isAuthenticatedUnverified
+        ? health.lastError || 'IQ Option active account mode is UNVERIFIED; live orders are blocked.'
+        : null;
+      let modeConfirmed = Boolean(health.connected) && healthAuthenticated && !isAuthenticatedUnverified;
+
+      if (modeConfirmed && !health.connectInFlight) {
         try {
           const acct = await this.requestConnector<{
             accountType?: string;
@@ -428,28 +451,41 @@ export class IQOptionAdapter implements BrokerAdapter {
             balance?: number;
             currency?: string;
           }>('/account', {}, ctx);
-          const reportedMode = String(acct.activeMode || acct.accountType || acct.mode || accountType || 'PRACTICE').toUpperCase();
-          if (reportedMode === 'REAL' || reportedMode === 'PRACTICE') {
+          const reportedMode = parseVerifiedIqMode(
+            acct.activeMode || acct.accountType || acct.mode,
+            acct.modeVerified
+          );
+          if (reportedMode === 'UNVERIFIED') {
+            accountType = 'UNVERIFIED';
+            modeConfirmed = false;
+            balance = null;
+            accountSyncError = 'IQ Option active account mode is UNVERIFIED; live orders are blocked.';
+          } else {
             accountType = reportedMode;
-          }
-          balance = toFiniteNumber(acct.balance);
-          currency = acct.currency || 'USD';
-          if (balance === null) {
-            accountSyncError = 'IQ Option connector did not return a valid numeric balance.';
+            balance = toFiniteNumber(acct.balance);
+            currency = acct.currency || 'USD';
+            if (balance === null) {
+              accountSyncError = 'IQ Option connector did not return a valid numeric balance.';
+            }
           }
         } catch (acctErr) {
-          // A transient /account timeout must NOT mark a healthy authenticated session disconnected
-          accountSyncError = acctErr instanceof Error ? acctErr.message : 'Temporary balance sync timeout.';
+          const errMsg = acctErr instanceof Error ? acctErr.message : 'Temporary balance sync timeout.';
+          if (/unverified|could not verify active account mode/i.test(errMsg)) {
+            accountType = 'UNVERIFIED';
+            modeConfirmed = false;
+          }
+          // A transient /account timeout must NOT mark a healthy verified session disconnected
+          accountSyncError = errMsg;
           balance = null;
         }
       }
 
-      const verifiedConnected = Boolean(health.connected) && health.authenticated !== false;
-      const detectedEnv: 'real' | 'demo' = accountType === 'REAL' ? 'real' : 'demo';
+      const verifiedConnected = modeConfirmed && (accountType === 'PRACTICE' || accountType === 'REAL');
+      const detectedEnv: 'real' | 'demo' = verifiedConnected && accountType === 'REAL' ? 'real' : 'demo';
       const diagnostics: BrokerConnectorDiagnostics = {
         ...baseDiagnostics,
         reachable: true,
-        authenticated: verifiedConnected,
+        authenticated: healthAuthenticated,
         credentialsConfigured:
           typeof health.credentialsConfigured === 'boolean' ? health.credentialsConfigured : null,
         latencyMs,
@@ -459,7 +495,7 @@ export class IQOptionAdapter implements BrokerAdapter {
       const warningSuffix = cfg.warnings.length > 0 ? ` (${cfg.warnings[0]})` : '';
       return {
         ...caps,
-        environment: verifiedConnected ? detectedEnv : caps.environment,
+        environment: detectedEnv,
         connected: verifiedConnected,
         executionEnabled: verifiedConnected && health.orderExecutionSupported !== false,
         accountType,
@@ -470,13 +506,15 @@ export class IQOptionAdapter implements BrokerAdapter {
         lastCheckedAt: checkedAt,
         message: verifiedConnected
           ? accountSyncError
-            ? `Connected to IQ Option (${accountType || 'PRACTICE'}, ${latencyMs}ms) — live balance sync delayed (${accountSyncError}).${warningSuffix}`
-            : `Connected to IQ Option (${accountType || 'PRACTICE'} mode detected directly from IQ Option, ${latencyMs}ms).${warningSuffix}`
-          : health.connectInFlight
-            ? `IQ connector reachable (${latencyMs}ms); establishing broker session, please wait...${warningSuffix}`
-            : health.credentialsConfigured
-              ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || 'click Connect to initiate session'}).${warningSuffix}`
-              : `IQ connector reachable (${latencyMs}ms); sign in with your IQ Option email & password to connect.${warningSuffix}`,
+            ? `Connected to IQ Option (${accountType}, ${latencyMs}ms) — live balance sync delayed (${accountSyncError}).${warningSuffix}`
+            : `Connected to IQ Option (${accountType} mode detected directly from IQ Option, ${latencyMs}ms).${warningSuffix}`
+          : accountType === 'UNVERIFIED'
+            ? `IQ Option session authenticated (${latencyMs}ms), but active account mode is UNVERIFIED — live orders are blocked until broker mode is confirmed.${warningSuffix}`
+            : health.connectInFlight
+              ? `IQ connector reachable (${latencyMs}ms); establishing broker session, please wait...${warningSuffix}`
+              : health.credentialsConfigured
+                ? `IQ connector reachable (${latencyMs}ms); not authenticated (${health.lastError || 'click Connect to initiate session'}).${warningSuffix}`
+                : `IQ connector reachable (${latencyMs}ms); sign in with your IQ Option email & password to connect.${warningSuffix}`,
         limitations: IQ_LIMITATIONS,
         diagnostics,
       };
@@ -524,12 +562,13 @@ export class IQOptionAdapter implements BrokerAdapter {
   private async connectInternal(ctx?: BrokerAccountContext) {
     const creds = ctx?.credentials || {};
     const res = await this.requestConnector<{
+      authenticated?: boolean;
       connected?: boolean;
-      accountType?: string;
-      activeMode?: string;
-      mode?: string;
+      accountType?: string | null;
+      activeMode?: string | null;
+      mode?: string | null;
       modeVerified?: boolean;
-      detail?: string;
+      detail?: string | null;
     }>(
       '/connect',
       {
@@ -542,37 +581,63 @@ export class IQOptionAdapter implements BrokerAdapter {
       ctx
     );
 
-    const reportedMode = String(res.activeMode || res.accountType || res.mode || '').toUpperCase();
+    const reportedMode = parseVerifiedIqMode(res.activeMode || res.accountType || res.mode, res.modeVerified);
     let balance: number | null = null;
     let currency: string | null = 'USD';
-    let confirmedAccountType = reportedMode === 'REAL' || reportedMode === 'PRACTICE' ? reportedMode : 'PRACTICE';
+    let confirmedAccountType: VerifiedIqAccountMode = reportedMode;
     let balanceWarning: string | null = null;
 
-    if (res.connected) {
-      try {
-        const acct = await this.getBalance(ctx, true);
-        balance = toFiniteNumber(acct.balance);
-        currency = acct.currency;
-        if (acct.accountType === 'REAL' || acct.accountType === 'PRACTICE') {
-          confirmedAccountType = acct.accountType;
-        }
-      } catch (err) {
-        balance = null;
-        balanceWarning = err instanceof Error ? err.message : 'Balance unavailable from broker.';
-      }
+    if (!res.connected || reportedMode === 'UNVERIFIED') {
+      const isUnverifiedSession = Boolean(res.authenticated) || String(res.mode || res.accountType || '').toUpperCase() === 'UNVERIFIED';
+      return {
+        connected: false,
+        accountType: isUnverifiedSession ? 'UNVERIFIED' : null,
+        balance: null,
+        equity: null,
+        currency: null,
+        externalAccountId: null,
+        message:
+          res.detail ||
+          (isUnverifiedSession
+            ? 'IQ Option active account mode could not be verified (UNVERIFIED); live orders are blocked.'
+            : 'IQ Option connector did not confirm an active session.'),
+      };
     }
+
+    try {
+      const acct = await this.getBalance(ctx, true);
+      balance = toFiniteNumber(acct.balance);
+      currency = acct.currency;
+      if (acct.accountType === 'REAL' || acct.accountType === 'PRACTICE') {
+        confirmedAccountType = acct.accountType;
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : 'Balance unavailable from broker.';
+      if (/unverified|could not verify active account mode/i.test(errMsg)) {
+        return {
+          connected: false,
+          accountType: 'UNVERIFIED',
+          balance: null,
+          equity: null,
+          currency: null,
+          externalAccountId: null,
+          message: errMsg,
+        };
+      }
+      balance = null;
+      balanceWarning = errMsg;
+    }
+
     return {
-      connected: Boolean(res.connected),
-      accountType: res.connected ? confirmedAccountType : null,
+      connected: true,
+      accountType: confirmedAccountType,
       balance,
       equity: balance,
       currency,
       externalAccountId: confirmedAccountType === 'REAL' ? 'iq-real' : 'iq-practice',
-      message: res.connected
-        ? balanceWarning
-          ? `Authenticated with IQ Option in ${confirmedAccountType} mode (detected from IQ Option), but balance sync was delayed (${balanceWarning}).`
-          : `Authenticated with IQ Option in ${confirmedAccountType} mode (automatically synced from IQ Option).`
-        : res.detail || 'IQ Option connector did not confirm an active session.',
+      message: balanceWarning
+        ? `Authenticated with IQ Option in ${confirmedAccountType} mode (detected from IQ Option), but balance sync was delayed (${balanceWarning}).`
+        : `Authenticated with IQ Option in ${confirmedAccountType} mode (automatically synced from IQ Option).`,
     };
   }
 
@@ -596,7 +661,10 @@ export class IQOptionAdapter implements BrokerAdapter {
       currency?: string;
       source?: string;
     }>(path, {}, ctx);
-    const reportedMode = String(acct.activeMode || acct.accountType || acct.mode || 'PRACTICE').toUpperCase();
+    const verifiedMode = parseVerifiedIqMode(acct.activeMode || acct.accountType || acct.mode, acct.modeVerified);
+    if (verifiedMode === 'UNVERIFIED') {
+      throw new Error('IQ Option active account mode is UNVERIFIED; live orders and balance sync are blocked.');
+    }
     const bal = toFiniteNumber(acct.balance);
     if (bal === null) {
       throw new Error('IQ Option connector returned a missing or non-numeric account balance.');
@@ -604,7 +672,7 @@ export class IQOptionAdapter implements BrokerAdapter {
     return {
       balance: bal,
       equity: bal,
-      accountType: reportedMode === 'REAL' ? 'REAL' : 'PRACTICE',
+      accountType: verifiedMode,
       currency: acct.currency || 'USD',
       source: acct.source || 'IQ_OPTION_UNOFFICIAL',
     };
@@ -794,7 +862,10 @@ export class IQOptionAdapter implements BrokerAdapter {
     const clean = (order.mappedSymbol || order.symbol).toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     try {
       const liveAcct = await this.getBalance(ctx, true);
-      const liveMode = liveAcct.accountType === 'REAL' ? 'REAL' : 'PRACTICE';
+      if (liveAcct.accountType !== 'REAL' && liveAcct.accountType !== 'PRACTICE') {
+        throw new Error('IQ Option active account mode is UNVERIFIED; live orders are blocked.');
+      }
+      const liveMode = liveAcct.accountType;
       const liveEnv = liveMode === 'REAL' ? 'real' : 'demo';
       if (liveAcct.balance !== null && order.amount > liveAcct.balance) {
         return {
@@ -832,7 +903,7 @@ export class IQOptionAdapter implements BrokerAdapter {
       return {
         valid: false,
         compatible: true,
-        environment: ctx.environment,
+        environment: 'demo',
         symbol: order.symbol.toUpperCase(),
         mappedSymbol: clean,
         direction: order.direction,
@@ -854,7 +925,10 @@ export class IQOptionAdapter implements BrokerAdapter {
     const clean = (order.mappedSymbol || order.symbol).toUpperCase().replace(/[^A-Z0-9_-]/g, '');
     // Verify the live active mode directly from IQ Option before every single order
     const liveAcct = await this.getBalance(ctx, true);
-    const verifiedLiveMode = liveAcct.accountType === 'REAL' ? 'REAL' : 'PRACTICE';
+    if (liveAcct.accountType !== 'REAL' && liveAcct.accountType !== 'PRACTICE') {
+      throw new Error('IQ Option active account mode is UNVERIFIED; live orders are blocked.');
+    }
+    const verifiedLiveMode = liveAcct.accountType;
 
     const res = await this.requestConnector<{
       accepted?: boolean;
@@ -865,6 +939,8 @@ export class IQOptionAdapter implements BrokerAdapter {
       filledUnits?: number | null;
       rawStatus?: string;
       mode?: string;
+      accountType?: string;
+      modeVerified?: boolean;
       message?: string;
       submittedAt?: string;
     }>(
@@ -884,7 +960,10 @@ export class IQOptionAdapter implements BrokerAdapter {
       ctx
     );
 
-    const confirmedMode = String(res.mode || verifiedLiveMode).toUpperCase();
+    const confirmedMode = parseVerifiedIqMode(res.mode || res.accountType || verifiedLiveMode, res.modeVerified);
+    if (confirmedMode === 'UNVERIFIED') {
+      throw new Error('IQ Option connector did not confirm a verified account mode on order response.');
+    }
     return {
       accepted: Boolean(res.accepted),
       brokerOrderId: String(res.brokerOrderId || ''),

@@ -1004,6 +1004,19 @@ export function BrokerConnectionsView({
             const syncedPositions = positionsByAccount[acct.id];
             const syncedHist = historyByAccount[acct.id];
             const isEditingRisk = editingRiskAccountId === acct.id && riskDraft;
+            const isIqOption = acct.brokerId === 'iq_option';
+            const normalizedType = (acct.accountType || '').trim().toUpperCase();
+            const displayMode = isIqOption
+              ? acct.connected && (normalizedType === 'PRACTICE' || normalizedType === 'REAL')
+                ? normalizedType
+                : normalizedType === 'UNVERIFIED' || acct.connected
+                  ? 'UNVERIFIED'
+                  : 'STANDBY'
+              : (acct.accountType || acct.environment).toUpperCase();
+            const isVerifiedReal = isIqOption
+              ? acct.connected && normalizedType === 'REAL'
+              : acct.environment === 'real' || normalizedType === 'REAL';
+            const isUnverifiedIq = isIqOption && displayMode === 'UNVERIFIED';
 
             return (
               <div
@@ -1018,12 +1031,16 @@ export function BrokerConnectionsView({
                       <span className="text-sm font-semibold text-slate-900 dark:text-white">{acct.label}</span>
                       <span
                         className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase ${
-                          acct.environment === 'real' || acct.accountType === 'REAL'
+                          isVerifiedReal
                             ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
-                            : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                            : isUnverifiedIq
+                              ? 'bg-red-500/15 text-red-700 dark:text-red-300'
+                              : displayMode === 'PRACTICE'
+                                ? 'bg-blue-500/15 text-blue-700 dark:text-blue-300'
+                                : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
                         }`}
                       >
-                        {acct.accountType || acct.environment}
+                        {displayMode}
                       </span>
                       {acct.isAuthoritative && (
                         <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">
@@ -1043,8 +1060,8 @@ export function BrokerConnectionsView({
                     </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
                       {acct.brokerName} · ID: <span className="font-mono">{acct.id.slice(0, 14)}</span> ·{' '}
-                      {acct.brokerId === 'iq_option'
-                        ? `Auto-Detected: ${acct.accountType || acct.environment.toUpperCase()}`
+                      {isIqOption
+                        ? `Auto-Detected: ${displayMode}`
                         : `${acct.capabilities.isOfficialApi ? 'Official API' : 'Bridge'} · ${acct.accountType || acct.environment.toUpperCase()}`}
                       {acct.lastSyncedAt ? ` · Synced ${new Date(acct.lastSyncedAt).toLocaleTimeString()}` : ''}
                     </p>
@@ -1068,7 +1085,9 @@ export function BrokerConnectionsView({
                 {/* Balance, Equity, Credentials Mask */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-3 border-t border-slate-200/80 dark:border-slate-800 text-xs">
                   <div>
-                    <p className="text-[11px] text-slate-500">{acct.environment === 'real' ? 'Account Balance' : 'Demo Balance'}</p>
+                    <p className="text-[11px] text-slate-500">
+                      {isVerifiedReal ? 'Account Balance' : isIqOption && displayMode === 'PRACTICE' ? 'Practice Balance' : 'Demo Balance'}
+                    </p>
                     <p className="mt-0.5 font-mono tabular-nums font-semibold text-slate-900 dark:text-white">
                       {typeof acct.balance === 'number' && Number.isFinite(acct.balance)
                         ? `${acct.balance.toFixed(2)} ${acct.currency || 'USD'}`
@@ -1094,19 +1113,25 @@ export function BrokerConnectionsView({
                     </p>
                   </div>
                   <div>
-                    <p className="text-[11px] text-slate-500">{acct.environment === 'real' ? 'Live Execution' : 'Demo Execution'}</p>
+                    <p className="text-[11px] text-slate-500">
+                      {isUnverifiedIq ? 'Execution Guard' : isVerifiedReal ? 'Live Execution' : 'Demo Execution'}
+                    </p>
                     <p
                       className={`mt-0.5 font-semibold ${
-                        (acct.environment === 'real' ? acct.capabilities.liveOrderPlacementSupported : acct.capabilities.demoOrderPlacementSupported)
-                          ? 'text-emerald-600 dark:text-emerald-400'
-                          : 'text-amber-600 dark:text-amber-400'
+                        isUnverifiedIq
+                          ? 'text-red-600 dark:text-red-400'
+                          : (isVerifiedReal ? acct.capabilities.liveOrderPlacementSupported : acct.capabilities.demoOrderPlacementSupported)
+                            ? 'text-emerald-600 dark:text-emerald-400'
+                            : 'text-amber-600 dark:text-amber-400'
                       }`}
                     >
-                      {(acct.environment === 'real' ? acct.capabilities.liveOrderPlacementSupported : acct.capabilities.demoOrderPlacementSupported)
-                        ? acct.environment === 'real'
-                          ? 'Live Ready'
-                          : 'Sandbox Ready'
-                        : 'Read-Only'}
+                      {isUnverifiedIq
+                        ? 'Blocked (Unverified)'
+                        : (isVerifiedReal ? acct.capabilities.liveOrderPlacementSupported : acct.capabilities.demoOrderPlacementSupported)
+                          ? isVerifiedReal
+                            ? 'Live Ready'
+                            : 'Sandbox Ready'
+                          : 'Read-Only'}
                     </p>
                   </div>
                 </div>
@@ -1599,11 +1624,21 @@ export function BrokerConnectionsView({
           <div>
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Legacy Environment Connector · IQ Option</p>
             <h3 className="mt-1 text-base font-semibold text-slate-900 dark:text-white">
-              {broker?.connected ? `Connected (${broker.accountType || 'PRACTICE'} — Auto-Detected)` : 'Not Connected'}
+              {broker?.connected && (broker.accountType === 'PRACTICE' || broker.accountType === 'REAL')
+                ? `Connected (${broker.accountType} — Auto-Detected)`
+                : broker?.accountType === 'UNVERIFIED'
+                  ? 'Mode Unverified — Orders Blocked'
+                  : 'Not Connected'}
             </h3>
             <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 max-w-2xl leading-relaxed">{broker?.message}</p>
           </div>
-          <span className="rounded-lg border border-emerald-300 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 px-3 py-1.5 text-xs font-medium text-emerald-800 dark:text-emerald-300 whitespace-nowrap">
+          <span
+            className={`rounded-lg border px-3 py-1.5 text-xs font-medium whitespace-nowrap ${
+              broker?.accountType === 'UNVERIFIED'
+                ? 'border-red-300 dark:border-red-800/70 bg-red-50 dark:bg-red-950/40 text-red-800 dark:text-red-300'
+                : 'border-emerald-300 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300'
+            }`}
+          >
             Auto-Follows IQ Option Mode ({broker?.accountType || 'Standby'})
           </span>
         </div>
@@ -1639,8 +1674,18 @@ export function BrokerConnectionsView({
           </div>
           <div>
             <p className="text-[11px] text-slate-500">Order Execution</p>
-            <p className="mt-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
-              {broker?.orderExecutionSupported ? `Enabled (${broker.accountType || 'Auto'})` : 'Standby'}
+            <p
+              className={`mt-1 text-xs font-semibold ${
+                broker?.accountType === 'UNVERIFIED'
+                  ? 'text-red-600 dark:text-red-400'
+                  : 'text-emerald-600 dark:text-emerald-400'
+              }`}
+            >
+              {broker?.accountType === 'UNVERIFIED'
+                ? 'Blocked (Unverified Mode)'
+                : broker?.executionEnabled && broker?.accountType
+                  ? `Enabled (${broker.accountType})`
+                  : 'Standby'}
             </p>
           </div>
         </div>
