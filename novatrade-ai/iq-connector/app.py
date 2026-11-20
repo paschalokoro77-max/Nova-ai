@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.1')
+app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.2')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
@@ -962,6 +962,7 @@ def _patch_iqoptionapi():
                         resp_map[req_id] = raw_msg
                     if msg_name in ('user-settings', 'user-settings-changed'):
                         api_obj._nt_user_settings_msg = raw_msg
+                        api_obj._nt_user_settings_msg_at = time.time()
                         extracted_id = _extract_balance_id_from_user_settings(raw_msg)
                         if extracted_id is not None:
                             api_obj._nt_user_settings_balance_id = extracted_id
@@ -1564,77 +1565,138 @@ def _coerce_balance_id(raw_val: Any) -> Any:
     return s
 
 
-def _extract_balance_id_from_user_settings(payload: Any) -> Any:
-    """Extract the user's currently selected traderoom balanceId from IQ Option user-settings / user-settings-changed."""
-    if payload is None:
+def _coerce_int(raw_val: Any) -> Optional[int]:
+    if raw_val is None or isinstance(raw_val, bool):
+        return None
+    if isinstance(raw_val, int):
+        return raw_val
+    if isinstance(raw_val, float) and math.isfinite(raw_val) and raw_val.is_integer():
+        return int(raw_val)
+    s = str(raw_val).strip()
+    if s and (s.isdigit() or (s.startswith('-') and s[1:].isdigit())):
+        try:
+            return int(s)
+        except Exception:
+            return None
+    return None
+
+
+_USER_SETTINGS_BALANCE_KEYS = (
+    'balanceId',
+    'balance_id',
+    'activeBalanceId',
+    'active_balance_id',
+    'selectedBalanceId',
+    'selected_balance_id',
+    'currentBalanceId',
+    'current_balance_id',
+    'userBalanceId',
+    'user_balance_id',
+    'lastBalanceId',
+    'last_balance_id',
+)
+_USER_SETTINGS_NESTED_BALANCE_OBJ_KEYS = ('balance', 'activeBalance', 'active_balance', 'selectedBalance', 'selected_balance')
+_USER_SETTINGS_ENVELOPE_KEYS = ('msg', 'result', 'data', 'payload', 'settings', 'configs', 'items', 'value', 'values', 'config')
+
+
+def _extract_balance_id_from_user_settings(
+    payload: Any,
+    known_balance_ids: Optional[set] = None,
+    _depth: int = 0,
+) -> Any:
+    """Extract the user's currently selected traderoom balanceId from IQ Option user-settings / user-settings-changed.
+    Supports nested JSON strings, versioned configs, and validates against known_balance_ids when supplied.
+    """
+    if payload is None or _depth > 8:
         return None
     if isinstance(payload, str):
+        s = payload.strip()
+        if not s or (not s.startswith('{') and not s.startswith('[')):
+            return None
         try:
-            payload = json.loads(payload)
+            payload = json.loads(s)
         except Exception:
             return None
 
-    def _from_config_obj(cfg: Any) -> Any:
+    def _accept(val: Any) -> Any:
+        norm = _coerce_balance_id(val)
+        if norm is None:
+            return None
+        if known_balance_ids is not None and len(known_balance_ids) > 0:
+            if str(norm) not in known_balance_ids:
+                return None
+        return norm
+
+    def _from_config_obj(cfg: Any, depth: int) -> Any:
+        if depth > 8 or cfg is None:
+            return None
         if isinstance(cfg, str):
+            s = cfg.strip()
+            if not s or (not s.startswith('{') and not s.startswith('[')):
+                return None
             try:
-                cfg = json.loads(cfg)
+                cfg = json.loads(s)
             except Exception:
                 return None
         if isinstance(cfg, dict):
-            for key in ('balanceId', 'balance_id', 'activeBalanceId', 'active_balance_id'):
-                val = _coerce_balance_id(cfg.get(key))
+            for key in _USER_SETTINGS_BALANCE_KEYS:
+                if key in cfg:
+                    val = _accept(cfg.get(key))
+                    if val is not None:
+                        return val
+            for obj_key in _USER_SETTINGS_NESTED_BALANCE_OBJ_KEYS:
+                nested_obj = cfg.get(obj_key)
+                if isinstance(nested_obj, dict):
+                    val = _accept(nested_obj.get('id') or nested_obj.get('balanceId') or nested_obj.get('balance_id'))
+                    if val is not None:
+                        return val
+            for sub_key, sub_val in cfg.items():
+                if isinstance(sub_val, (dict, list, str)):
+                    if sub_key in _USER_SETTINGS_BALANCE_KEYS:
+                        continue
+                    val = _from_config_obj(sub_val, depth + 1)
+                    if val is not None:
+                        return val
+        elif isinstance(cfg, list):
+            for item in cfg:
+                val = _from_config_obj(item, depth + 1)
                 if val is not None:
                     return val
         return None
 
     if isinstance(payload, dict):
-        # Unwrap WebSocket envelope {'name': 'user-settings', 'msg': ...}
-        if 'msg' in payload and payload.get('msg') is not None:
-            inner = _extract_balance_id_from_user_settings(payload.get('msg'))
-            if inner is not None:
-                return inner
-        if 'result' in payload and payload.get('result') is not None:
-            inner = _extract_balance_id_from_user_settings(payload.get('result'))
-            if inner is not None:
-                return inner
-
-        # Shape A: {'name': 'traderoom_gl_common', 'config': {'balanceId': 123}}
+        # 1. Prioritize canonical traderoom_gl_common entry first
         if payload.get('name') == 'traderoom_gl_common' or payload.get('setting_name') == 'traderoom_gl_common':
-            val = _from_config_obj(payload.get('config'))
-            if val is not None:
-                return val
-
-        # Shape B: {'configs': {'traderoom_gl_common': {'config': {'balanceId': 123}}}} or {'configs': [...]}
-        configs = payload.get('configs')
-        if isinstance(configs, dict):
-            tr = configs.get('traderoom_gl_common')
-            if isinstance(tr, dict):
-                val = _from_config_obj(tr.get('config') if 'config' in tr else tr)
-                if val is not None:
-                    return val
-            for cfg_entry in configs.values():
-                val = _extract_balance_id_from_user_settings(cfg_entry)
-                if val is not None:
-                    return val
-        elif isinstance(configs, list):
-            for entry in configs:
-                if isinstance(entry, dict) and entry.get('name') == 'traderoom_gl_common':
-                    val = _from_config_obj(entry.get('config') if 'config' in entry else entry)
+            for container_key in ('config', 'data', 'value', 'values', 'settings'):
+                if container_key in payload:
+                    val = _from_config_obj(payload.get(container_key), _depth + 1)
                     if val is not None:
                         return val
 
-        # Shape C: direct {'config': {'balanceId': 123}} or {'traderoom_gl_common': ...}
         if 'traderoom_gl_common' in payload:
-            val = _extract_balance_id_from_user_settings(payload.get('traderoom_gl_common'))
-            if val is not None:
-                return val
-        if 'config' in payload:
-            val = _from_config_obj(payload.get('config'))
+            val = _extract_balance_id_from_user_settings(payload.get('traderoom_gl_common'), known_balance_ids, _depth + 1)
             if val is not None:
                 return val
 
-        # Shape D: direct {'balanceId': 123} / {'balance_id': 123}
-        direct = _from_config_obj(payload)
+        # 2. Unwrap standard WebSocket / user-settings envelope containers
+        for env_key in ('msg', 'result', 'configs', 'settings', 'data', 'payload', 'items', 'value', 'values'):
+            if env_key in payload and payload.get(env_key) is not None:
+                inner = payload.get(env_key)
+                if isinstance(inner, dict) and 'traderoom_gl_common' in inner:
+                    val = _extract_balance_id_from_user_settings(inner.get('traderoom_gl_common'), known_balance_ids, _depth + 1)
+                    if val is not None:
+                        return val
+                val = _extract_balance_id_from_user_settings(inner, known_balance_ids, _depth + 1)
+                if val is not None:
+                    return val
+
+        # 3. Direct config / balance keys on current object
+        if 'config' in payload:
+            val = _from_config_obj(payload.get('config'), _depth + 1)
+            if val is not None:
+                return val
+
+        direct = _from_config_obj(payload, _depth + 1)
         if direct is not None:
             return direct
 
@@ -1642,15 +1704,92 @@ def _extract_balance_id_from_user_settings(payload: Any) -> Any:
         # Prefer explicit traderoom_gl_common entry first
         for entry in payload:
             if isinstance(entry, dict) and entry.get('name') == 'traderoom_gl_common':
-                val = _from_config_obj(entry.get('config') if 'config' in entry else entry)
+                val = _extract_balance_id_from_user_settings(entry, known_balance_ids, _depth + 1)
                 if val is not None:
                     return val
         for entry in payload:
-            val = _extract_balance_id_from_user_settings(entry)
+            val = _extract_balance_id_from_user_settings(entry, known_balance_ids, _depth + 1)
             if val is not None:
                 return val
 
     return None
+
+
+def _summarize_user_settings_response(resp: Any) -> dict:
+    """Build a strictly non-sensitive structural summary of an IQ Option user-settings WS frame.
+    NEVER includes balance IDs, balances, emails, tokens, or raw setting values — ONLY status & key names.
+    """
+    if not isinstance(resp, dict):
+        return {'type': type(resp).__name__}
+    summary: dict = {
+        'name': str(resp.get('name') or ''),
+        'status': resp.get('status'),
+    }
+    msg = resp.get('msg')
+    summary['msgType'] = type(msg).__name__
+    if isinstance(msg, dict):
+        summary['msgKeys'] = sorted(str(k) for k in list(msg.keys())[:15])
+        status_int = _coerce_int(resp.get('status'))
+        if status_int is not None and status_int >= 4000:
+            err_hint = msg.get('code') or msg.get('message') or msg.get('error')
+            if isinstance(err_hint, str) and err_hint.strip():
+                summary['errorCode'] = _sanitize_error(err_hint.strip())[:100]
+        # Extract non-sensitive setting bucket names & top-level config key names (never values)
+        config_names: List[str] = []
+        config_keys: List[str] = []
+        target_container = msg.get('result') if isinstance(msg.get('result'), (dict, list)) else msg
+        if isinstance(target_container, dict):
+            cfgs = target_container.get('configs')
+            if isinstance(cfgs, dict):
+                config_names = sorted(str(k) for k in list(cfgs.keys())[:15])
+                tr = cfgs.get('traderoom_gl_common')
+                if isinstance(tr, dict):
+                    tr_cfg = tr.get('config') if 'config' in tr else tr
+                    if isinstance(tr_cfg, str):
+                        try:
+                            tr_cfg = json.loads(tr_cfg)
+                        except Exception:
+                            tr_cfg = None
+                    if isinstance(tr_cfg, dict):
+                        config_keys = sorted(str(k) for k in list(tr_cfg.keys())[:20])
+            elif isinstance(cfgs, list):
+                for item in cfgs[:15]:
+                    if isinstance(item, dict) and item.get('name'):
+                        config_names.append(str(item.get('name')))
+                        if item.get('name') == 'traderoom_gl_common':
+                            tr_cfg = item.get('config')
+                            if isinstance(tr_cfg, str):
+                                try:
+                                    tr_cfg = json.loads(tr_cfg)
+                                except Exception:
+                                    tr_cfg = None
+                            if isinstance(tr_cfg, dict):
+                                config_keys = sorted(str(k) for k in list(tr_cfg.keys())[:20])
+            elif 'config' in target_container:
+                tr_cfg = target_container.get('config')
+                if isinstance(tr_cfg, str):
+                    try:
+                        tr_cfg = json.loads(tr_cfg)
+                    except Exception:
+                        tr_cfg = None
+                if isinstance(tr_cfg, dict):
+                    config_keys = sorted(str(k) for k in list(tr_cfg.keys())[:20])
+            if target_container.get('name') and not config_names:
+                config_names.append(str(target_container.get('name')))
+        elif isinstance(target_container, list):
+            for item in target_container[:15]:
+                if isinstance(item, dict) and item.get('name'):
+                    config_names.append(str(item.get('name')))
+        if config_names:
+            summary['configNames'] = config_names
+        if config_keys:
+            summary['configKeys'] = config_keys
+    elif isinstance(msg, list):
+        summary['msgLen'] = len(msg)
+        names = [str(item.get('name')) for item in msg[:15] if isinstance(item, dict) and item.get('name')]
+        if names:
+            summary['configNames'] = names
+    return summary
 
 
 def _resolve_mode_from_balances(
@@ -1666,7 +1805,7 @@ def _resolve_mode_from_balances(
             continue
         bid = _coerce_balance_id(bal.get('id'))
         if bid is not None and str(bid) == str(norm_target):
-            btype = bal.get('type')
+            btype = _coerce_int(bal.get('type'))
             curr = str(bal.get('currency') or 'USD').upper()
             if btype == 1:
                 return ('REAL', bid, curr)
@@ -1706,16 +1845,22 @@ def _get_balances_list(client: Any, refresh: bool = False, timeout_seconds: floa
 
 def _query_user_settings_balance_id(
     client: Any,
-    timeout_seconds: float = 2.5,
+    timeout_seconds: float = 3.0,
+    known_balance_ids: Optional[set] = None,
 ) -> Tuple[Any, Optional[str], dict]:
     """Read-only WebSocket query for IQ Option's traderoom_gl_common.config.balanceId.
+    Tries versioned IQ Option get-user-settings payloads first, uses clean numeric request_ids,
+    and records strictly non-sensitive structural diagnostics.
     NEVER calls set-user-settings or change_balance.
     """
     diag: dict = {
         'queried': False,
         'attempts': 0,
         'responseName': None,
+        'responseStatus': None,
+        'matchedQuery': None,
         'foundBalanceId': False,
+        'attemptsSummary': [],
     }
     api = getattr(client, 'api', None)
     if api is None or not hasattr(api, 'send_websocket_request') or not _is_client_alive(client):
@@ -1726,48 +1871,95 @@ def _query_user_settings_balance_id(
     if not isinstance(getattr(api, '_nt_ws_responses', None), dict):
         api._nt_ws_responses = {}
 
-    queries = [
-        {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common'}},
-        {'name': 'get-user-settings', 'version': '1.0', 'body': {'names': ['traderoom_gl_common']}},
-        {'name': 'get-user-settings', 'version': '1.0', 'body': {}},
+    queries: List[Tuple[str, dict]] = [
+        ('traderoom_gl_common_v3', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 3}}),
+        ('traderoom_gl_common_v4', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 4}}),
+        ('traderoom_gl_common_v5', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common', 'version': 5}}),
+        ('traderoom_gl_common', {'name': 'get-user-settings', 'version': '1.0', 'body': {'name': 'traderoom_gl_common'}}),
+        ('names_traderoom_gl_common', {'name': 'get-user-settings', 'version': '1.0', 'body': {'names': ['traderoom_gl_common']}}),
+        ('all_settings', {'name': 'get-user-settings', 'version': '1.0', 'body': {}}),
     ]
-    per_try_budget = max(0.5, min(1.5, timeout_seconds / 2.0))
+    total_deadline = time.monotonic() + max(1.0, min(timeout_seconds, 3.5))
+    per_try_budget = 0.55
+    req_base = int(time.time() * 1000) % 1000000000
 
-    for idx, msg_payload in enumerate(queries):
-        if not _is_client_alive(client):
+    for idx, (label, msg_payload) in enumerate(queries):
+        if not _is_client_alive(client) or time.monotonic() >= total_deadline:
             break
         diag['queried'] = True
         diag['attempts'] = idx + 1
-        req_id = f'nt_us_{int(time.time() * 1000)}_{idx}'
+        req_id = str(req_base + idx + 1)
         api._nt_pending_req_ids.add(req_id)
+        before_unsolicited_at = float(getattr(api, '_nt_user_settings_msg_at', 0.0) or 0.0)
         try:
             _run_with_timeout(
                 lambda p=msg_payload, rid=req_id: api.send_websocket_request('sendMessage', p, request_id=rid),
-                min(per_try_budget, 1.5),
+                min(per_try_budget, 1.0),
                 'get_user_settings',
             )
-            deadline = time.monotonic() + per_try_budget
-            while time.monotonic() < deadline:
+            step_deadline = min(total_deadline, time.monotonic() + per_try_budget)
+            got_resp = None
+            while time.monotonic() < step_deadline:
                 resp = api._nt_ws_responses.pop(req_id, None)
                 if resp is not None:
-                    diag['responseName'] = str(resp.get('name') or '')
-                    bal_id = _extract_balance_id_from_user_settings(resp)
-                    if bal_id is not None:
-                        api._nt_user_settings_balance_id = bal_id
-                        api._nt_user_settings_source = 'user_settings'
-                        api._nt_user_settings_at = time.time()
-                        diag['foundBalanceId'] = True
-                        return (bal_id, 'user_settings', diag)
+                    got_resp = resp
                     break
+                # Fallback if broker replied with a user-settings frame without echoing request_id
+                latest_at = float(getattr(api, '_nt_user_settings_msg_at', 0.0) or 0.0)
+                if latest_at > before_unsolicited_at:
+                    latest_frame = getattr(api, '_nt_user_settings_msg', None)
+                    if isinstance(latest_frame, dict) and not latest_frame.get('request_id'):
+                        got_resp = latest_frame
+                        break
                 if not _is_client_alive(client):
                     break
-                time.sleep(0.03)
-        except Exception:
-            pass
+                time.sleep(0.025)
+
+            if got_resp is not None:
+                diag['responseName'] = str(got_resp.get('name') or '')
+                diag['responseStatus'] = got_resp.get('status')
+                summary = _summarize_user_settings_response(got_resp)
+                summary['query'] = label
+                diag['attemptsSummary'].append(summary)
+                bal_id = _extract_balance_id_from_user_settings(got_resp, known_balance_ids=known_balance_ids)
+                if bal_id is not None:
+                    api._nt_user_settings_balance_id = bal_id
+                    api._nt_user_settings_source = 'user_settings'
+                    api._nt_user_settings_at = time.time()
+                    diag['foundBalanceId'] = True
+                    diag['matchedQuery'] = label
+                    return (bal_id, 'user_settings', diag)
+            else:
+                diag['attemptsSummary'].append({'query': label, 'timedOut': True})
+        except Exception as exc:
+            diag['attemptsSummary'].append({'query': label, 'error': type(exc).__name__})
         finally:
             api._nt_pending_req_ids.discard(req_id)
 
     return (None, None, diag)
+
+
+def _query_http_getprofile(client: Any, timeout_seconds: float = 1.5) -> Optional[dict]:
+    """Read-only HTTP /api/getprofile cross-check using the already-authenticated session.
+    NEVER alters broker state and NEVER assumes REAL on dual-wallet accounts.
+    """
+    api = getattr(client, 'api', None)
+    if api is None or not hasattr(api, 'getprofile') or not callable(api.getprofile):
+        return None
+    try:
+        resp = _run_with_timeout(api.getprofile, min(timeout_seconds, 2.0), 'http_getprofile')
+        if resp is None:
+            return None
+        data = resp.json() if hasattr(resp, 'json') and callable(resp.json) else resp
+        if isinstance(data, dict):
+            result = data.get('result')
+            if isinstance(result, dict):
+                return result
+            if 'balance_type' in data or 'balance_id' in data or 'balances' in data:
+                return data
+    except Exception:
+        return None
+    return None
 
 
 def _sync_local_balance_id(client: Any, verified_balance_id: Any) -> None:
@@ -1813,15 +2005,15 @@ def _extract_mode_from_profile(profile_msg: Any) -> Tuple[Optional[str], Any, Op
     active_entries = [b for b in bal_list if b.get('is_active') is True or b.get('active') is True]
     if len(active_entries) == 1:
         b = active_entries[0]
-        btype = b.get('type')
+        btype = _coerce_int(b.get('type'))
         curr = str(b.get('currency') or 'USD').upper()
         if btype == 1:
             return ('REAL', _coerce_balance_id(b.get('id')), curr)
         if btype == 4:
             return ('PRACTICE', _coerce_balance_id(b.get('id')), curr)
 
-    real_entries = [b for b in bal_list if b.get('type') == 1]
-    practice_entries = [b for b in bal_list if b.get('type') == 4]
+    real_entries = [b for b in bal_list if _coerce_int(b.get('type')) == 1]
+    practice_entries = [b for b in bal_list if _coerce_int(b.get('type')) == 4]
 
     # 2. Single-wallet account (unambiguous)
     if practice_entries and not real_entries:
@@ -1838,7 +2030,7 @@ def _extract_mode_from_profile(profile_msg: Any) -> Tuple[Optional[str], Any, Op
         if m == 'PRACTICE':
             return ('PRACTICE', bid, curr)
 
-    bal_type = profile_msg.get('balance_type')
+    bal_type = _coerce_int(profile_msg.get('balance_type'))
     if bal_type == 4 or profile_msg.get('is_demo') is True:
         if practice_entries:
             b = practice_entries[0]
@@ -1909,18 +2101,41 @@ def _detect_balance_mode(
     if api is not None:
         bal_list = _get_balances_list(client, refresh=refresh, timeout_seconds=min(timeout, 2.5))
         profile_msg = getattr(getattr(api, 'profile', None), 'msg', None)
+        known_bal_ids = {
+            str(_coerce_balance_id(b.get('id')))
+            for b in bal_list
+            if isinstance(b, dict) and _coerce_balance_id(b.get('id')) is not None
+        }
         available_modes: List[str] = []
-        if any(b.get('type') == 1 for b in bal_list):
+        if any(_coerce_int(b.get('type')) == 1 for b in bal_list):
             available_modes.append('REAL')
-        if any(b.get('type') == 4 for b in bal_list):
+        if any(_coerce_int(b.get('type')) == 4 for b in bal_list):
             available_modes.append('PRACTICE')
 
         legacy_profile_mode: Optional[str] = None
+        prof_btype_coerced: Optional[int] = None
+        prof_bal_id_mode: Optional[str] = None
         if isinstance(profile_msg, dict):
-            if profile_msg.get('balance_type') == 1:
+            prof_btype_coerced = _coerce_int(profile_msg.get('balance_type'))
+            if prof_btype_coerced == 1:
                 legacy_profile_mode = 'REAL'
-            elif profile_msg.get('balance_type') == 4:
+            elif prof_btype_coerced == 4:
                 legacy_profile_mode = 'PRACTICE'
+            raw_pbid = _coerce_balance_id(profile_msg.get('balance_id'))
+            if raw_pbid is not None and bal_list:
+                prof_bal_id_mode, _, _ = _resolve_mode_from_balances(bal_list, raw_pbid)
+
+        profile_diag: dict = {
+            'hasProfileMsg': isinstance(profile_msg, dict),
+            'hasBalanceType': isinstance(profile_msg, dict) and profile_msg.get('balance_type') is not None,
+            'balanceTypeValue': prof_btype_coerced,
+            'hasBalanceId': isinstance(profile_msg, dict) and _coerce_balance_id(profile_msg.get('balance_id')) is not None,
+            'balanceIdMode': prof_bal_id_mode,
+            'balancesCount': len(bal_list),
+            'httpProfileChecked': False,
+            'httpProfileBalanceType': None,
+            'httpProfileBalanceIdMode': None,
+        }
 
         # 1. Authoritative: IQ Option traderoom_gl_common user-settings (live push or fresh WS query)
         settings_bal_id = getattr(api, '_nt_user_settings_balance_id', None)
@@ -1930,12 +2145,19 @@ def _detect_balance_mode(
             'queried': False,
             'attempts': 0,
             'responseName': None,
+            'responseStatus': None,
+            'matchedQuery': None,
             'foundBalanceId': settings_bal_id is not None,
+            'attemptsSummary': [],
         }
 
         should_query_settings = refresh or settings_bal_id is None or settings_age > 30.0
         if should_query_settings:
-            q_bal_id, q_src, q_diag = _query_user_settings_balance_id(client, timeout_seconds=min(timeout, 3.0))
+            q_bal_id, q_src, q_diag = _query_user_settings_balance_id(
+                client,
+                timeout_seconds=min(timeout, 3.5),
+                known_balance_ids=known_bal_ids or None,
+            )
             us_diag = q_diag
             if q_bal_id is not None:
                 settings_bal_id = q_bal_id
@@ -1958,8 +2180,12 @@ def _detect_balance_mode(
                     'verified': True,
                     'userSettingsQueried': us_diag.get('queried', False),
                     'userSettingsResponseName': us_diag.get('responseName'),
+                    'userSettingsResponseStatus': us_diag.get('responseStatus'),
+                    'userSettingsMatchedQuery': us_diag.get('matchedQuery'),
+                    'userSettingsAttempts': us_diag.get('attemptsSummary', []),
                     'userSettingsMode': us_mode,
                     'profileLegacyMode': legacy_profile_mode,
+                    'profileDiag': profile_diag,
                     'availableModes': available_modes,
                     'lastCheckedAt': time.time(),
                 }
@@ -1968,11 +2194,31 @@ def _detect_balance_mode(
         # 2. Unambiguous profile / balances signals (explicit active flag, single-wallet, or explicit PRACTICE)
         #    NEVER assumes REAL on dual-wallet accounts from legacy profile_msg['balance_type'] == 1!
         merged_profile = dict(profile_msg) if isinstance(profile_msg, dict) else {}
-        if bal_list and 'balances' not in merged_profile:
-            merged_profile['balances'] = bal_list
-        elif bal_list:
+        if bal_list:
             merged_profile['balances'] = bal_list
         prof_mode, prof_bal_id, prof_curr = _extract_mode_from_profile(merged_profile)
+        prof_source = 'single_wallet_or_explicit_profile'
+
+        # 2b. Read-only HTTP /api/getprofile cross-check if WS profile & user-settings did not verify mode.
+        #     Still obeys strict safety rule: NEVER assumes REAL on dual-wallet accounts!
+        if prof_mode not in ('PRACTICE', 'REAL'):
+            http_profile = _query_http_getprofile(client, timeout_seconds=1.5)
+            profile_diag['httpProfileChecked'] = True
+            if isinstance(http_profile, dict):
+                http_btype = _coerce_int(http_profile.get('balance_type'))
+                profile_diag['httpProfileBalanceType'] = http_btype
+                http_bid = _coerce_balance_id(http_profile.get('balance_id'))
+                if http_bid is not None and bal_list:
+                    http_bid_mode, _, _ = _resolve_mode_from_balances(bal_list, http_bid)
+                    profile_diag['httpProfileBalanceIdMode'] = http_bid_mode
+                merged_http = dict(http_profile)
+                if bal_list and not isinstance(merged_http.get('balances'), list):
+                    merged_http['balances'] = bal_list
+                h_mode, h_bal_id, h_curr = _extract_mode_from_profile(merged_http)
+                if h_mode in ('PRACTICE', 'REAL'):
+                    prof_mode, prof_bal_id, prof_curr = h_mode, h_bal_id, h_curr
+                    prof_source = 'http_getprofile_explicit'
+
         if prof_mode in ('PRACTICE', 'REAL'):
             prev_mode = _confirmed_mode
             if prof_bal_id is not None:
@@ -1985,12 +2231,16 @@ def _detect_balance_mode(
             if prev_mode != prof_mode:
                 _invalidate_balance_cache()
             _mode_detection_diag = {
-                'source': 'single_wallet_or_explicit_profile',
+                'source': prof_source,
                 'verified': True,
                 'userSettingsQueried': us_diag.get('queried', False),
                 'userSettingsResponseName': us_diag.get('responseName'),
+                'userSettingsResponseStatus': us_diag.get('responseStatus'),
+                'userSettingsMatchedQuery': us_diag.get('matchedQuery'),
+                'userSettingsAttempts': us_diag.get('attemptsSummary', []),
                 'userSettingsMode': None,
                 'profileLegacyMode': legacy_profile_mode,
+                'profileDiag': profile_diag,
                 'availableModes': available_modes,
                 'lastCheckedAt': time.time(),
             }
@@ -2001,7 +2251,7 @@ def _detect_balance_mode(
         _mode_verified = False
         _active_balance_id = None
         # Ensure local global_value.balance_id is NOT left pointing at a REAL wallet while unverified
-        practice_entries = [b for b in bal_list if b.get('type') == 4 and b.get('id') is not None]
+        practice_entries = [b for b in bal_list if _coerce_int(b.get('type')) == 4 and b.get('id') is not None]
         if practice_entries:
             _sync_local_balance_id(client, practice_entries[0]['id'])
         _mode_detection_diag = {
@@ -2009,14 +2259,19 @@ def _detect_balance_mode(
             'verified': False,
             'userSettingsQueried': us_diag.get('queried', False),
             'userSettingsResponseName': us_diag.get('responseName'),
+            'userSettingsResponseStatus': us_diag.get('responseStatus'),
+            'userSettingsMatchedQuery': us_diag.get('matchedQuery'),
+            'userSettingsAttempts': us_diag.get('attemptsSummary', []),
             'userSettingsMode': None,
             'profileLegacyMode': legacy_profile_mode,
+            'profileDiag': profile_diag,
             'availableModes': available_modes,
             'lastCheckedAt': time.time(),
         }
         _last_error = (
-            'IQ Option active account mode could not be verified (broker user-settings did not confirm '
-            'active balanceId on dual-wallet REAL/PRACTICE account); live orders are blocked.'
+            'IQ Option session authenticated, but active account mode could not be verified '
+            '(broker user-settings did not confirm active balanceId on dual-wallet REAL/PRACTICE account); '
+            'live orders are blocked.'
         )
         return ('UNVERIFIED', False)
 
@@ -2830,7 +3085,7 @@ async def health(
 
     return {
         'status': 'running',
-        'version': getattr(app, 'version', '0.5.1'),
+        'version': getattr(app, 'version', '0.5.2'),
         'serviceAvailable': True,
         'busy': busy,
         'connectInFlight': connect_in_flight,
@@ -2906,7 +3161,7 @@ async def network_check(
 
     return {
         'status': 'ok',
-        'version': getattr(app, 'version', '0.5.1'),
+        'version': getattr(app, 'version', '0.5.2'),
         'serviceAvailable': True,
         'timeoutSeconds': _WS_CONNECT_TIMEOUT,
         'activeWsUrl': _active_ws_url,

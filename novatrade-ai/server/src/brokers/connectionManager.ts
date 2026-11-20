@@ -1292,12 +1292,18 @@ export class BrokerConnectionManager {
         acct.brokerId !== 'iq_option' || (res.connected && (iqNormalizedType === 'REAL' || iqNormalizedType === 'PRACTICE'));
       const effectiveConnected = Boolean(res.connected && iqVerified);
 
+      const iqUnverifiedSession = acct.brokerId === 'iq_option' && !effectiveConnected && iqNormalizedType === 'UNVERIFIED';
+
       acct.connected = effectiveConnected;
-      acct.status = effectiveConnected ? 'CONNECTED' : 'AUTHENTICATION FAILED';
+      acct.status = effectiveConnected
+        ? 'CONNECTED'
+        : iqUnverifiedSession
+          ? 'MODE UNVERIFIED'
+          : 'AUTHENTICATION FAILED';
       if (acct.brokerId === 'iq_option') {
         acct.accountType = effectiveConnected
           ? iqNormalizedType
-          : iqNormalizedType === 'UNVERIFIED'
+          : iqUnverifiedSession
             ? 'UNVERIFIED'
             : null;
         acct.environment = effectiveConnected && iqNormalizedType === 'REAL' ? 'real' : 'demo';
@@ -1359,10 +1365,13 @@ export class BrokerConnectionManager {
       }
       if (!effectiveConnected) {
         throw new BrokerConnectionError(
-          res.message || 'Broker authentication or mode verification failed.',
+          res.message ||
+            (iqUnverifiedSession
+              ? 'IQ Option session authenticated, but active account mode could not be verified (UNVERIFIED); live orders are blocked.'
+              : 'Broker authentication failed.'),
           {
-            statusCode: 401,
-            connectionStatus: 'AUTHENTICATION FAILED',
+            statusCode: iqUnverifiedSession ? 409 : 401,
+            connectionStatus: iqUnverifiedSession ? 'MODE UNVERIFIED' : 'AUTHENTICATION FAILED',
             account: publicAccount,
           }
         );
@@ -1523,9 +1532,11 @@ export class BrokerConnectionManager {
             ? 'NOT CONFIGURED'
             : !snap.diagnostics?.reachable
               ? 'GATEWAY OFFLINE'
-              : snapType === 'UNVERIFIED' || snap.diagnostics?.lastConnectorError
-                ? 'AUTHENTICATION FAILED'
-                : 'GATEWAY ONLINE';
+              : snapType === 'UNVERIFIED'
+                ? 'MODE UNVERIFIED'
+                : snap.diagnostics?.lastConnectorError
+                  ? 'AUTHENTICATION FAILED'
+                  : 'GATEWAY ONLINE';
         acct.accountType = verifiedIq ? snapType : snapType === 'UNVERIFIED' ? 'UNVERIFIED' : null;
         acct.environment = verifiedIq && snapType === 'REAL' ? 'real' : 'demo';
       } else {

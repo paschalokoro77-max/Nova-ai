@@ -299,6 +299,7 @@ export type BrokerConnectionState =
   | 'GATEWAY ONLINE'
   | 'GATEWAY OFFLINE'
   | 'NOT CONFIGURED'
+  | 'MODE UNVERIFIED'
   | 'AUTHENTICATION FAILED';
 
 export interface BrokerCredentialFieldSpec {
