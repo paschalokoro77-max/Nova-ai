@@ -236,6 +236,8 @@ export default function App() {
   });
   const [mt5Positions, setMt5Positions] = useState<BrokerPosition[]>([]);
   const [mt5PositionsLoading, setMt5PositionsLoading] = useState(false);
+  const [iqPositions, setIqPositions] = useState<BrokerPosition[]>([]);
+  const [iqPositionsLoading, setIqPositionsLoading] = useState(false);
   const [androidDevices, setAndroidDevices] = useState<AndroidDevicePublic[]>([]);
   const [androidAnalyses, setAndroidAnalyses] = useState<AndroidScreenAnalysisRecord[]>([]);
   const [androidActions, setAndroidActions] = useState<AndroidActionQueueItem[]>([]);
@@ -667,7 +669,11 @@ export default function App() {
     }
   }
 
-  async function handleOpenManualPaperTrade(symbol: string, direction: 'CALL' | 'PUT', amount: number) {
+  async function handleOpenManualPaperTrade(symbol: string, direction: 'CALL' | 'PUT', amount: number, expirySeconds?: number) {
+    if (amount > 100) {
+      pushToast('error', 'Stake Limit Exceeded', 'Maximum stake per individual trade is $100.');
+      return;
+    }
     setBusy(true);
     try {
       const res = await apiRequest<{ trade: PaperTrade; notice: string }>('/api/paper-trades', {
@@ -679,7 +685,7 @@ export default function App() {
           direction,
           amount,
           entryPrice: symbol === selectedSymbol ? candleFeed?.currentPrice ?? null : null,
-          expirySeconds: aiSettings?.expirySeconds ?? 180,
+          ...(expirySeconds ? { expirySeconds } : {}),
           mode,
         }),
       });
@@ -1260,30 +1266,44 @@ export default function App() {
     symbol: string,
     direction: 'CALL' | 'PUT',
     amount: number,
-    orderType: BrokerOrderType
+    orderType: BrokerOrderType,
+    expirySeconds?: number
   ) {
+    if (amount > 100) {
+      pushToast('error', 'Stake Limit Exceeded', 'Maximum stake per individual trade is $100.');
+      return;
+    }
     setBusy(true);
     try {
-      const targetEnv = brokerAccounts.find((a) => a.id === accountId)?.environment || 'demo';
+      const targetAcct = brokerAccounts.find((a) => a.id === accountId);
+      const targetEnv = targetAcct?.environment || 'demo';
       const res = await apiRequest<{ order: BrokerOrderRecord; duplicatePrevented?: boolean }>('/api/brokers/orders', {
         method: 'POST',
         headers: authHeaders,
         body: JSON.stringify({
           accountId,
-          environment: targetEnv,
+          ...(targetAcct?.brokerId === 'mt5' ? { environment: targetEnv } : {}),
           symbol,
           direction,
           orderType,
           amount,
           entryPrice: symbol === selectedSymbol ? candleFeed?.currentPrice ?? null : null,
-          expirySeconds: aiSettings?.expirySeconds ?? 180,
+          ...(expirySeconds ? { expirySeconds } : {}),
           idempotencyKey: `${accountId}-${symbol}-${direction}-${Math.floor(Date.now() / 5000)}`,
           source: 'manual',
         }),
       });
+      const resolvedMode =
+        res.order.brokerId === 'iq_option'
+          ? res.order.environment === 'real'
+            ? 'REAL'
+            : 'PRACTICE'
+          : res.order.environment === 'real'
+            ? 'Real'
+            : 'Demo';
       pushToast(
         res.duplicatePrevented ? 'warning' : 'success',
-        res.duplicatePrevented ? 'Duplicate Order Prevented' : `${targetEnv === 'real' ? 'Real' : 'Demo'} ${direction} Sent`,
+        res.duplicatePrevented ? 'Duplicate Order Prevented' : `${resolvedMode} ${direction} Sent`,
         `${res.order.brokerName}: ${res.order.mappedSymbol} (${res.order.status})`
       );
       await refreshPlatformState();
@@ -1305,7 +1325,7 @@ export default function App() {
       setAutoBrokerExecution(res.enabled);
       pushToast(
         res.enabled ? 'info' : 'warning',
-        res.enabled ? 'Auto MT5 Routing Armed' : 'Auto MT5 Routing Disarmed',
+        res.enabled ? 'Auto Broker Routing Armed' : 'Auto Broker Routing Disarmed',
         res.reason
       );
       await refreshPlatformState();
@@ -1321,19 +1341,22 @@ export default function App() {
     symbol: string,
     direction: 'CALL' | 'PUT',
     amount: number,
-    orderType: BrokerOrderType
+    orderType: BrokerOrderType,
+    expirySeconds?: number
   ): Promise<BrokerOrderValidationResult> {
-    const targetEnv = brokerAccounts.find((a) => a.id === accountId)?.environment || 'demo';
+    const targetAcct = brokerAccounts.find((a) => a.id === accountId);
+    const targetEnv = targetAcct?.environment || 'demo';
     const res = await apiRequest<{ validation: BrokerOrderValidationResult }>('/api/brokers/orders/validate', {
       method: 'POST',
       headers: authHeaders,
       body: JSON.stringify({
         accountId,
-        environment: targetEnv,
+        ...(targetAcct?.brokerId === 'mt5' ? { environment: targetEnv } : {}),
         symbol,
         direction,
         orderType,
         amount,
+        ...(expirySeconds ? { expirySeconds } : {}),
       }),
     });
     return res.validation;
@@ -1365,6 +1388,62 @@ export default function App() {
       `/api/brokers/accounts/${accountId}/positions`,
       { headers: authHeaders }
     );
+  }
+
+  async function handleCloseBrokerPosition(
+    accountId: string,
+    ticket: string
+  ): Promise<{ closed: boolean; ticket: string; mode?: string | null; realizedPnl?: number | null; message: string }> {
+    setBusy(true);
+    try {
+      const res = await apiRequest<{ closed: boolean; ticket: string; mode?: string | null; realizedPnl?: number | null; message: string }>(
+        `/api/brokers/accounts/${accountId}/positions/${encodeURIComponent(ticket)}/close`,
+        {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({}),
+        }
+      );
+      pushToast(res.closed ? 'success' : 'info', res.closed ? 'Position Closed' : 'Close Requested', res.message);
+      await refreshPlatformState();
+      if (iqAccount?.id === accountId) {
+        const latest = await handleFetchBrokerPositions(accountId).catch(() => null);
+        if (latest && Array.isArray(latest.positions)) {
+          setIqPositions(latest.positions);
+        }
+      }
+      return res;
+    } catch (err) {
+      pushToast('error', 'Close Position Failed', sanitizeErrorMessage(err, 'Unable to close open trade.'));
+      throw err;
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCleanupStaleIqDuplicates(): Promise<{ removedIds: string[]; keptAccountId: string | null }> {
+    setBusy(true);
+    try {
+      const res = await apiRequest<{ removedIds: string[]; keptAccountId: string | null }>(
+        '/api/brokers/accounts/cleanup-duplicates',
+        {
+          method: 'POST',
+          headers: authHeaders,
+          body: JSON.stringify({}),
+        }
+      );
+      pushToast(
+        res.removedIds.length > 0 ? 'success' : 'info',
+        'Duplicate Cleanup Complete',
+        res.removedIds.length > 0
+          ? `Removed ${res.removedIds.length} stale IQ Option duplicate record(s). Active session preserved.`
+          : 'No stale IQ Option duplicates to remove.'
+      );
+      await refreshPlatformState(true);
+      return res;
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function handleFetchBrokerAssets(
@@ -1416,9 +1495,10 @@ export default function App() {
         : 'Not Configured'
       : mt5AccountMode;
 
-  // Detected IQ Option account and mode
+  // Detected IQ Option account and mode (prefer authoritative, then connected)
   const iqAccount = useMemo(() => {
     return (
+      brokerAccounts.find((a) => a.brokerId === 'iq_option' && a.isAuthoritative) ||
       brokerAccounts.find((a) => a.brokerId === 'iq_option' && a.connected) ||
       brokerAccounts.find((a) => a.brokerId === 'iq_option') ||
       null
@@ -1524,6 +1604,29 @@ export default function App() {
       };
     }
   }, [dashboardSource, mt5Account?.id, mt5Account?.connected]);
+
+  // Automatically fetch IQ Option open positions when IQ Option dashboard is active
+  useEffect(() => {
+    if (dashboardSource === 'iq_option' && iqAccount?.id && (iqAccount.connected || brokerStatus?.connected)) {
+      let cancelled = false;
+      setIqPositionsLoading(true);
+      handleFetchBrokerPositions(iqAccount.id)
+        .then((res) => {
+          if (!cancelled && Array.isArray(res?.positions)) {
+            setIqPositions(res.positions);
+          }
+        })
+        .catch((err) => {
+          console.warn('Failed to fetch IQ Option positions for dashboard:', err);
+        })
+        .finally(() => {
+          if (!cancelled) setIqPositionsLoading(false);
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+  }, [dashboardSource, iqAccount?.id, iqAccount?.connected, brokerStatus?.connected]);
 
   async function handleSignOut() {
     if (isSupabaseConfigured) {
@@ -2758,51 +2861,148 @@ export default function App() {
                     </div>
                   ) : (
                     <>
-                      {/* IQ Option Status Grid */}
+                      {/* IQ Option Live Positions & Execution Controls Grid */}
                       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                         <div className={`lg:col-span-2 ${CARD_SURFACE} p-5 space-y-4`}>
-                          <div className="flex items-center justify-between">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
                             <div>
                               <h3 className="text-sm font-semibold text-slate-900 dark:text-white">
-                                IQ Option Synchronization &amp; Execution Policy
+                                Active IQ Option Positions ({iqPositions.length})
                               </h3>
                               <p className="text-xs text-slate-500 dark:text-slate-400">
-                                Mode: <strong className="text-slate-900 dark:text-white">{iqAccountMode}</strong> · Balance verified from connector.
+                                Auto-Detected Mode: <strong className="text-slate-900 dark:text-white">{iqAccountMode}</strong> · Follows your active account mode inside IQ Option.
                               </p>
                             </div>
-                            <span className="text-[10px] font-mono px-2 py-1 rounded bg-amber-100 dark:bg-amber-950/80 text-amber-800 dark:text-amber-300 font-bold border border-amber-300/40">
-                              EXECUTION LOCKED (HTTP 423)
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span
+                                className={`text-[10px] font-mono px-2 py-1 rounded font-bold border ${
+                                  iqAccountMode === 'REAL'
+                                    ? 'bg-emerald-100 dark:bg-emerald-950/70 text-emerald-800 dark:text-emerald-300 border-emerald-300/40'
+                                    : 'bg-blue-100 dark:bg-blue-950/70 text-blue-800 dark:text-blue-300 border-blue-300/40'
+                                }`}
+                              >
+                                LIVE MODE: {iqAccountMode}
+                              </span>
+                              {iqAccount?.id && (
+                                <button
+                                  type="button"
+                                  disabled={iqPositionsLoading}
+                                  onClick={() => {
+                                    setIqPositionsLoading(true);
+                                    handleFetchBrokerPositions(iqAccount.id)
+                                      .then((res) => {
+                                        if (Array.isArray(res?.positions)) setIqPositions(res.positions);
+                                      })
+                                      .finally(() => setIqPositionsLoading(false));
+                                  }}
+                                  className="inline-flex items-center gap-1 rounded-lg border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-[11px] font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50"
+                                >
+                                  <RefreshCw className={`h-3 w-3 ${iqPositionsLoading ? 'animate-spin' : ''}`} />
+                                  Refresh
+                                </button>
+                              )}
+                            </div>
                           </div>
 
-                          <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#070C17] border border-slate-200/80 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 space-y-2">
-                            <p>
-                              <strong>Read-Only Market &amp; Balance Mode:</strong> The IQ Option connector is connected in{' '}
-                              <span className="font-semibold text-slate-900 dark:text-white">{iqAccountMode}</span> mode.
-                              Real-money order placement through the unofficial connector is locked to protect your capital.
-                            </p>
-                            <p>
-                              To test automated strategy execution safely, switch to <strong>1. Paper Trading</strong> above or route execution through the verified <strong>2. MetaTrader 5</strong> bridge.
-                            </p>
-                          </div>
+                          {iqPositions.length === 0 ? (
+                            <div className="p-4 rounded-xl bg-slate-50 dark:bg-[#070C17] border border-slate-200/80 dark:border-slate-800 text-xs text-slate-600 dark:text-slate-400 space-y-2">
+                              <p>
+                                {iqPositionsLoading
+                                  ? 'Synchronizing active IQ Option positions...'
+                                  : `No active IQ Option trades open in ${iqAccountMode} mode.`}
+                              </p>
+                              <p>
+                                Select IQ Option as your execution target and open trades from the <strong>Trading Desk</strong>, or let the AI engine route validated signals automatically when armed.
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="overflow-x-auto">
+                              <table className="w-full text-left text-xs">
+                                <thead>
+                                  <tr className="border-b border-slate-200 dark:border-slate-800 text-slate-500 dark:text-slate-400">
+                                    <th className="py-2 pr-3 font-medium">Ticket</th>
+                                    <th className="py-2 pr-3 font-medium">Symbol</th>
+                                    <th className="py-2 pr-3 font-medium">Side</th>
+                                    <th className="py-2 pr-3 font-medium text-right">Stake</th>
+                                    <th className="py-2 pr-3 font-medium text-right">P&amp;L</th>
+                                    <th className="py-2 font-medium text-right">Action</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-200/70 dark:divide-slate-800">
+                                  {iqPositions.map((pos) => (
+                                    <tr key={pos.ticket}>
+                                      <td className="py-2.5 pr-3 font-mono text-slate-600 dark:text-slate-300">#{pos.ticket}</td>
+                                      <td className="py-2.5 pr-3 font-semibold text-slate-900 dark:text-white">{pos.symbol}</td>
+                                      <td
+                                        className={`py-2.5 pr-3 font-semibold ${
+                                          pos.side === 'BUY' ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+                                        }`}
+                                      >
+                                        {pos.side === 'BUY' ? 'CALL' : 'PUT'}
+                                      </td>
+                                      <td className="py-2.5 pr-3 text-right font-mono tabular-nums text-slate-900 dark:text-white">
+                                        ${pos.volume.toFixed(2)}
+                                      </td>
+                                      <td
+                                        className={`py-2.5 pr-3 text-right font-mono tabular-nums font-semibold ${
+                                          (pos.profit ?? 0) >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'
+                                        }`}
+                                      >
+                                        {pos.profit != null ? `${pos.profit >= 0 ? '+' : ''}$${pos.profit.toFixed(2)}` : 'Open'}
+                                      </td>
+                                      <td className="py-2.5 text-right">
+                                        {iqAccount?.id && pos.canClose !== false && (
+                                          <button
+                                            type="button"
+                                            disabled={busy}
+                                            onClick={() => handleCloseBrokerPosition(iqAccount.id, pos.ticket)}
+                                            className="rounded-lg border border-red-300 dark:border-red-800/70 bg-red-50 dark:bg-red-950/40 px-2.5 py-1 text-[11px] font-semibold text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50"
+                                          >
+                                            Close Trade
+                                          </button>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
                         </div>
 
                         {/* IQ Option Controls */}
                         <div className={`${CARD_SURFACE} p-5 flex flex-col justify-between`}>
                           <div>
-                            <h3 className="text-sm font-semibold text-slate-900 dark:text-white">Connector Controls</h3>
+                            <h3 className="text-sm font-semibold text-slate-900 dark:text-white">IQ Option Controls</h3>
                             <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-                              Manage connector credentials, practice/real selection, and token lifecycle in the broker settings.
+                              Mode is controlled inside IQ Option. NovaTrade verifies the active mode before every trade.
                             </p>
                           </div>
                           <div className="space-y-2.5 mt-4">
+                            {iqAccount?.id && activeBrokerAccountId !== iqAccount.id && (
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleSelectActiveBrokerAccount(iqAccount.id)}
+                                className="w-full min-h-11 rounded-xl bg-emerald-600 hover:bg-emerald-500 py-2.5 px-4 text-xs font-semibold text-white transition-colors"
+                              >
+                                Set IQ Option ({iqAccountMode}) as Execution Target
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setActiveNav('paper-trading')}
+                              className="w-full min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 py-2.5 px-4 text-xs font-semibold text-white transition-colors"
+                            >
+                              Open Trading Desk
+                            </button>
                             <button
                               type="button"
                               disabled={busy}
-                              onClick={refreshPlatformState}
-                              className="w-full min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 py-2.5 px-4 text-xs font-semibold text-white transition-colors"
+                              onClick={() => handleReconcileBrokerOrders(iqAccount?.id)}
+                              className="w-full min-h-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#070C17] hover:bg-slate-50 dark:hover:bg-slate-800 py-2.5 px-4 text-xs font-medium text-slate-700 dark:text-slate-200 transition-colors"
                             >
-                              Refresh Balance &amp; Status
+                              Sync Trades &amp; Balance
                             </button>
                             <button
                               type="button"
@@ -3458,6 +3658,8 @@ export default function App() {
               onFetchQuote={handleFetchBrokerQuote}
               onFetchCandles={handleFetchBrokerCandles}
               onFetchPositions={handleFetchBrokerPositions}
+              onClosePosition={handleCloseBrokerPosition}
+              onCleanupStaleIqDuplicates={handleCleanupStaleIqDuplicates}
               onFetchAssets={handleFetchBrokerAssets}
               onSyncHistory={handleSyncBrokerHistory}
               onReconcileOrders={handleReconcileBrokerOrders}

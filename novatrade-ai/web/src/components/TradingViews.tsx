@@ -522,12 +522,20 @@ interface PaperTradingDeskProps {
     symbol: string,
     dir: 'CALL' | 'PUT',
     amount: number,
-    orderType: BrokerOrderType
+    orderType: BrokerOrderType,
+    expirySeconds?: number
   ) => Promise<BrokerOrderValidationResult>;
-  onExecuteBrokerDemoOrder?: (accountId: string, symbol: string, dir: 'CALL' | 'PUT', amount: number, orderType: BrokerOrderType) => Promise<void>;
+  onExecuteBrokerDemoOrder?: (
+    accountId: string,
+    symbol: string,
+    dir: 'CALL' | 'PUT',
+    amount: number,
+    orderType: BrokerOrderType,
+    expirySeconds?: number
+  ) => Promise<void>;
   onModeChange: (m: OperatingMode) => void;
   onUpdateStartingBalance: (val: number) => Promise<void>;
-  onOpenManualTrade: (symbol: string, dir: 'CALL' | 'PUT', amount: number) => Promise<void>;
+  onOpenManualTrade: (symbol: string, dir: 'CALL' | 'PUT', amount: number, expirySeconds?: number) => Promise<void>;
   onCreateAssistedProposal: () => Promise<void>;
   onApproveProposal: (id: string) => Promise<void>;
   onRejectProposal: (id: string) => Promise<void>;
@@ -565,7 +573,8 @@ export function PaperTradingDeskView({
   onSettle,
   onCancel,
 }: PaperTradingDeskProps) {
-  const [stakeDraft, setStakeDraft] = useState('50');
+  const [stakeDraft, setStakeDraft] = useState('25');
+  const [durationDraft, setDurationDraft] = useState('auto');
   const [balanceDraft, setBalanceDraft] = useState(String(analytics?.startingVirtualBalance ?? 10000));
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [validatingOrder, setValidatingOrder] = useState(false);
@@ -878,7 +887,7 @@ export function PaperTradingDeskView({
             </div>
           )}
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div>
               <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1.5">Instrument</label>
               <select
@@ -895,101 +904,152 @@ export function PaperTradingDeskView({
             </div>
             <div>
               <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1.5">
-                Stake (Max ${riskStatus?.limits.maxTradeAmount ?? 100})
+                Stake (Max $100)
               </label>
               <input
                 type="number"
                 min={1}
-                max={riskStatus?.limits.maxTradeAmount ?? 10000}
+                max={100}
                 value={stakeDraft}
                 onChange={(e) => setStakeDraft(e.target.value)}
                 className={`${INPUT_CLASS} font-mono tabular-nums`}
               />
-            </div>
-          </div>
-
-          {activeBrokerAccountId && onValidateBrokerOrder && (
-            <div className="space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  disabled={busy || validatingOrder || !stakeDraft.trim() || parsedStake < 1}
-                  onClick={async () => {
-                    setValidatingOrder(true);
-                    try {
-                      const check = await onValidateBrokerOrder(activeBrokerAccountId, selectedSymbol, 'CALL', parsedStake, 'MARKET');
-                      setBrokerValidation(check);
-                    } finally {
-                      setValidatingOrder(false);
-                    }
-                  }}
-                  className="min-h-10 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0C1322] px-3.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
-                >
-                  {validatingOrder
-                    ? 'Checking MT5 Order...'
-                    : `Validate ${activeBroker?.environment === 'real' ? 'Real' : 'Demo'} Order (Pre-Flight)`}
-                </button>
-              </div>
-              {brokerValidation && (
-                <div
-                  className={`rounded-xl border px-3 py-2 text-[11px] ${
-                    brokerValidation.valid
-                      ? 'border-emerald-300 dark:border-emerald-800/70 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300'
-                      : 'border-red-300 dark:border-red-800/70 bg-red-50/70 dark:bg-red-950/30 text-red-800 dark:text-red-300'
-                  }`}
-                >
-                  <p className="font-semibold">
-                    {brokerValidation.valid ? 'Validation Passed' : 'Validation Blocked'} · {brokerValidation.mappedSymbol}
-                    {brokerValidation.normalizedVolume != null ? ` · Vol ${brokerValidation.normalizedVolume}` : ''}
-                    {brokerValidation.estimatedMargin != null ? ` · Margin ~${brokerValidation.estimatedMargin.toFixed(2)}` : ''}
-                  </p>
-                  <p>{brokerValidation.reason}</p>
-                </div>
+              {parsedStake > 100 && (
+                <p className="mt-1 text-[11px] text-red-500 font-medium">Individual trades cannot exceed $100.</p>
               )}
             </div>
-          )}
-
-          <div className="grid grid-cols-2 gap-3 pt-1">
-            <button
-              type="button"
-              disabled={busy || !stakeDraft.trim() || parsedStake < 1}
-              onClick={() => {
-                if (activeBrokerAccountId && onExecuteBrokerDemoOrder) {
-                  void onExecuteBrokerDemoOrder(activeBrokerAccountId, selectedSymbol, 'CALL', parsedStake, 'MARKET');
-                } else {
-                  void onOpenManualTrade(selectedSymbol, 'CALL', parsedStake);
-                }
-              }}
-              className="min-h-11 inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 py-2.5 text-xs font-semibold text-white transition-colors"
-            >
-              <Play className="h-3.5 w-3.5" />{' '}
-              {activeBrokerAccountId
-                ? `Send ${activeBroker?.environment === 'real' ? 'Real' : 'Demo'} BUY (CALL)`
-                : 'Open Paper CALL'}
-            </button>
-            <button
-              type="button"
-              disabled={busy || !stakeDraft.trim() || parsedStake < 1}
-              onClick={() => {
-                if (activeBrokerAccountId && onExecuteBrokerDemoOrder) {
-                  void onExecuteBrokerDemoOrder(activeBrokerAccountId, selectedSymbol, 'PUT', parsedStake, 'MARKET');
-                } else {
-                  void onOpenManualTrade(selectedSymbol, 'PUT', parsedStake);
-                }
-              }}
-              className="min-h-11 inline-flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 disabled:opacity-50 py-2.5 text-xs font-semibold text-white transition-colors"
-            >
-              <Play className="h-3.5 w-3.5" />{' '}
-              {activeBrokerAccountId
-                ? `Send ${activeBroker?.environment === 'real' ? 'Real' : 'Demo'} SELL (PUT)`
-                : 'Open Paper PUT'}
-            </button>
+            <div>
+              <label className="block text-xs text-slate-500 dark:text-slate-400 mb-1.5">
+                Duration / Expiry
+              </label>
+              <select
+                value={durationDraft}
+                onChange={(e) => setDurationDraft(e.target.value)}
+                className={SELECT_CLASS}
+              >
+                <option value="auto">Auto (AI Selected Duration)</option>
+                <option value="60">1 minute (60s)</option>
+                <option value="120">2 minutes (120s)</option>
+                <option value="180">3 minutes (180s)</option>
+                <option value="300">5 minutes (300s)</option>
+                <option value="900">15 minutes (900s)</option>
+                <option value="1800">30 minutes (1800s)</option>
+                <option value="3600">1 hour (3600s)</option>
+              </select>
+            </div>
           </div>
-          <p className="text-[11px] text-slate-500 dark:text-slate-400">
-            {activeBrokerAccountId
-              ? `Routes validated MARKET ${activeBroker?.environment === 'real' ? 'REAL' : 'DEMO'} orders through the selected broker adapter with pre-flight order_check(), duplicate-order & per-account risk guards.`
-              : 'Trades auto-settle at expiry using live verified market prices, or can be settled manually below.'}
-          </p>
+
+          {activeBrokerAccountId && onValidateBrokerOrder && (() => {
+            const brokerOrderType: BrokerOrderType =
+              activeBroker?.brokerId === 'iq_option' ? 'BINARY_FIXED_EXPIRY' : 'MARKET';
+            const modeTag =
+              activeBroker?.accountType ||
+              (activeBroker?.environment === 'real' ? 'REAL' : 'DEMO');
+            const chosenExpiry = durationDraft === 'auto' ? undefined : Number(durationDraft);
+            return (
+              <div className="space-y-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={busy || validatingOrder || !stakeDraft.trim() || parsedStake < 1 || parsedStake > 100}
+                    onClick={async () => {
+                      setValidatingOrder(true);
+                      try {
+                        const check = await onValidateBrokerOrder(
+                          activeBrokerAccountId,
+                          selectedSymbol,
+                          'CALL',
+                          parsedStake,
+                          brokerOrderType,
+                          chosenExpiry
+                        );
+                        setBrokerValidation(check);
+                      } finally {
+                        setValidatingOrder(false);
+                      }
+                    }}
+                    className="min-h-10 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-[#0C1322] px-3.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50 transition-colors"
+                  >
+                    {validatingOrder
+                      ? `Checking ${activeBroker?.brokerName || 'Broker'} Order...`
+                      : `Validate ${modeTag} Order (Pre-Flight)`}
+                  </button>
+                </div>
+                {brokerValidation && (
+                  <div
+                    className={`rounded-xl border px-3 py-2 text-[11px] ${
+                      brokerValidation.valid
+                        ? 'border-emerald-300 dark:border-emerald-800/70 bg-emerald-50/70 dark:bg-emerald-950/30 text-emerald-800 dark:text-emerald-300'
+                        : 'border-red-300 dark:border-red-800/70 bg-red-50/70 dark:bg-red-950/30 text-red-800 dark:text-red-300'
+                    }`}
+                  >
+                    <p className="font-semibold">
+                      {brokerValidation.valid ? 'Validation Passed' : 'Validation Blocked'} · {brokerValidation.mappedSymbol}
+                      {brokerValidation.normalizedVolume != null ? ` · Vol ${brokerValidation.normalizedVolume}` : ''}
+                      {brokerValidation.estimatedMargin != null ? ` · Margin ~${brokerValidation.estimatedMargin.toFixed(2)}` : ''}
+                    </p>
+                    <p>{brokerValidation.reason}</p>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
+          {(() => {
+            const brokerOrderType: BrokerOrderType =
+              activeBroker?.brokerId === 'iq_option' ? 'BINARY_FIXED_EXPIRY' : 'MARKET';
+            const modeTag =
+              activeBroker?.accountType ||
+              (activeBroker?.environment === 'real' ? 'REAL' : 'DEMO');
+            const chosenExpiry = durationDraft === 'auto' ? undefined : Number(durationDraft);
+            return (
+              <>
+                <div className="grid grid-cols-2 gap-3 pt-1">
+                  <button
+                    type="button"
+                    disabled={busy || !stakeDraft.trim() || parsedStake < 1 || parsedStake > 100}
+                    onClick={() => {
+                      if (activeBrokerAccountId && onExecuteBrokerDemoOrder) {
+                        void onExecuteBrokerDemoOrder(activeBrokerAccountId, selectedSymbol, 'CALL', parsedStake, brokerOrderType, chosenExpiry);
+                      } else {
+                        void onOpenManualTrade(selectedSymbol, 'CALL', parsedStake, chosenExpiry);
+                      }
+                    }}
+                    className="min-h-11 inline-flex items-center justify-center gap-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 py-2.5 text-xs font-semibold text-white transition-colors"
+                  >
+                    <Play className="h-3.5 w-3.5" />{' '}
+                    {activeBrokerAccountId
+                      ? `Send ${modeTag} BUY (CALL)`
+                      : 'Open Paper CALL'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy || !stakeDraft.trim() || parsedStake < 1 || parsedStake > 100}
+                    onClick={() => {
+                      if (activeBrokerAccountId && onExecuteBrokerDemoOrder) {
+                        void onExecuteBrokerDemoOrder(activeBrokerAccountId, selectedSymbol, 'PUT', parsedStake, brokerOrderType, chosenExpiry);
+                      } else {
+                        void onOpenManualTrade(selectedSymbol, 'PUT', parsedStake, chosenExpiry);
+                      }
+                    }}
+                    className="min-h-11 inline-flex items-center justify-center gap-2 rounded-xl bg-red-600 hover:bg-red-500 disabled:opacity-50 py-2.5 text-xs font-semibold text-white transition-colors"
+                  >
+                    <Play className="h-3.5 w-3.5" />{' '}
+                    {activeBrokerAccountId
+                      ? `Send ${modeTag} SELL (PUT)`
+                      : 'Open Paper PUT'}
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  {activeBrokerAccountId
+                    ? activeBroker?.brokerId === 'iq_option'
+                      ? `Routes validated IQ Option ${modeTag} orders (duration: ${durationDraft === 'auto' ? 'Auto / AI Selected' : durationDraft + 's'}) with live broker mode verification, duplicate-order & per-account risk guards (follows active mode inside IQ Option; max $100/trade).`
+                      : `Routes validated MARKET ${modeTag} orders through MetaTrader 5 with pre-flight order_check(), duplicate-order & per-account risk guards (max $100/trade).`
+                    : 'Trades auto-settle at expiry using live verified market prices, or can be settled manually below.'}
+                </p>
+              </>
+            );
+          })()}
         </div>
       </div>
 

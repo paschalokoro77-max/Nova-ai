@@ -83,8 +83,15 @@ class FakeIqClient:
         self.mode = initial_mode
         self.allow_real_switch = allow_real_switch
         self.change_balance_called_with = None
+        self.change_balance_calls = []
         self.candles_rows = candles_rows
         self.raise_on_candles = raise_on_candles
+        self.buy_calls = []
+        self.sell_calls = []
+        self.closed_digital_calls = []
+        self.open_positions = []
+        self.option_outcomes = {}
+        self._next_order_id = 50001
 
     def check_connect(self):
         return True
@@ -94,8 +101,8 @@ class FakeIqClient:
 
     def change_balance(self, target_mode):
         self.change_balance_called_with = target_mode
+        self.change_balance_calls.append(target_mode)
         if target_mode == "REAL" and not self.allow_real_switch:
-            # Stays in PRACTICE even when REAL was requested
             self.mode = "PRACTICE"
             return
         self.mode = target_mode
@@ -118,8 +125,8 @@ class FakeIqClient:
 
     def get_balances(self):
         return [
-            {"id": 1, "type": 1, "amount": 10000.0, "currency": "USD"},
-            {"id": 2, "type": 4, "amount": 250.0, "currency": "USD"},
+            {"id": 1, "type": 1, "amount": 250.0, "currency": "USD"},
+            {"id": 2, "type": 4, "amount": 10000.0, "currency": "USD"},
         ]
 
     def get_profile_ansyc(self):
@@ -129,9 +136,47 @@ class FakeIqClient:
                 "email": "trader@example.com",
                 "name": "Nova Trader",
                 "currency": "USD",
+                "balance_type": 4 if self.mode == "PRACTICE" else 1,
+                "balance_id": 2 if self.mode == "PRACTICE" else 1,
                 "is_activated": True,
             }
         }
+
+    def buy(self, amount, symbol, direction, duration_min):
+        oid = self._next_order_id
+        self._next_order_id += 1
+        self.buy_calls.append((amount, symbol, direction, duration_min, self.mode))
+        self.open_positions.append({
+            "id": oid,
+            "active": symbol,
+            "direction": direction,
+            "amount": amount,
+            "open_quote": 1.0860,
+            "current_price": 1.0864,
+            "pnl": 4.25,
+            "open_time": int(time.time()),
+            "expiration_time": int(time.time()) + duration_min * 60,
+            "instrument_type": "turbo-option",
+        })
+        return True, oid
+
+    def sell_option(self, order_id):
+        self.sell_calls.append(order_id)
+        self.open_positions = [p for p in self.open_positions if str(p.get("id")) != str(order_id)]
+        return True
+
+    def close_digital_option(self, order_id):
+        self.closed_digital_calls.append(order_id)
+        self.open_positions = [p for p in self.open_positions if str(p.get("id")) != str(order_id)]
+        return True
+
+    def get_positions(self, instrument_type):
+        if instrument_type == "turbo-option":
+            return True, {"positions": list(self.open_positions)}
+        return True, {"positions": []}
+
+    def get_optioninfo_v2(self, count):
+        return {"msg": {"closed_options": list(self.option_outcomes.values())}}
 
     def get_option_history_v2(self, active, count):
         return (
@@ -163,7 +208,7 @@ class TestIqConnectorModes(unittest.TestCase):
         app._busy_operation = None
         app._last_connect_stage = None
         app._last_connect_duration_ms = None
-        app._requested_mode = "PRACTICE"
+        app._requested_mode = "AUTO"
         app._confirmed_mode = "PRACTICE"
         app._mode_verified = False
         app._last_error = None
@@ -173,6 +218,9 @@ class TestIqConnectorModes(unittest.TestCase):
         app._last_ws_diagnostics = None
         app._last_candle_check = None
         app._opcodes_updated = False
+        app._tracked_orders.clear()
+        app._idempotency_index.clear()
+        app._invalidate_balance_cache()
 
     def test_normalize_mode(self):
         self.assertEqual(app._normalize_mode("demo"), "PRACTICE")
@@ -186,13 +234,13 @@ class TestIqConnectorModes(unittest.TestCase):
             app._normalize_mode("unsupported_mode")
 
     def test_resolve_target_mode(self):
-        # Default fallback
-        app._requested_mode = "PRACTICE"
-        self.assertEqual(app._resolve_target_mode(), "PRACTICE")
+        # Default fallback is AUTO (follows live IQ Option active mode)
+        self.assertEqual(app._resolve_target_mode(), "AUTO")
 
         # Header takes precedence
         self.assertEqual(app._resolve_target_mode(x_iq_mode="REAL"), "REAL")
         self.assertEqual(app._resolve_target_mode(x_iq_mode="DEMO"), "PRACTICE")
+        self.assertEqual(app._resolve_target_mode(x_iq_mode="AUTO"), "AUTO")
 
         # Query param
         self.assertEqual(app._resolve_target_mode(query_mode="REAL"), "REAL")
@@ -205,16 +253,24 @@ class TestIqConnectorModes(unittest.TestCase):
         active, ok = app._ensure_balance_mode(client, "PRACTICE")
         self.assertTrue(ok)
         self.assertEqual(active, "PRACTICE")
+        self.assertEqual(client.change_balance_calls, [])
 
-    def test_ensure_balance_mode_real_success(self):
+    def test_ensure_balance_mode_never_silently_switches_mode(self):
+        # Even if REAL is expected, connector MUST NOT silently call change_balance()
         client = FakeIqClient(initial_mode="PRACTICE", allow_real_switch=True)
         active, ok = app._ensure_balance_mode(client, "REAL")
-        self.assertTrue(ok)
-        self.assertEqual(active, "REAL")
-        self.assertEqual(client.get_balance_mode(), "REAL")
+        self.assertFalse(ok)
+        self.assertEqual(active, "PRACTICE")
+        self.assertEqual(client.change_balance_calls, [])
+
+        # When user already switched IQ Option to REAL, AUTO and REAL both verify REAL
+        real_client = FakeIqClient(initial_mode="REAL", allow_real_switch=True)
+        active_auto, ok_auto = app._ensure_balance_mode(real_client, "AUTO")
+        self.assertTrue(ok_auto)
+        self.assertEqual(active_auto, "REAL")
+        self.assertEqual(real_client.change_balance_calls, [])
 
     def test_ensure_balance_mode_real_fail_closed(self):
-        # Client refused to switch to REAL and remains in PRACTICE
         client = FakeIqClient(initial_mode="PRACTICE", allow_real_switch=False)
         active, ok = app._ensure_balance_mode(client, "REAL")
         self.assertFalse(ok)
@@ -234,11 +290,44 @@ class TestIqConnectorModes(unittest.TestCase):
         self.assertEqual(active, "REAL")
         self.assertTrue(ok)
 
-    def test_order_placement_strictly_locked(self):
+    def test_order_placement_in_practice_and_mode_mismatch_guard(self):
+        client = FakeIqClient(initial_mode="PRACTICE")
+        app._client = client
+        req = app.OrderRequest(
+            symbol="EURUSD",
+            direction="CALL",
+            amount=15.0,
+            expirySeconds=180,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-idem-1",
+        )
+        res = app.place_order(req, x_connector_token=None)
+        self.assertTrue(res["accepted"])
+        self.assertEqual(res["mode"], "PRACTICE")
+        self.assertEqual(res["mappedSymbol"], "EURUSD")
+        self.assertEqual(res["direction"], "CALL")
+        self.assertEqual(len(client.buy_calls), 1)
+        self.assertEqual(client.change_balance_calls, [])
+
+        # Duplicate idempotencyKey returns cached order without double execution
+        dup = app.place_order(req, x_connector_token=None)
+        self.assertTrue(dup["duplicatePrevented"])
+        self.assertEqual(dup["brokerOrderId"], res["brokerOrderId"])
+        self.assertEqual(len(client.buy_calls), 1)
+
+        # If caller expected REAL while IQ Option is in PRACTICE, fail closed with HTTP 409
+        mismatch_req = app.OrderRequest(
+            symbol="EURUSD",
+            direction="CALL",
+            amount=10.0,
+            expirySeconds=180,
+            expectedMode="REAL",
+            idempotencyKey="test-idem-mismatch",
+        )
         with self.assertRaises(app.HTTPException) as ctx:
-            app.order_locked()
-        self.assertEqual(ctx.exception.status_code, 423)
-        self.assertIn("locked", str(ctx.exception.detail).lower())
+            app.place_order(mismatch_req, x_connector_token=None)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(client.change_balance_calls, [])
 
     def test_price_endpoint_returns_latest_close_in_practice(self):
         app._client = FakeIqClient(initial_mode="PRACTICE")
@@ -246,7 +335,7 @@ class TestIqConnectorModes(unittest.TestCase):
         self.assertEqual(res["symbol"], "EURUSD")
         self.assertEqual(res["last"], 1.0860)
         self.assertEqual(res["mode"], "PRACTICE")
-        self.assertFalse(res["orderExecutionSupported"])
+        self.assertTrue(res["orderExecutionSupported"])
         self.assertFalse(res["realTradingEnabled"])
 
     def test_candles_endpoint_returns_normalized_bars(self):
@@ -256,7 +345,7 @@ class TestIqConnectorModes(unittest.TestCase):
         self.assertEqual(res["symbol"], "EURUSD")
         self.assertEqual(len(res["candles"]), 2)
         self.assertEqual(res["candles"][-1]["close"], 1.0860)
-        self.assertFalse(res["orderExecutionSupported"])
+        self.assertTrue(res["orderExecutionSupported"])
         self.assertFalse(res["realTradingEnabled"])
 
     def test_price_and_candles_handle_upstream_exception_as_json_http_exception(self):
@@ -276,14 +365,15 @@ class TestIqConnectorModes(unittest.TestCase):
             app.latest_price("EURUSD", mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
         self.assertEqual(ctx.exception.status_code, 502)
 
-    def test_health_always_reports_practice_and_execution_locked(self):
+    def test_health_reports_live_detected_mode_and_trading_capabilities(self):
         app._client = FakeIqClient(initial_mode="PRACTICE")
-        res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
+        res = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
         self.assertEqual(res["status"], "running")
         self.assertFalse(res["busy"])
         self.assertTrue(res["connected"])
         self.assertEqual(res["mode"], "PRACTICE")
-        self.assertFalse(res["orderExecutionSupported"])
+        self.assertTrue(res["modeFollowsBroker"])
+        self.assertTrue(res["orderExecutionSupported"])
         self.assertFalse(res["realTradingEnabled"])
 
     def test_fetch_candles_safe_handles_unknown_symbol_and_bounded_timeout(self):
@@ -367,7 +457,7 @@ class TestIqConnectorModes(unittest.TestCase):
             self.assertLess(elapsed_health, 0.25)
             self.assertEqual(health_res["status"], "running")
             self.assertTrue(health_res["busy"])
-            self.assertFalse(health_res["orderExecutionSupported"])
+            self.assertTrue(health_res["orderExecutionSupported"])
             self.assertFalse(health_res["realTradingEnabled"])
 
             # /balance, /price, and /candles must fail fast with HTTP 503 instead of hanging
@@ -391,7 +481,7 @@ class TestIqConnectorModes(unittest.TestCase):
         # After lock release, all endpoints recover immediately
         bal_ok = app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
         self.assertEqual(bal_ok["balance"], 10000.0)
-        self.assertFalse(bal_ok["orderExecutionSupported"])
+        self.assertTrue(bal_ok["orderExecutionSupported"])
         self.assertFalse(bal_ok["realTradingEnabled"])
 
     def test_hanging_balance_and_candles_timeout_and_release_lock(self):
@@ -979,7 +1069,7 @@ class TestIqConnectorModes(unittest.TestCase):
             self.assertEqual(res["wsEndpoints"][1]["url"], app._WS_FALLBACK_URL)
             self.assertEqual(res["wsEndpoints"][1]["httpStatus"], 101)
             self.assertTrue(res["authEndpoint"]["ok"])
-            self.assertFalse(res["orderExecutionSupported"])
+            self.assertTrue(res["orderExecutionSupported"])
             self.assertFalse(res["realTradingEnabled"])
         finally:
             app._probe_ws_endpoint = orig_probe_ws
@@ -1166,7 +1256,7 @@ class TestIqConnectorModes(unittest.TestCase):
             health_res = asyncio.run(app.health(mode=None, x_iq_mode="PRACTICE"))
             self.assertFalse(health_res["proxyConfigured"])
             self.assertFalse(health_res["wsProxyEnabled"])
-            self.assertFalse(health_res["orderExecutionSupported"])
+            self.assertTrue(health_res["orderExecutionSupported"])
             self.assertFalse(health_res["realTradingEnabled"])
         finally:
             for k, v in saved_env.items():
@@ -1434,7 +1524,7 @@ class TestIqConnectorModes(unittest.TestCase):
             self.assertFalse(net_res["wsProxyEnabled"])
             self.assertEqual(net_res["proxyAuthEndpoint"]["proxy"], "http://eu-egress.example:3128")
             self.assertTrue(net_res["proxyAuthEndpoint"]["tlsVerified"])
-            self.assertFalse(net_res["orderExecutionSupported"])
+            self.assertTrue(net_res["orderExecutionSupported"])
             self.assertFalse(net_res["realTradingEnabled"])
             serialized = str(net_res)
             for forbidden in ("prox_usr", "ProxPass", "UltraSecretIQPass", "private.trader@example.com", "ConnTok-887766"):
@@ -1836,7 +1926,7 @@ class TestIqConnectorModes(unittest.TestCase):
                 self.assertTrue(res["connected"])
                 self.assertEqual(res["mode"], "PRACTICE")
                 self.assertTrue(res["modeVerified"])
-                self.assertFalse(res["orderExecutionSupported"])
+                self.assertTrue(res["orderExecutionSupported"])
                 self.assertFalse(res["realTradingEnabled"])
 
             # After completion, connector is idle and connected
@@ -2079,7 +2169,7 @@ class TestIqConnectorModes(unittest.TestCase):
             self.assertTrue(app._is_client_alive(c2))
             bal = app.balance(mode=None, x_iq_mode="PRACTICE", x_connector_token=None)
             self.assertEqual(bal["balance"], 10000.0)
-            self.assertFalse(bal["orderExecutionSupported"])
+            self.assertTrue(bal["orderExecutionSupported"])
             self.assertFalse(bal["realTradingEnabled"])
         finally:
             app._iqoptionapi_patched = orig_patched
@@ -2088,6 +2178,187 @@ class TestIqConnectorModes(unittest.TestCase):
                     sys.modules.pop(k, None)
                 else:
                     sys.modules[k] = v
+
+    def test_dynamic_real_mode_detection_and_execution_without_switching(self):
+        """When the user switches their IQ Option account to REAL inside IQ Option, NovaTrade auto-detects REAL without calling change_balance()."""
+        client = FakeIqClient(initial_mode="PRACTICE")
+        app._client = client
+
+        acc_practice = app.account(fresh=True, x_connector_token=None)
+        self.assertEqual(acc_practice["mode"], "PRACTICE")
+        self.assertEqual(acc_practice["balance"], 10000.0)
+        self.assertFalse(acc_practice["realTradingEnabled"])
+        self.assertEqual(client.change_balance_calls, [])
+
+        # User switches to REAL inside IQ Option app
+        client.mode = "REAL"
+        acc_real = app.account(fresh=True, x_connector_token=None)
+        self.assertEqual(acc_real["mode"], "REAL")
+        self.assertEqual(acc_real["accountType"], "REAL")
+        self.assertEqual(acc_real["balance"], 250.0)
+        self.assertTrue(acc_real["realTradingEnabled"])
+        self.assertEqual(client.change_balance_calls, [])
+
+        # Health also reflects REAL automatically
+        h_real = asyncio.run(app.health(mode=None, x_iq_mode="AUTO"))
+        self.assertTrue(h_real["connected"])
+        self.assertEqual(h_real["mode"], "REAL")
+        self.assertTrue(h_real["realTradingEnabled"])
+
+        # Order routed with expectedMode=REAL executes cleanly in REAL without switching
+        req = app.OrderRequest(
+            symbol="EURUSD",
+            direction="PUT",
+            amount=5.0,
+            expirySeconds=60,
+            expectedMode="REAL",
+            idempotencyKey="real-mode-order-1",
+        )
+        res = app.place_order(req, x_connector_token=None)
+        self.assertTrue(res["accepted"])
+        self.assertEqual(res["mode"], "REAL")
+        self.assertEqual(client.buy_calls[-1][4], "REAL")
+        self.assertEqual(client.change_balance_calls, [])
+
+    def test_full_practice_trade_lifecycle_open_monitor_close_and_history(self):
+        """End-to-end connector test: open PRACTICE trade -> list active position -> close trade -> verify history sync."""
+        client = FakeIqClient(initial_mode="PRACTICE")
+        app._client = client
+
+        # 1. Open trade in PRACTICE
+        order_res = app.place_order(
+            app.OrderRequest(
+                symbol="EURUSD",
+                direction="CALL",
+                amount=20.0,
+                expirySeconds=180,
+                expectedMode="PRACTICE",
+                idempotencyKey="lifecycle-1",
+            ),
+            x_connector_token=None,
+        )
+        self.assertTrue(order_res["accepted"])
+        oid = order_res["brokerOrderId"]
+        self.assertEqual(order_res["mode"], "PRACTICE")
+
+        # 2. Monitor active positions
+        pos_res = app.positions(x_connector_token=None)
+        self.assertTrue(pos_res["supported"])
+        self.assertEqual(pos_res["mode"], "PRACTICE")
+        self.assertEqual(len(pos_res["positions"]), 1)
+        self.assertEqual(pos_res["positions"][0]["ticket"], oid)
+        self.assertEqual(pos_res["positions"][0]["symbol"], "EURUSD")
+
+        # 3. Check single order status while open
+        st_open = app.order_status(oid, x_connector_token=None)
+        self.assertIn(st_open["status"], ("OPEN", "FILLED"))
+        self.assertEqual(st_open["brokerOrderId"], oid)
+
+        # 4. Close trade
+        close_res = app.close_position(oid, x_connector_token=None)
+        self.assertTrue(close_res["closed"])
+        self.assertEqual(close_res["status"], "CLOSED")
+        self.assertEqual(close_res["mode"], "PRACTICE")
+        self.assertEqual(len(client.sell_calls), 1)
+
+        # 5. Active positions list is now empty
+        pos_after = app.positions(x_connector_token=None)
+        self.assertEqual(len(pos_after["positions"]), 0)
+
+        # 6. History contains both IQ Option closed history and settled tracked order
+        client.option_outcomes["101"] = {
+            "id": 101,
+            "active": "EURUSD",
+            "direction": "call",
+            "amount": 10.0,
+            "win_amount": 18.0,
+            "profit_amount": 8.0,
+            "close_time": 1700000000,
+        }
+        hist = app.history(x_connector_token=None)
+        self.assertTrue(hist["supported"])
+        ids = [str(t.get("id")) for t in hist["trades"]]
+        self.assertIn("101", ids)
+        self.assertIn(oid, ids)
+
+    def test_transient_timeout_preserves_alive_client_session(self):
+        """A single transient timeout reading balance must NOT tear down a healthy alive WebSocket session."""
+        release_event = threading.Event()
+        calls = {"count": 0}
+
+        class FlakyOnceClient(FakeIqClient):
+            def get_balance(self):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    release_event.wait(timeout=2.0)
+                return 7428.71
+
+        orig_timeout = app._BALANCE_TIMEOUT
+        app._BALANCE_TIMEOUT = 0.05
+        client = FlakyOnceClient(initial_mode="PRACTICE")
+        app._client = client
+        try:
+            with self.assertRaises(app.HTTPException) as ctx:
+                app.balance(fresh=True, x_connector_token=None)
+            self.assertEqual(ctx.exception.status_code, 504)
+            # Crucially, _client must still be preserved because check_connect() is still alive!
+            self.assertIs(app._client, client)
+
+            # Subsequent call succeeds immediately using the preserved session
+            ok_bal = app.balance(fresh=True, x_connector_token=None)
+            self.assertEqual(ok_bal["balance"], 7428.71)
+            self.assertEqual(ok_bal["mode"], "PRACTICE")
+        finally:
+            release_event.set()
+            app._BALANCE_TIMEOUT = orig_timeout
+
+
+    def test_flexible_trade_duration_and_stake_limit(self):
+        client = FakeIqClient(initial_mode="PRACTICE")
+        app._client = client
+
+        # 1-minute (60s) duration -> duration_min = 1
+        req_1m = app.OrderRequest(
+            symbol="EURUSD",
+            direction="CALL",
+            amount=25.0,
+            expirySeconds=60,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-flex-1m",
+        )
+        res_1m = app.place_order(req_1m, x_connector_token=None)
+        self.assertTrue(res_1m["accepted"])
+        self.assertEqual(res_1m["expirySeconds"], 60)
+        self.assertEqual(client.buy_calls[-1][3], 1, "1-minute trade must pass duration_min=1 to IQ Option")
+
+        # 5-minute (300s) duration -> duration_min = 5
+        req_5m = app.OrderRequest(
+            symbol="EURUSD",
+            direction="CALL",
+            amount=50.0,
+            expirySeconds=300,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-flex-5m",
+        )
+        res_5m = app.place_order(req_5m, x_connector_token=None)
+        self.assertTrue(res_5m["accepted"])
+        self.assertEqual(res_5m["expirySeconds"], 300)
+        self.assertEqual(client.buy_calls[-1][3], 5, "5-minute trade must pass duration_min=5 to IQ Option")
+
+        # 15-minute (900s) duration -> duration_min = 15
+        req_15m = app.OrderRequest(
+            symbol="EURUSD",
+            direction="PUT",
+            amount=100.0,
+            expirySeconds=900,
+            expectedMode="PRACTICE",
+            idempotencyKey="test-flex-15m",
+        )
+        res_15m = app.place_order(req_15m, x_connector_token=None)
+        self.assertTrue(res_15m["accepted"])
+        self.assertEqual(res_15m["expirySeconds"], 900)
+        self.assertEqual(client.buy_calls[-1][3], 15, "15-minute trade must pass duration_min=15 to IQ Option")
+        self.assertEqual(res_15m["amount"], 100.0, "Stake of exactly $100 must be supported")
 
 
 if __name__ == "__main__":

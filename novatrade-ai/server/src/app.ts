@@ -181,20 +181,24 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       if (signal.direction !== 'CALL' && signal.direction !== 'PUT') return;
       const assetMeta = getAssetDefinition(signal.symbol);
       const actUid = uid === 'local-preview' ? undefined : uid;
+      const { accounts } = await brokerManager.listAccounts(uid);
+      const targetAccount = accounts.find((a) => a.id === targetAccountId);
+      const autoOrderType = targetAccount?.brokerId === 'iq_option' ? 'BINARY_FIXED_EXPIRY' : 'MARKET';
+      const targetBrokerLabel = targetAccount?.brokerName || 'broker';
       try {
         const validation = await brokerManager.validateDemoOrder(uid, {
           accountId: targetAccountId,
           symbol: signal.symbol,
           assetClass: assetMeta.instrumentType,
           direction: signal.direction,
-          orderType: 'MARKET',
+          orderType: autoOrderType,
           amount: stake,
           entryPrice: signal.entryPrice,
           expirySeconds: eng.resolveEffectiveExpirySeconds(signal),
           globalEmergencyStop: eng.riskSettings.emergencyStop,
         });
         if (!validation.valid) {
-          eng.logActivity('BROKER', 'AUTO_BROKER_SKIPPED', `Auto MT5 demo order skipped (${signal.symbol}): ${validation.reason}`, actUid);
+          eng.logActivity('BROKER', 'AUTO_BROKER_SKIPPED', `Auto ${targetBrokerLabel} order skipped (${signal.symbol}): ${validation.reason}`, actUid);
           return;
         }
         const routed = await brokerManager.executeDemoOrder(uid, {
@@ -202,7 +206,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
           symbol: signal.symbol,
           assetClass: assetMeta.instrumentType,
           direction: signal.direction,
-          orderType: 'MARKET',
+          orderType: autoOrderType,
           amount: stake,
           entryPrice: signal.entryPrice,
           expirySeconds: eng.resolveEffectiveExpirySeconds(signal),
@@ -212,15 +216,15 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         });
         eng.logActivity(
           'BROKER',
-          routed.duplicatePrevented ? 'AUTO_BROKER_DUPLICATE_PREVENTED' : 'AUTO_BROKER_DEMO_ORDER',
-          `Auto routed ${routed.order.direction} ${routed.order.mappedSymbol} to ${routed.order.brokerName} (${routed.order.status})`,
+          routed.duplicatePrevented ? 'AUTO_BROKER_DUPLICATE_PREVENTED' : 'AUTO_BROKER_ORDER',
+          `Auto routed ${routed.order.direction} ${routed.order.mappedSymbol} to ${routed.order.brokerName} (${routed.order.environment.toUpperCase()} / ${routed.order.status})`,
           actUid
         );
       } catch (err) {
         eng.logActivity(
           'BROKER',
           'AUTO_BROKER_ORDER_BLOCKED',
-          err instanceof Error ? err.message : 'Automatic demo order blocked.',
+          err instanceof Error ? err.message : 'Automatic broker order blocked.',
           actUid
         );
       }
@@ -553,7 +557,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       mt5DemoOrderPlacement: true,
       mt5RealOrderPlacement: false as const,
       iqOptionReadInspection: true,
-      iqOptionOrderExecutionSupported: false as const,
+      iqOptionOrderExecutionSupported: Boolean(iqCfg.urlValid),
     };
 
     if (authRequired && !user.userId) {
@@ -613,7 +617,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         mt5DemoConnected: brokerSummary.mt5DemoConnected,
         mt5RealConnected: brokerSummary.mt5RealConnected,
         iqOptionConnected: brokerSummary.iqDemoConnected || brokerSummary.iqRealConnected,
-        iqOptionOrderExecutionSupported: false as const,
+        iqOptionOrderExecutionSupported: Boolean(iqCfg.urlValid),
       },
     });
   };
@@ -1368,10 +1372,10 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       symbol: z.string().regex(/^[A-Z0-9_-]{3,20}$/),
       timeframe: z.enum(['1m', '5m', '15m', '1h']).optional(),
       direction: z.enum(['CALL', 'PUT']),
-      amount: z.number().positive().max(100000),
+      amount: z.number().positive().max(100),
       dailyLossLimit: z.number().positive().max(1000000).optional(),
       entryPrice: z.number().positive().nullable().optional(),
-      expirySeconds: z.number().int().min(30).max(3600).optional(),
+      expirySeconds: z.number().int().min(30).max(86400).optional(),
       mode: z.enum(['signals', 'assisted', 'automatic', 'manual']).optional(),
     });
     const parsed = schema.safeParse(req.body);
@@ -1383,6 +1387,12 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       if (latest.ok) entryPrice = latest.currentPrice;
     }
 
+    let resolvedExpiry = parsed.data.expirySeconds;
+    if (!resolvedExpiry) {
+      const signal = ws.engine.signals.find((s) => s.symbol === parsed.data.symbol);
+      resolvedExpiry = signal ? ws.engine.resolveEffectiveExpirySeconds(signal) : 60;
+    }
+
     const uid = ws.userId || 'local-preview';
     await brokerManager.ensureHydrated(uid);
     const result = ws.engine.openPaperTrade({
@@ -1392,7 +1402,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       amount: parsed.data.amount,
       mode: parsed.data.mode ?? 'manual',
       entryPrice,
-      expirySeconds: parsed.data.expirySeconds,
+      expirySeconds: resolvedExpiry,
       pendingOutcome: true,
       userId: ws.userId,
       accountBucket: brokerManager.getActiveAccountBucket(uid),
@@ -1461,7 +1471,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
     const schema = z.object({
-      maxTradeAmount: z.number().positive().max(100000),
+      maxTradeAmount: z.number().positive().max(100),
       dailyLossLimit: z.number().positive().max(1000000),
       dailyProfitTarget: z.number().positive().max(1000000),
       maxConsecutiveLosses: z.number().int().min(1).max(20),
@@ -1782,6 +1792,26 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
+  router.post('/brokers/accounts/cleanup-duplicates', async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
+    const userId = ws.userId || 'local-preview';
+    try {
+      const result = await brokerManager.cleanupStaleIqDuplicates(userId);
+      if (result.removedIds.length > 0) {
+        ws.engine.logActivity(
+          'BROKER',
+          'BROKER_STALE_DUPLICATES_CLEANED',
+          `Removed ${result.removedIds.length} stale duplicate IQ Option record(s). Preserved authoritative account ${result.keptAccountId || 'none'}.`,
+          ws.userId
+        );
+      }
+      return res.json(result);
+    } catch (err) {
+      return res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to clean up stale IQ Option duplicates.' });
+    }
+  });
+
   router.delete('/brokers/accounts/:accountId', async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
@@ -1934,9 +1964,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       symbol: z.string().min(2).max(20),
       direction: z.enum(['CALL', 'PUT']),
       orderType: z.enum(['MARKET', 'LIMIT', 'BINARY_FIXED_EXPIRY']).default('MARKET'),
-      amount: z.number().min(1).max(100000),
+      amount: z.number().min(1).max(100),
       entryPrice: z.number().positive().nullable().optional(),
-      expirySeconds: z.number().int().min(30).max(86400).default(180),
+      expirySeconds: z.number().int().min(30).max(86400).optional(),
       idempotencyKey: z.string().min(4).max(100).optional(),
       source: z.enum(['assisted', 'automatic', 'manual']).default('manual'),
     });
@@ -1950,13 +1980,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       return res.status(404).json({ executed: false, error: 'Selected broker account not found.' });
     }
     const requestedEnv = parsed.data.environment ?? targetAcct.environment;
-    if (requestedEnv === 'real' && targetAcct.brokerId !== 'mt5') {
-      return res.status(423).json({
-        executed: false,
-        error: 'Real-money orders are locked for IQ Option. Only MetaTrader 5 (MT5) Real accounts support real execution.',
-      });
-    }
-    if (requestedEnv !== targetAcct.environment) {
+    if (targetAcct.brokerId !== 'iq_option' && requestedEnv !== targetAcct.environment) {
       return res.status(409).json({
         executed: false,
         error: `Environment mismatch: account "${targetAcct.label}" is configured as ${targetAcct.environment.toUpperCase()}, not ${requestedEnv.toUpperCase()}.`,
@@ -1971,6 +1995,12 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       });
     }
 
+    let resolvedExpiry = parsed.data.expirySeconds;
+    if (!resolvedExpiry) {
+      const signal = ws.engine.signals.find((s) => s.symbol === parsed.data.symbol);
+      resolvedExpiry = signal ? ws.engine.resolveEffectiveExpirySeconds(signal) : 60;
+    }
+
     const assetMeta = getAssetDefinition(parsed.data.symbol);
     try {
       const result = await brokerManager.executeDemoOrder(userId, {
@@ -1981,7 +2011,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
         orderType: parsed.data.orderType,
         amount: parsed.data.amount,
         entryPrice: parsed.data.entryPrice ?? null,
-        expirySeconds: parsed.data.expirySeconds,
+        expirySeconds: resolvedExpiry,
         idempotencyKey: parsed.data.idempotencyKey,
         source: parsed.data.source,
         globalEmergencyStop: ws.engine.riskSettings.emergencyStop,
@@ -2054,6 +2084,26 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
     }
   });
 
+  router.post('/brokers/accounts/:accountId/positions/:ticket/close', tradingLimiter, async (req, res) => {
+    const ws = await resolveWorkspace(req, res, true);
+    if (!ws) return;
+    const userId = ws.userId || 'local-preview';
+    try {
+      const result = await brokerManager.closeAccountPosition(userId, req.params.accountId, req.params.ticket);
+      ws.engine.ingestBrokerOutcomes(brokerManager.getSettledOrderLearnables(userId));
+      ws.engine.logActivity(
+        'BROKER',
+        result.closed ? 'BROKER_POSITION_CLOSED' : 'BROKER_POSITION_CLOSE_UNCONFIRMED',
+        `${result.message} (Ticket ${result.brokerOrderId})`,
+        ws.userId
+      );
+      return res.json({ ...result, ticket: result.brokerOrderId });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to close position.';
+      return res.status(msg.toLowerCase().includes('not found') ? 404 : 424).json({ closed: false, error: msg });
+    }
+  });
+
   router.get('/brokers/accounts/:accountId/assets', async (req, res) => {
     const ws = await resolveWorkspace(req, res, true);
     if (!ws) return;
@@ -2077,9 +2127,9 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       symbol: z.string().min(2).max(20),
       direction: z.enum(['CALL', 'PUT']),
       orderType: z.enum(['MARKET', 'LIMIT', 'BINARY_FIXED_EXPIRY']).default('MARKET'),
-      amount: z.number().min(1).max(100000),
+      amount: z.number().min(1).max(100),
       entryPrice: z.number().positive().nullable().optional(),
-      expirySeconds: z.number().int().min(30).max(86400).default(180),
+      expirySeconds: z.number().int().min(30).max(86400).optional(),
     });
     const parsed = schema.safeParse(req.body ?? {});
     if (!parsed.success) {
@@ -2091,20 +2141,20 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       return res.status(404).json({ valid: false, compatible: false, reason: 'Selected broker account not found.' });
     }
     const requestedEnv = parsed.data.environment ?? targetAcct.environment;
-    if (requestedEnv === 'real' && targetAcct.brokerId !== 'mt5') {
-      return res.status(423).json({
-        valid: false,
-        compatible: false,
-        reason: 'Real-money orders are locked for IQ Option. Only MetaTrader 5 (MT5) supports Demo or Real orders.',
-      });
-    }
-    if (requestedEnv !== targetAcct.environment) {
+    if (targetAcct.brokerId !== 'iq_option' && requestedEnv !== targetAcct.environment) {
       return res.status(409).json({
         valid: false,
         compatible: false,
         reason: `Environment mismatch: account "${targetAcct.label}" is configured as ${targetAcct.environment.toUpperCase()}.`,
       });
     }
+
+    let resolvedExpiry = parsed.data.expirySeconds;
+    if (!resolvedExpiry) {
+      const signal = ws.engine.signals.find((s) => s.symbol === parsed.data.symbol);
+      resolvedExpiry = signal ? ws.engine.resolveEffectiveExpirySeconds(signal) : 60;
+    }
+
     const assetMeta = getAssetDefinition(parsed.data.symbol);
     const validation = await brokerManager.validateDemoOrder(userId, {
       accountId: parsed.data.accountId,
@@ -2114,7 +2164,7 @@ export function createNovaTradeRouter(options: CreateServerOptions = {}) {
       orderType: parsed.data.orderType,
       amount: parsed.data.amount,
       entryPrice: parsed.data.entryPrice ?? null,
-      expirySeconds: parsed.data.expirySeconds,
+      expirySeconds: resolvedExpiry,
       globalEmergencyStop: ws.engine.riskSettings.emergencyStop,
     });
     return res.json({ validation });

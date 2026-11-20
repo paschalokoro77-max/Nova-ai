@@ -774,16 +774,101 @@ export class BrokerConnectionManager {
     }
   }
 
+  findAuthoritativeIqAccountId(store: UserBrokerStore): string | null {
+    const iqAccounts = store.accounts.filter((a) => a.brokerId === 'iq_option');
+    if (iqAccounts.length === 0) return null;
+    const score = (a: StoredAccountInternal): number => {
+      let s = 0;
+      if (a.connected) s += 1000;
+      if (a.credentialSource === 'user_vault') s += 200;
+      else if (a.credentialSource === 'server_env') s += 50;
+      if (typeof a.balance === 'number' && Number.isFinite(a.balance)) s += 100;
+      if (a.status === 'CONNECTED') s += 100;
+      return s;
+    };
+    const sorted = [...iqAccounts].sort((a, b) => {
+      const diff = score(b) - score(a);
+      if (diff !== 0) return diff;
+      const ta = new Date(a.lastSyncedAt || a.updatedAt || a.createdAt).getTime() || 0;
+      const tb = new Date(b.lastSyncedAt || b.updatedAt || b.createdAt).getTime() || 0;
+      return tb - ta;
+    });
+    return sorted[0]?.id ?? null;
+  }
+
   async listAccounts(
     userId: string
   ): Promise<{ activeAccountId: string | null; autoExecuteBrokerDemo: boolean; accounts: ManagedBrokerAccountPublic[] }> {
     const store = await this.ensureHydrated(userId);
-    const list = await Promise.all(store.accounts.map((a) => this.toPublicAccount(a)));
+    const authIqId = this.findAuthoritativeIqAccountId(store);
+    const list = await Promise.all(
+      store.accounts.map(async (a) => {
+        const pub = await this.toPublicAccount(a);
+        if (a.brokerId === 'iq_option') {
+          pub.isAuthoritative = a.id === authIqId;
+          pub.isStaleDuplicate = a.id !== authIqId && !a.connected;
+        }
+        return pub;
+      })
+    );
     return {
       activeAccountId: store.activeAccountId,
       autoExecuteBrokerDemo: Boolean(store.autoExecuteBrokerDemo),
       accounts: list,
     };
+  }
+
+  private findMatchingIqAccountForUpsert(
+    store: UserBrokerStore,
+    email?: string,
+    label?: string,
+    environment?: BrokerEnvironment
+  ): StoredAccountInternal | undefined {
+    const normalizedEmail = (email || '').trim().toLowerCase();
+    const iqAccounts = store.accounts.filter((a) => a.brokerId === 'iq_option');
+    if (iqAccounts.length === 0) return undefined;
+
+    if (normalizedEmail) {
+      const matches = iqAccounts.filter((a) => {
+        const decrypted = this.decryptCredentials(a.encryptedCredentials);
+        const storedEmail = (decrypted.email || '').trim().toLowerCase();
+        if (storedEmail && storedEmail === normalizedEmail) return true;
+        const lbl = (a.label || '').trim().toLowerCase();
+        return lbl === `iq option (${normalizedEmail})` || lbl === normalizedEmail;
+      });
+      if (matches.length > 0) {
+        if (environment) {
+          const envMatch = matches.find((a) => a.environment === environment);
+          if (envMatch) return envMatch;
+          const cleanLbl = (label || '').trim().toLowerCase();
+          const hasDifferentiatingLabel = cleanLbl && matches.every(
+            (a) => (a.label || '').trim().toLowerCase() !== cleanLbl
+          );
+          if (hasDifferentiatingLabel) {
+            return undefined;
+          }
+        }
+        // Prefer the currently connected / most recently synced record so login updates the authoritative account in place
+        matches.sort((a, b) => {
+          if (a.connected !== b.connected) return a.connected ? -1 : 1;
+          const ta = new Date(a.lastSyncedAt || a.updatedAt || a.createdAt).getTime() || 0;
+          const tb = new Date(b.lastSyncedAt || b.updatedAt || b.createdAt).getTime() || 0;
+          return tb - ta;
+        });
+        return matches[0];
+      }
+    }
+
+    // Prevent spawning duplicate empty/unconfigured "IQ Option Demo" shells
+    const cleanLabel = (label || '').trim().toLowerCase();
+    if (!normalizedEmail && cleanLabel) {
+      const shell = iqAccounts.find(
+        (a) => a.credentialSource === 'none' && (a.label || '').trim().toLowerCase() === cleanLabel
+      );
+      if (shell) return shell;
+    }
+
+    return undefined;
   }
 
   async createOrUpdateAccount(
@@ -806,6 +891,9 @@ export class BrokerConnectionManager {
     const store = await this.ensureHydrated(userId);
     const now = new Date().toISOString();
     let target = input.accountId ? store.accounts.find((a) => a.id === input.accountId) : undefined;
+    if (!target && input.brokerId === 'iq_option') {
+      target = this.findMatchingIqAccountForUpsert(store, input.credentials?.email, input.label, input.environment);
+    }
     const resolvedEnv: BrokerEnvironment = input.environment === 'real' ? 'real' : 'demo';
 
     if (!target) {
@@ -868,7 +956,49 @@ export class BrokerConnectionManager {
 
     this.saveStore(userId, store, false);
     await this.persistStoreToSupabase(userId, store);
-    return this.toPublicAccount(target);
+    const pub = await this.toPublicAccount(target);
+    if (target.brokerId === 'iq_option') {
+      const authIqId = this.findAuthoritativeIqAccountId(store);
+      pub.isAuthoritative = target.id === authIqId;
+      pub.isStaleDuplicate = target.id !== authIqId && !target.connected;
+    }
+    return pub;
+  }
+
+  /** Explicitly invoked (opt-in) cleanup of stale disconnected IQ Option duplicate records.
+   * Preserves the authoritative / connected IQ Option record untouched and never calls adapter.disconnect().
+   */
+  async cleanupStaleIqDuplicates(
+    userId: string
+  ): Promise<{ keptAccountId: string | null; removedIds: string[]; removedCount: number }> {
+    const store = await this.ensureHydrated(userId);
+    const authIqId = this.findAuthoritativeIqAccountId(store);
+    if (!authIqId) {
+      return { keptAccountId: null, removedIds: [], removedCount: 0 };
+    }
+
+    const removedIds: string[] = [];
+    store.accounts = store.accounts.filter((acct) => {
+      if (acct.brokerId !== 'iq_option') return true;
+      if (acct.id === authIqId) return true;
+      if (acct.connected) return true;
+      removedIds.push(acct.id);
+      return false;
+    });
+
+    if (removedIds.length > 0) {
+      if (store.activeAccountId && removedIds.includes(store.activeAccountId)) {
+        store.activeAccountId = authIqId;
+      }
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
+    }
+
+    return {
+      keptAccountId: authIqId,
+      removedIds,
+      removedCount: removedIds.length,
+    };
   }
 
   async deleteAccount(userId: string, accountId: string): Promise<boolean> {
@@ -902,7 +1032,7 @@ export class BrokerConnectionManager {
       throw new Error('Broker account not found for user.');
     }
     store.activeAccountId = acct.id;
-    if (acct.brokerId !== 'mt5' || !acct.connected) {
+    if (!acct.connected) {
       store.autoExecuteBrokerDemo = false;
     }
     this.saveStore(userId, store, false);
@@ -1040,7 +1170,7 @@ export class BrokerConnectionManager {
             accountType: active.accountType,
           }
         : null,
-      autoBrokerRoutingEnabled: Boolean(store.autoExecuteBrokerDemo && active && active.brokerId === 'mt5' && active.connected),
+      autoBrokerRoutingEnabled: Boolean(store.autoExecuteBrokerDemo && active && active.connected),
       mt5DemoConnected,
       mt5RealConnected,
       iqDemoConnected,
@@ -1062,30 +1192,31 @@ export class BrokerConnectionManager {
         enabled: false,
         activeAccountId: store.activeAccountId,
         reason: globalEmergencyStop
-          ? 'Emergency Stop engaged; automatic MT5 demo routing disarmed.'
-          : 'Automatic MT5 demo execution paused.',
+          ? 'Emergency Stop engaged; automatic broker routing disarmed.'
+          : 'Automatic broker execution paused.',
       };
     }
     if (!store.activeAccountId) {
-      throw new Error('Select a connected MetaTrader 5 (MT5) account as your Active Execution Target first.');
+      throw new Error('Select a connected broker account (IQ Option or MT5) as your Active Execution Target first.');
     }
     const acct = store.accounts.find((a) => a.id === store.activeAccountId);
-    if (!acct || !acct.connected || (acct.environment !== 'demo' && acct.brokerId !== 'mt5')) {
-      throw new Error('Active execution account must be a connected MT5 account (Demo or Real) or Practice Sandbox.');
+    if (!acct || !acct.connected) {
+      throw new Error('Active execution account must be a connected broker account.');
     }
     const adapter = this.registry.get(acct.brokerId);
     const caps = adapter ? await adapter.getCapabilities(this.toContext(acct)) : null;
     const supportsExecution = acct.environment === 'real' ? caps?.liveOrderPlacementSupported : caps?.demoOrderPlacementSupported;
     if (!supportsExecution) {
-      throw new Error(`${acct.label} is read-only and cannot receive automatic broker orders in ${acct.environment.toUpperCase()} mode.`);
+      throw new Error(`${acct.label} is not configured to receive automatic broker orders.`);
     }
     store.autoExecuteBrokerDemo = true;
     this.saveStore(userId, store, false);
     await this.persistStoreToSupabase(userId, store);
+    const modeLabel = acct.accountType || acct.environment.toUpperCase();
     return {
       enabled: true,
       activeAccountId: acct.id,
-      reason: `Validated AI signals will route guarded ${acct.environment.toUpperCase()} orders to ${acct.label} while Emergency Stop and risk limits stay clear.`,
+      reason: `Validated AI signals will route guarded ${modeLabel} orders to ${acct.label} while Emergency Stop and risk limits stay clear.`,
     };
   }
 
@@ -1144,8 +1275,11 @@ export class BrokerConnectionManager {
       acct.connected = res.connected;
       acct.status = res.connected ? 'CONNECTED' : 'AUTHENTICATION FAILED';
       acct.accountType = res.accountType;
-      acct.balance = res.connected ? validBalance : null;
-      acct.equity = res.connected ? validEquity : null;
+      if (acct.brokerId === 'iq_option' && res.connected && res.accountType) {
+        acct.environment = res.accountType.toUpperCase() === 'REAL' ? 'real' : 'demo';
+      }
+      acct.balance = res.connected ? (validBalance ?? acct.balance) : null;
+      acct.equity = res.connected ? (validEquity ?? acct.equity ?? acct.balance) : null;
       acct.currency = res.currency || acct.currency;
       acct.externalAccountId = res.externalAccountId ?? acct.externalAccountId;
       acct.lastError = res.connected ? null : res.message;
@@ -1157,15 +1291,14 @@ export class BrokerConnectionManager {
 
       let statusSnap: BrokerStatusSnapshot;
       if (acct.brokerId === 'iq_option' && res.connected) {
-        // Avoid redundant immediate /health + /account round-trip right after /connect already verified session & balance
-        const caps = await adapter.getCapabilities(ctx);
+        const caps = await adapter.getCapabilities(this.toContext(acct));
         statusSnap = {
           ...caps,
           connected: true,
-          executionEnabled: false,
+          executionEnabled: true,
           accountType: res.accountType,
-          balance: validBalance,
-          equity: validEquity,
+          balance: acct.balance,
+          equity: acct.equity,
           currency: res.currency || acct.currency,
           connectorUrlConfigured: true,
           lastCheckedAt: now,
@@ -1191,6 +1324,11 @@ export class BrokerConnectionManager {
       }
       void this.syncBrokerSummaryToSupabase(acct, statusSnap);
       const publicAccount = await this.toPublicAccount(acct, statusSnap.diagnostics, statusSnap);
+      if (acct.brokerId === 'iq_option') {
+        const authIqId = this.findAuthoritativeIqAccountId(store);
+        publicAccount.isAuthoritative = acct.id === authIqId;
+        publicAccount.isStaleDuplicate = acct.id !== authIqId && !acct.connected;
+      }
       if (!res.connected) {
         throw new BrokerConnectionError(res.message || 'Broker authentication failed.', {
           statusCode: 401,
@@ -1236,19 +1374,32 @@ export class BrokerConnectionManager {
           : 'AUTHENTICATION FAILED';
       const statusCode = isNotConfigured ? 422 : isGatewayOffline ? 424 : 401;
 
-      acct.connected = false;
-      acct.status = connectionStatus;
-      acct.balance = null;
-      acct.equity = null;
-      acct.lastError = msg;
-      acct.lastCheckedAt = now;
-      acct.updatedAt = now;
+      // Do not overwrite an already-healthy IQ Option session on a transient timeout/busy error
+      const isTransientTimeout =
+        acct.brokerId === 'iq_option' &&
+        acct.connected &&
+        isGatewayOffline &&
+        (lower.includes('timeout') || lower.includes('timed out') || lower.includes('busy') || lower.includes('aborted'));
+
+      if (isTransientTimeout) {
+        acct.lastError = `Temporary connector delay (${msg}); active session preserved.`;
+        acct.lastCheckedAt = now;
+        acct.updatedAt = now;
+      } else {
+        acct.connected = false;
+        acct.status = connectionStatus;
+        acct.balance = null;
+        acct.equity = null;
+        acct.lastError = msg;
+        acct.lastCheckedAt = now;
+        acct.updatedAt = now;
+      }
       this.saveStore(userId, store, false);
       await this.persistStoreToSupabase(userId, store);
       const publicAccount = await this.toPublicAccount(acct);
       throw new BrokerConnectionError(msg, {
         statusCode,
-        connectionStatus,
+        connectionStatus: isTransientTimeout ? 'CONNECTED' : connectionStatus,
         account: publicAccount,
       });
     }
@@ -1259,7 +1410,16 @@ export class BrokerConnectionManager {
     const acct = store.accounts.find((a) => a.id === accountId);
     if (!acct) throw new Error('Broker account not found.');
     const adapter = this.registry.get(acct.brokerId);
-    if (adapter) {
+
+    // Protect the active IQ Option session: stale/disconnected duplicate cards must NEVER disconnect the live connector
+    const otherConnectedIq =
+      acct.brokerId === 'iq_option' &&
+      store.accounts.some((a) => a.brokerId === 'iq_option' && a.id !== acct.id && a.connected);
+    const shouldCallRemoteDisconnect =
+      Boolean(adapter) &&
+      (acct.brokerId !== 'iq_option' || (acct.connected && !otherConnectedIq));
+
+    if (adapter && shouldCallRemoteDisconnect) {
       await adapter.disconnect(this.toContext(acct)).catch(() => undefined);
     }
     acct.connected = false;
@@ -1301,33 +1461,61 @@ export class BrokerConnectionManager {
 
     const snap = await adapter.getStatus(this.toContext(acct));
     const now = new Date().toISOString();
-    acct.connected = snap.connected;
-    acct.status = snap.connected
-      ? 'CONNECTED'
-      : !snap.connectorConfigured
-        ? 'NOT CONFIGURED'
-        : !snap.diagnostics?.reachable
-          ? 'GATEWAY OFFLINE'
-          : snap.diagnostics?.lastConnectorError
-            ? 'AUTHENTICATION FAILED'
-            : 'GATEWAY ONLINE';
-    acct.accountType = snap.connected ? (snap.accountType ?? acct.accountType) : null;
-    const nextBalance = toFiniteBalance(snap.balance);
-    const nextEquity = toFiniteBalance(snap.equity) ?? nextBalance;
-    acct.balance = snap.connected ? nextBalance : null;
-    acct.equity = snap.connected ? nextEquity : null;
-    acct.currency = snap.currency ?? acct.currency;
-    acct.lastCheckedAt = now;
-    if (snap.connected) acct.lastSyncedAt = now;
-    acct.lastError = snap.diagnostics?.lastConnectorError || (snap.connected ? null : snap.message);
-    acct.updatedAt = now;
-    if (!acct.connected && store.activeAccountId === acct.id) {
-      store.autoExecuteBrokerDemo = false;
+    const errLower = (snap.diagnostics?.lastConnectorError || snap.message || '').toLowerCase();
+    const recentSyncAgeMs = acct.lastSyncedAt ? Date.now() - new Date(acct.lastSyncedAt).getTime() : Infinity;
+
+    // A temporary timeout must NOT overwrite a healthy authenticated IQ Option session
+    const isTransientUnreachableOnHealthy =
+      acct.brokerId === 'iq_option' &&
+      acct.connected &&
+      !snap.connected &&
+      !snap.diagnostics?.reachable &&
+      recentSyncAgeMs < 90_000 &&
+      (errLower.includes('timeout') || errLower.includes('timed out') || errLower.includes('aborted') || errLower.includes('busy') || errLower.includes('http 50'));
+
+    if (isTransientUnreachableOnHealthy) {
+      acct.lastCheckedAt = now;
+      acct.lastError = `Temporary connector timeout (${snap.diagnostics?.lastConnectorError || 'delayed response'}); healthy session preserved.`;
+      acct.updatedAt = now;
+    } else {
+      acct.connected = snap.connected;
+      acct.status = snap.connected
+        ? 'CONNECTED'
+        : !snap.connectorConfigured
+          ? 'NOT CONFIGURED'
+          : !snap.diagnostics?.reachable
+            ? 'GATEWAY OFFLINE'
+            : snap.diagnostics?.lastConnectorError
+              ? 'AUTHENTICATION FAILED'
+              : 'GATEWAY ONLINE';
+      acct.accountType = snap.connected ? (snap.accountType ?? acct.accountType) : null;
+      if (acct.brokerId === 'iq_option' && snap.connected && acct.accountType) {
+        acct.environment = acct.accountType.toUpperCase() === 'REAL' ? 'real' : 'demo';
+      }
+      const nextBalance = toFiniteBalance(snap.balance);
+      const nextEquity = toFiniteBalance(snap.equity) ?? nextBalance;
+      // Preserve last valid balance if connected session had a temporary balance-read timeout
+      acct.balance = snap.connected ? (nextBalance ?? acct.balance) : null;
+      acct.equity = snap.connected ? (nextEquity ?? acct.equity ?? acct.balance) : null;
+      acct.currency = snap.currency ?? acct.currency;
+      acct.lastCheckedAt = now;
+      if (snap.connected) acct.lastSyncedAt = now;
+      acct.lastError = snap.diagnostics?.lastConnectorError || (snap.connected ? null : snap.message);
+      acct.updatedAt = now;
+      if (!acct.connected && store.activeAccountId === acct.id) {
+        store.autoExecuteBrokerDemo = false;
+      }
     }
     this.saveStore(userId, store, false);
     await this.persistStoreToSupabase(userId, store);
     void this.syncBrokerSummaryToSupabase(acct, snap);
-    return this.toPublicAccount(acct, snap.diagnostics, snap);
+    const pub = await this.toPublicAccount(acct, snap.diagnostics, snap);
+    if (acct.brokerId === 'iq_option') {
+      const authIqId = this.findAuthoritativeIqAccountId(store);
+      pub.isAuthoritative = acct.id === authIqId;
+      pub.isStaleDuplicate = acct.id !== authIqId && !acct.connected;
+    }
+    return pub;
   }
 
   checkInstrumentCompatibilityForAccount(
@@ -1464,8 +1652,9 @@ export class BrokerConnectionManager {
     if (input.direction === 'PUT' && !limits.allowPut) {
       return fail(`Per-account risk guard: PUT/SELL direction is disabled on ${acct.label}.`, true);
     }
-    if (input.amount > limits.maxOrderAmount) {
-      return fail(`Stake ($${input.amount}) exceeds ${acct.label} maxOrderAmount ($${limits.maxOrderAmount}).`, true);
+    const effectiveMaxStake = Math.min(100, limits.maxOrderAmount);
+    if (input.amount > effectiveMaxStake) {
+      return fail(`Stake ($${input.amount}) exceeds the maximum allowed stake of $${effectiveMaxStake} per individual trade.`, true);
     }
     if (acct.dailyOrdersCount >= limits.maxDailyOrders) {
       return fail(`Daily order cap (${limits.maxDailyOrders}) reached on ${acct.label}.`, true);
@@ -1566,6 +1755,14 @@ export class BrokerConnectionManager {
       }
     }
 
+    const limits = acct.riskLimits;
+    const effectiveMaxStake = Math.min(100, limits.maxOrderAmount);
+    if (input.amount > effectiveMaxStake) {
+      throw new Error(
+        `Per-account risk limit: Stake ($${input.amount}) exceeds the maximum allowed stake of $${effectiveMaxStake} per individual trade.`
+      );
+    }
+
     const recentDup = store.orders.find(
       (o) =>
         o.accountId === acct.id &&
@@ -1598,17 +1795,11 @@ export class BrokerConnectionManager {
     }
 
     // 4. Per-account risk limit checks
-    const limits = acct.riskLimits;
     if (input.direction === 'CALL' && !limits.allowCall) {
       throw new Error(`Per-account risk guard: CALL/BUY direction is disabled on ${acct.label}.`);
     }
     if (input.direction === 'PUT' && !limits.allowPut) {
       throw new Error(`Per-account risk guard: PUT/SELL direction is disabled on ${acct.label}.`);
-    }
-    if (input.amount > limits.maxOrderAmount) {
-      throw new Error(
-        `Per-account risk limit: Stake ($${input.amount}) exceeds ${acct.label} maxOrderAmount ($${limits.maxOrderAmount}).`
-      );
     }
     if (acct.dailyOrdersCount >= limits.maxDailyOrders) {
       throw new Error(
@@ -1629,29 +1820,37 @@ export class BrokerConnectionManager {
       );
     }
 
+    const effectiveOrderType: BrokerOrderType =
+      acct.brokerId === 'iq_option' ? 'BINARY_FIXED_EXPIRY' : input.orderType;
+
     const orderPayload: BrokerOrderRequest = {
       environment: acct.environment,
       symbol: input.symbol,
       mappedSymbol: compat.mappedSymbol,
       assetClass: input.assetClass,
       direction: input.direction,
-      orderType: input.orderType,
+      orderType: effectiveOrderType,
       amount: input.amount,
       entryPrice: input.entryPrice,
       expirySeconds: input.expirySeconds,
       idempotencyKey,
     };
 
-    // 4b. Pre-flight broker order validation (e.g., MT5 mt5.order_check()) when supported
+    // 4b. Pre-flight broker order validation & live active mode sync
     if (adapter.validateOrder) {
       const preflight = await adapter.validateOrder(ctx, orderPayload);
       if (!preflight.valid) {
         throw new Error(`Order validation failed: ${preflight.reason}`);
       }
+      if (acct.brokerId === 'iq_option') {
+        acct.environment = preflight.environment;
+        acct.accountType = preflight.environment === 'real' ? 'REAL' : 'PRACTICE';
+        orderPayload.environment = preflight.environment;
+      }
     }
 
-    // 5. Execute order on broker adapter (Demo or Real for MT5)
-    const placement = await adapter.placeOrder(ctx, orderPayload);
+    // 5. Execute order on broker adapter (MT5 or IQ Option on verified live mode)
+    const placement = await adapter.placeOrder(this.toContext(acct), orderPayload);
 
     const record: BrokerOrderRecord = {
       id: crypto.randomUUID(),
@@ -1663,7 +1862,7 @@ export class BrokerConnectionManager {
       symbol: input.symbol.toUpperCase(),
       mappedSymbol: placement.mappedSymbol,
       direction: input.direction,
-      orderType: input.orderType,
+      orderType: effectiveOrderType,
       amount: input.amount,
       entryPrice: input.entryPrice,
       filledPrice: placement.filledPrice,
@@ -1687,6 +1886,49 @@ export class BrokerConnectionManager {
     await this.persistStoreToSupabase(userId, store);
 
     return { order: record, placement };
+  }
+
+  async closeAccountPosition(
+    userId: string,
+    accountId: string,
+    brokerOrderId: string
+  ): Promise<{
+    closed: boolean;
+    brokerOrderId: string;
+    status: string;
+    realizedPnl: number | null;
+    mode?: string | null;
+    message: string;
+    closedAt?: string | null;
+  }> {
+    const store = await this.ensureHydrated(userId);
+    const acct = store.accounts.find((a) => a.id === accountId);
+    if (!acct) throw new Error('Broker account not found.');
+    const adapter = this.registry.get(acct.brokerId);
+    if (!adapter?.closePosition) {
+      throw new Error(`${adapter?.brokerName || acct.brokerId} does not support closing open positions via API.`);
+    }
+    const res = await adapter.closePosition(this.toContext(acct), brokerOrderId);
+    if (res.closed) {
+      const ord = store.orders.find(
+        (o) => o.accountId === accountId && String(o.brokerOrderId) === String(brokerOrderId)
+      );
+      if (ord) {
+        ord.status = 'CLOSED';
+        if (typeof res.realizedPnl === 'number' && Number.isFinite(res.realizedPnl)) {
+          ord.realizedPnl = res.realizedPnl;
+          if (res.realizedPnl < 0) {
+            this.rollAccountDay(acct);
+            acct.dailySimulatedLoss = Number((acct.dailySimulatedLoss + Math.abs(res.realizedPnl)).toFixed(2));
+          }
+        }
+        ord.note = res.message;
+        ord.reconciledAt = res.closedAt || new Date().toISOString();
+      }
+      this.saveStore(userId, store, false);
+      await this.persistStoreToSupabase(userId, store);
+    }
+    return res;
   }
 
   async reconcileOrders(userId: string, accountId?: string): Promise<{ updatedCount: number; orders: BrokerOrderRecord[] }> {

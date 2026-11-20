@@ -21,7 +21,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title='NovaTrade IQ Option experimental connector', version='0.4.6')
+app = FastAPI(title='NovaTrade IQ Option connector', version='0.5.0')
 
 _WS_PRIMARY_URL = 'wss://iqoption.com/echo/websocket'
 _WS_FALLBACK_URL = 'wss://ws.iqoption.com/echo/websocket'
@@ -37,6 +37,9 @@ _CANDLES_TIMEOUT = float(os.environ.get('IQ_CANDLES_TIMEOUT_SECONDS', '7.0'))
 _MODE_TIMEOUT = float(os.environ.get('IQ_MODE_TIMEOUT_SECONDS', '5.0'))
 _HISTORY_TIMEOUT = float(os.environ.get('IQ_HISTORY_TIMEOUT_SECONDS', '6.0'))
 _ASSETS_TIMEOUT = float(os.environ.get('IQ_ASSETS_TIMEOUT_SECONDS', '8.0'))
+_ORDER_TIMEOUT = float(os.environ.get('IQ_ORDER_TIMEOUT_SECONDS', '8.0'))
+_POSITIONS_TIMEOUT = float(os.environ.get('IQ_POSITIONS_TIMEOUT_SECONDS', '6.0'))
+_BALANCE_CACHE_TTL_SECONDS = float(os.environ.get('IQ_BALANCE_CACHE_TTL_SECONDS', '2.5'))
 _CLOSE_TIMEOUT = 1.5
 _HTTP_CONNECT_TIMEOUT = float(os.environ.get('IQ_HTTP_CONNECT_TIMEOUT_SECONDS', '6.0'))
 _HTTP_TIMEOUT = float(os.environ.get('IQ_HTTP_READ_TIMEOUT_SECONDS', '10.0'))
@@ -52,13 +55,18 @@ _last_connect_stage: Optional[str] = None
 _last_connect_duration_ms: Optional[float] = None
 _last_error: Optional[str] = None
 _connected_at: Optional[float] = None
-_requested_mode: str = 'PRACTICE'
+_requested_mode: str = 'AUTO'
 _confirmed_mode: str = 'PRACTICE'
 _mode_verified: bool = False
+_active_balance_id: Any = None
+_active_currency: str = 'USD'
 _active_ws_url: Optional[str] = None
 _active_ws_via_proxy: bool = False
 _last_ws_diagnostics: Optional[List[dict]] = None
 _last_candle_check: Optional[dict] = None
+_last_balance_cache: Optional[dict] = None
+_tracked_orders: Dict[str, dict] = {}
+_idempotency_index: Dict[str, str] = {}
 _opcodes_updated: bool = False
 _iqoptionapi_patched: bool = False
 
@@ -288,8 +296,8 @@ async def _unhandled_exception_handler(_request: Request, exc: Exception):
         status_code=502,
         content={
             'detail': f'IQ Option connector internal error ({type(exc).__name__}).',
-            'orderExecutionSupported': False,
-            'realTradingEnabled': False,
+            'orderExecutionSupported': True,
+            'modeFollowsBroker': True,
         },
     )
 
@@ -411,17 +419,26 @@ def _safe_close_client(client: Any, timeout_seconds: Optional[float] = None, res
                 pass
 
 
+def _invalidate_balance_cache():
+    global _last_balance_cache
+    with _state_lock:
+        _last_balance_cache = None
+
+
 def _invalidate_client(reason: Optional[str] = None, cancel_inflight: bool = False):
-    global _client, _connected_at, _mode_verified, _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_error, _session_generation
+    global _client, _connected_at, _mode_verified, _active_balance_id, _active_ws_url, _active_ws_via_proxy
+    global _opcodes_updated, _last_error, _session_generation, _last_balance_cache
     with _state_lock:
         _session_generation += 1
         old_client = _client
         _client = None
         _connected_at = None
         _mode_verified = False
+        _active_balance_id = None
         _active_ws_url = None
         _active_ws_via_proxy = False
         _opcodes_updated = False
+        _last_balance_cache = None
         if reason:
             _last_error = _sanitize_error(reason)
         if cancel_inflight and _inflight_connect is not None:
@@ -1351,15 +1368,27 @@ def _patch_iqoptionapi():
                     self.api.close(reset_globals=False)
                     return False, 'Connection attempt cancelled after timeout.'
                 profile_msg = getattr(getattr(self.api, 'profile', None), 'msg', None)
-                if isinstance(profile_msg, dict) and isinstance(profile_msg.get('balances'), list):
-                    for bal in profile_msg['balances']:
-                        if isinstance(bal, dict) and bal.get('type') == 4 and bal.get('id') is not None:
-                            global_value.balance_id = bal['id']
-                            break
-                    if global_value.balance_id is None and profile_msg['balances']:
-                        first = profile_msg['balances'][0]
-                        if isinstance(first, dict) and first.get('id') is not None:
-                            global_value.balance_id = first['id']
+                if isinstance(profile_msg, dict):
+                    # Follow IQ Option's own active selected balance_id first (NEVER override user's REAL/PRACTICE choice!)
+                    active_bal_id = profile_msg.get('balance_id')
+                    if active_bal_id is not None:
+                        global_value.balance_id = active_bal_id
+                    elif isinstance(profile_msg.get('balances'), list):
+                        pref_type = profile_msg.get('balance_type')
+                        if pref_type in (1, 4):
+                            for bal in profile_msg['balances']:
+                                if isinstance(bal, dict) and bal.get('type') == pref_type and bal.get('id') is not None:
+                                    global_value.balance_id = bal['id']
+                                    break
+                        if global_value.balance_id is None:
+                            for bal in profile_msg['balances']:
+                                if isinstance(bal, dict) and bal.get('type') == 4 and bal.get('id') is not None:
+                                    global_value.balance_id = bal['id']
+                                    break
+                        if global_value.balance_id is None and profile_msg['balances']:
+                            first = profile_msg['balances'][0]
+                            if isinstance(first, dict) and first.get('id') is not None:
+                                global_value.balance_id = first['id']
                 if global_value.balance_id is not None:
                     break
                 if global_value.check_websocket_if_connect == 0 or global_value.check_websocket_if_error:
@@ -1432,17 +1461,50 @@ class ConnectBody(BaseModel):
     mode: Optional[str] = None
 
 
+class OrderRequest(BaseModel):
+    symbol: str = Field(..., min_length=3, max_length=25)
+    direction: str = Field(..., min_length=3, max_length=6)
+    amount: float = Field(..., gt=0, le=100000)
+    expirySeconds: int = Field(default=60, ge=30, le=86400)
+    instrumentType: str = Field(default='auto')
+    expectedMode: Optional[str] = None
+    idempotencyKey: Optional[str] = None
+
+    @field_validator('symbol', mode='before')
+    @classmethod
+    def _clean_symbol(cls, v: Any) -> str:
+        return str(v or '').strip().upper().replace('/', '')
+
+    @field_validator('direction', mode='before')
+    @classmethod
+    def _clean_direction(cls, v: Any) -> str:
+        raw = str(v or '').strip().upper()
+        if raw in ('CALL', 'BUY'):
+            return 'CALL'
+        if raw in ('PUT', 'SELL'):
+            return 'PUT'
+        raise ValueError('direction must be CALL/BUY or PUT/SELL.')
+
+    @field_validator('instrumentType', mode='before')
+    @classmethod
+    def _clean_instrument(cls, v: Any) -> str:
+        raw = str(v or 'auto').strip().lower()
+        return raw if raw in ('auto', 'binary', 'digital') else 'auto'
+
+
 def _normalize_mode(raw: Optional[str]) -> Optional[str]:
     if raw is None:
         return None
     val = str(raw).strip().upper()
     if not val:
         return None
+    if val in ('AUTO', 'FOLLOW', 'ACTIVE'):
+        return 'AUTO'
     if val in ('REAL', 'LIVE'):
         return 'REAL'
     if val in ('PRACTICE', 'DEMO'):
         return 'PRACTICE'
-    raise HTTPException(400, f'Unsupported IQ Option account mode "{raw}". Expected PRACTICE or REAL.')
+    raise HTTPException(400, f'Unsupported IQ Option account mode "{raw}". Expected AUTO, PRACTICE, or REAL.')
 
 
 def _resolve_target_mode(
@@ -1451,35 +1513,66 @@ def _resolve_target_mode(
     query_mode: Optional[str] = None,
 ) -> str:
     return (
-        _normalize_mode(x_iq_mode)
+        _normalize_mode(explicit_mode)
         or _normalize_mode(query_mode)
-        or _normalize_mode(explicit_mode)
-        or _requested_mode
+        or _normalize_mode(x_iq_mode)
+        or 'AUTO'
     )
 
 
-def _peek_balance_mode_nonblocking(client: Any, target_mode: str) -> Tuple[str, bool]:
-    """Read current balance mode strictly from in-memory state (never triggers WS I/O or waits)."""
+def _extract_mode_from_profile(profile_msg: Any) -> Tuple[Optional[str], Any, Optional[str]]:
+    """Inspect IQ Option profile payload to determine the user's currently selected mode, balance_id, and currency."""
+    if not isinstance(profile_msg, dict):
+        return (None, None, None)
+
+    bal_id = profile_msg.get('balance_id')
+    if bal_id is None:
+        try:
+            import iqoptionapi.global_value as global_value
+            bal_id = getattr(global_value, 'balance_id', None)
+        except Exception:
+            bal_id = None
+
+    balances = profile_msg.get('balances')
+    if isinstance(balances, list):
+        if bal_id is not None:
+            for bal in balances:
+                if isinstance(bal, dict) and bal.get('id') == bal_id:
+                    btype = bal.get('type')
+                    curr = str(bal.get('currency') or 'USD').upper()
+                    if btype == 1:
+                        return ('REAL', bal_id, curr)
+                    if btype == 4:
+                        return ('PRACTICE', bal_id, curr)
+        pref_type = profile_msg.get('balance_type')
+        if pref_type in (1, 4):
+            for bal in balances:
+                if isinstance(bal, dict) and bal.get('type') == pref_type:
+                    curr = str(bal.get('currency') or 'USD').upper()
+                    return ('REAL' if pref_type == 1 else 'PRACTICE', bal.get('id'), curr)
+
+    bal_type = profile_msg.get('balance_type')
+    if bal_type == 1:
+        return ('REAL', bal_id, str(profile_msg.get('currency') or 'USD').upper())
+    if bal_type == 4:
+        return ('PRACTICE', bal_id, str(profile_msg.get('currency') or 'USD').upper())
+    return (None, bal_id, None)
+
+
+def _peek_balance_mode_nonblocking(client: Any, target_mode: str = 'AUTO') -> Tuple[str, bool]:
+    """Read current IQ Option active balance mode strictly from in-memory state (never triggers WS I/O or waits)."""
     if client is None:
-        return (target_mode, False)
+        return ('UNVERIFIED', False)
 
     api = getattr(client, 'api', None)
     if api is not None:
         profile_msg = getattr(getattr(api, 'profile', None), 'msg', None)
-        if isinstance(profile_msg, dict) and isinstance(profile_msg.get('balances'), list):
-            try:
-                import iqoptionapi.global_value as global_value
-                bal_id = getattr(global_value, 'balance_id', None)
-            except Exception:
-                bal_id = None
-            if bal_id is not None:
-                for bal in profile_msg['balances']:
-                    if isinstance(bal, dict) and bal.get('id') == bal_id:
-                        if bal.get('type') == 1:
-                            return ('REAL', target_mode == 'REAL')
-                        if bal.get('type') == 4:
-                            return ('PRACTICE', target_mode == 'PRACTICE')
-        return (_confirmed_mode, _mode_verified and (_confirmed_mode == target_mode))
+        mode, _bal_id, _curr = _extract_mode_from_profile(profile_msg)
+        if mode in ('PRACTICE', 'REAL'):
+            matches = True if target_mode == 'AUTO' else (mode == target_mode)
+            return (mode, matches)
+        matches = _mode_verified and (target_mode == 'AUTO' or _confirmed_mode == target_mode)
+        return (_confirmed_mode, bool(matches))
 
     # Non-iqoptionapi mock client in unit tests
     if hasattr(client, 'get_balance_mode'):
@@ -1487,87 +1580,125 @@ def _peek_balance_mode_nonblocking(client: Any, target_mode: str) -> Tuple[str, 
             raw = client.get_balance_mode()
             if raw:
                 confirmed = str(raw).strip().upper()
-                if target_mode == 'REAL':
-                    return (confirmed, confirmed == 'REAL')
-                if confirmed == 'REAL':
-                    return (confirmed, False)
-                return (confirmed, confirmed == 'PRACTICE')
+                if confirmed in ('PRACTICE', 'REAL'):
+                    matches = True if target_mode == 'AUTO' else (confirmed == target_mode)
+                    return (confirmed, matches)
         except Exception:
             return ('UNVERIFIED', False)
-    return (_confirmed_mode, _mode_verified)
+    return (_confirmed_mode, bool(_mode_verified and (target_mode == 'AUTO' or _confirmed_mode == target_mode)))
 
 
-def _ensure_balance_mode(client: Any, target_mode: str, timeout_seconds: Optional[float] = None) -> Tuple[str, bool]:
-    """Attempt to switch IQ Option balance mode and verify via get_balance_mode() with bounded timeouts.
-    Fails closed when REAL mode is requested unless get_balance_mode() explicitly confirms REAL.
+def _detect_balance_mode(
+    client: Any,
+    timeout_seconds: Optional[float] = None,
+    refresh: bool = False,
+) -> Tuple[str, bool]:
+    """Detect whichever account mode (PRACTICE or REAL) is currently active inside IQ Option.
+    NEVER calls client.change_balance() and NEVER silently overrides the user's selected mode.
     """
-    global _last_error, _confirmed_mode, _mode_verified
+    global _confirmed_mode, _mode_verified, _active_balance_id, _active_currency
     timeout = _MODE_TIMEOUT if timeout_seconds is None else timeout_seconds
-    current_mode = None
-    try:
-        if hasattr(client, 'get_balance_mode'):
-            raw_cur = _run_with_timeout(client.get_balance_mode, timeout, 'get_balance_mode')
-            if raw_cur:
-                current_mode = str(raw_cur).strip().upper()
-    except Exception:
-        current_mode = None
 
-    if current_mode == target_mode and current_mode in ('PRACTICE', 'REAL'):
-        _confirmed_mode = current_mode
-        _mode_verified = True
-        return (current_mode, True)
-
-    if current_mode != target_mode:
-        try:
-            _run_with_timeout(lambda: client.change_balance(target_mode), timeout, 'change_balance')
-        except Exception as exc:
-            _last_error = _sanitize_error(f'change_balance({target_mode}) failed: {type(exc).__name__}: {exc}')
-            _confirmed_mode = 'UNVERIFIED'
-            _mode_verified = False
-            return ('UNVERIFIED', False)
-
-    confirmed = 'UNVERIFIED'
-    try:
-        if hasattr(client, 'get_balance_mode'):
-            raw_mode = _run_with_timeout(client.get_balance_mode, timeout, 'get_balance_mode')
-            if raw_mode:
-                confirmed = str(raw_mode).strip().upper()
-    except Exception as exc:
-        _last_error = _sanitize_error(f'get_balance_mode() failed: {type(exc).__name__}: {exc}')
-        _confirmed_mode = 'UNVERIFIED'
-        _mode_verified = False
+    if client is None:
         return ('UNVERIFIED', False)
 
-    if target_mode == 'REAL':
-        verified = confirmed == 'REAL'
-        if not verified:
-            _last_error = f'Requested REAL account mode could not be verified (connector reported {confirmed}).'
-        _confirmed_mode = confirmed
-        _mode_verified = verified
-        return (confirmed, verified)
+    api = getattr(client, 'api', None)
 
-    # PRACTICE mode: confirmed if client reports PRACTICE (or if fork omits get_balance_mode, do not misreport as REAL)
-    if confirmed == 'REAL':
-        _last_error = 'Requested PRACTICE account mode, but connector remained on REAL.'
-        _confirmed_mode = confirmed
-        _mode_verified = False
+    # Optionally refresh live profile from IQ Option without wiping prior valid profile on timeout
+    if refresh and api is not None and hasattr(api, 'get_profile') and hasattr(api, 'profile'):
+        prev_msg = getattr(api.profile, 'msg', None)
+        try:
+            api.profile.msg = None
+            _run_with_timeout(api.get_profile, min(timeout, 3.0), 'get_profile')
+            deadline = time.monotonic() + min(timeout, 3.0)
+            while getattr(api.profile, 'msg', None) is None and time.monotonic() < deadline:
+                if not _is_client_alive(client):
+                    break
+                time.sleep(0.03)
+            if getattr(api.profile, 'msg', None) is None and prev_msg is not None:
+                api.profile.msg = prev_msg
+        except Exception:
+            if getattr(api.profile, 'msg', None) is None and prev_msg is not None:
+                api.profile.msg = prev_msg
+
+    # 1. Inspect live profile payload first (authoritative IQ Option active balance_id / balance_type)
+    if api is not None:
+        profile_msg = getattr(getattr(api, 'profile', None), 'msg', None)
+        prof_mode, prof_bal_id, prof_curr = _extract_mode_from_profile(profile_msg)
+        if prof_bal_id is not None:
+            _active_balance_id = prof_bal_id
+            try:
+                import iqoptionapi.global_value as global_value
+                global_value.balance_id = prof_bal_id
+            except Exception:
+                pass
+        if prof_curr:
+            _active_currency = prof_curr
+        if prof_mode in ('PRACTICE', 'REAL'):
+            _confirmed_mode = prof_mode
+            _mode_verified = True
+            return (prof_mode, True)
+
+    # 2. Fall back to client.get_balance_mode() (read-only query, never mutates mode)
+    if hasattr(client, 'get_balance_mode'):
+        try:
+            raw_cur = _run_with_timeout(client.get_balance_mode, timeout, 'get_balance_mode')
+            if raw_cur:
+                normalized = str(raw_cur).strip().upper()
+                if normalized in ('PRACTICE', 'REAL'):
+                    _confirmed_mode = normalized
+                    _mode_verified = True
+                    return (normalized, True)
+        except Exception:
+            # Transient read timeout on an alive client must not corrupt previously verified mode
+            if _is_client_alive(client) and _mode_verified and _confirmed_mode in ('PRACTICE', 'REAL'):
+                return (_confirmed_mode, False if refresh else True)
+            return ('UNVERIFIED', False)
+
+    if _mode_verified and _confirmed_mode in ('PRACTICE', 'REAL'):
+        return (_confirmed_mode, True)
+    return ('UNVERIFIED', False)
+
+
+def _ensure_balance_mode(
+    client: Any,
+    target_mode: str = 'AUTO',
+    timeout_seconds: Optional[float] = None,
+    refresh: bool = False,
+) -> Tuple[str, bool]:
+    """Detect IQ Option's live active account mode without EVER silently calling change_balance().
+    If target_mode is 'AUTO', follows whichever mode (PRACTICE or REAL) IQ Option reports.
+    If an explicit mode assertion ('PRACTICE' or 'REAL') is supplied and mismatches IQ Option's live mode,
+    returns (actual_mode, False) without altering the user's IQ Option account mode.
+    """
+    global _last_error
+    confirmed, verified = _detect_balance_mode(client, timeout_seconds=timeout_seconds, refresh=refresh)
+    if not verified or confirmed not in ('PRACTICE', 'REAL'):
         return (confirmed, False)
-    if confirmed == 'UNVERIFIED':
-        _confirmed_mode = 'PRACTICE'
-        _mode_verified = True
-        return ('PRACTICE', True)
-    verified = confirmed == 'PRACTICE'
-    _confirmed_mode = confirmed
-    _mode_verified = verified
-    return (confirmed, verified)
+    if target_mode in ('PRACTICE', 'REAL') and confirmed != target_mode:
+        _last_error = (
+            f'IQ Option active account mode is {confirmed}, which differs from expected {target_mode}. '
+            'Switch account mode inside IQ Option directly; NovaTrade never switches modes silently.'
+        )
+        return (confirmed, False)
+    return (confirmed, True)
 
 
-def _require_verified_mode(client: Any, target_mode: str) -> Tuple[str, bool]:
-    confirmed, verified = _ensure_balance_mode(client, target_mode)
-    if target_mode == 'REAL' and not verified:
+def _require_verified_mode(
+    client: Any,
+    target_mode: str = 'AUTO',
+    refresh: bool = False,
+) -> Tuple[str, bool]:
+    confirmed, verified = _ensure_balance_mode(client, target_mode=target_mode, refresh=refresh)
+    if not verified or confirmed not in ('PRACTICE', 'REAL'):
+        if target_mode in ('PRACTICE', 'REAL') and confirmed in ('PRACTICE', 'REAL') and confirmed != target_mode:
+            raise HTTPException(
+                409,
+                f'IQ Option is currently in {confirmed} mode (expected {target_mode}). Switch mode inside IQ Option first; NovaTrade will never silently switch your account mode.',
+            )
         raise HTTPException(
             409,
-            f'IQ Option connector could not verify REAL account mode (active={confirmed}). Refusing to return PRACTICE data as REAL.',
+            f'IQ Option connector could not verify active account mode (reported {confirmed}).',
         )
     return (confirmed, verified)
 
@@ -1579,14 +1710,14 @@ def connect(
     force_reconnect: bool = False,
 ):
     """Single-flight, generation-fenced IQ Option session establishment.
-    Runs outside _lock so concurrent callers coalesce cleanly instead of failing with HTTP 503 busy,
-    and ensures timed-out or superseded workers cannot corrupt a newer session.
+    Reuses any existing healthy authenticated session without redundant reconnects,
+    coalesces concurrent callers cleanly, and follows IQ Option's active account mode.
     """
     global _client, _last_error, _connected_at, _requested_mode, _confirmed_mode, _mode_verified
-    global _active_ws_url, _active_ws_via_proxy, _opcodes_updated
+    global _active_ws_url, _active_ws_via_proxy, _opcodes_updated, _last_balance_cache
     global _session_generation, _inflight_connect, _last_connect_stage, _last_connect_duration_ms
 
-    resolved_mode = _normalize_mode(target_mode) or _requested_mode
+    resolved_mode = _normalize_mode(target_mode) or 'AUTO'
     existing_flight: Optional[_InFlightConnect] = None
     flight: Optional[_InFlightConnect] = None
     stale_client: Any = None
@@ -1598,7 +1729,15 @@ def connect(
         prior_email = getattr(_client, 'email', None) if _client is not None else None
         prior_password = getattr(_client, 'password', None) if _client is not None else None
 
-        if _client is not None and not force_reconnect:
+        # Only force reconnect if a genuinely different email account is requested
+        email_changed = bool(
+            email
+            and prior_email
+            and str(email).strip().lower() != str(prior_email).strip().lower()
+        )
+        effective_force = force_reconnect or email_changed
+
+        if _client is not None and not effective_force:
             if _is_client_alive(_client):
                 _requested_mode = resolved_mode
                 return _client
@@ -1609,9 +1748,10 @@ def connect(
             _active_ws_url = None
             _active_ws_via_proxy = False
             _opcodes_updated = False
+            _last_balance_cache = None
             _last_error = 'IQ Option WebSocket session disconnected; reconnecting.'
 
-        if _inflight_connect is not None and not force_reconnect:
+        if _inflight_connect is not None and not effective_force:
             existing_flight = _inflight_connect
         else:
             target_email = email or os.environ.get('IQ_EMAIL') or prior_email
@@ -1619,7 +1759,7 @@ def connect(
             if not target_email or not target_password:
                 raise HTTPException(503, 'IQ Option email and password are required.')
 
-            if force_reconnect and _client is not None:
+            if effective_force and _client is not None:
                 stale_client = _client
                 _client = None
                 _connected_at = None
@@ -1627,6 +1767,7 @@ def connect(
                 _active_ws_url = None
                 _active_ws_via_proxy = False
                 _opcodes_updated = False
+                _last_balance_cache = None
 
             if _inflight_connect is not None:
                 _inflight_connect.cancel_event.set()
@@ -1692,8 +1833,8 @@ def connect(
             flight.error = err
             raise err
 
-        _set_connect_stage('mode_verify')
-        confirmed_mode, mode_verified = _ensure_balance_mode(client, resolved_mode, timeout_seconds=_MODE_TIMEOUT)
+        _set_connect_stage('mode_detect')
+        confirmed_mode, mode_verified = _detect_balance_mode(client, timeout_seconds=_MODE_TIMEOUT, refresh=False)
 
         with _state_lock:
             still_current = (not flight.cancel_event.is_set()) and (_session_generation == my_gen)
@@ -1705,8 +1846,9 @@ def connect(
                 _client = client
                 _confirmed_mode = confirmed_mode
                 _mode_verified = mode_verified
-                _last_error = None if (resolved_mode != 'REAL' or mode_verified) else _last_error
+                _last_error = None if mode_verified else _last_error
                 _connected_at = time.time()
+                _last_balance_cache = None
                 _last_connect_stage = 'connected'
                 _last_connect_duration_ms = round((time.monotonic() - flight.started_at) * 1000, 1)
                 flight.result_client = client
@@ -1731,7 +1873,6 @@ def connect(
                 _last_connect_stage = 'timeout'
                 _last_connect_duration_ms = round((time.monotonic() - flight.started_at) * 1000, 1)
                 _last_error = _sanitize_error(f'Connection timed out: {exc}', (target_email, target_password))
-        # Actively close the local client instance (never leave an unclosed WS/socket leaking!)
         if client is not None:
             _safe_close_client(client, reset_globals=False)
         err = HTTPException(504, 'IQ Option broker connection timed out; please retry.')
@@ -1757,10 +1898,12 @@ def connect(
         flight.done.set()
 
 
-def _try_reconnect_session(client: Any, target_mode: str) -> Optional[Any]:
-    """Attempt a single safe, generation-fenced reconnect if credentials are available."""
-    email = os.environ.get('IQ_EMAIL') or getattr(client, 'email', None)
-    password = os.environ.get('IQ_PASSWORD') or getattr(client, 'password', None)
+def _try_reconnect_session(client: Any, target_mode: str = 'AUTO') -> Optional[Any]:
+    """Attempt a single safe, generation-fenced reconnect ONLY when the existing socket is genuinely dead."""
+    if _is_client_alive(client):
+        return client
+    email = getattr(client, 'email', None) or os.environ.get('IQ_EMAIL')
+    password = getattr(client, 'password', None) or os.environ.get('IQ_PASSWORD')
     if email and password:
         new_client = connect(email=email, password=password, target_mode=target_mode, force_reconnect=True)
         return new_client
@@ -1777,19 +1920,35 @@ def _try_reconnect_session(client: Any, target_mode: str) -> Optional[Any]:
             deadline=time.monotonic() + _CONNECT_TIMEOUT,
         )
         if isinstance(res, (list, tuple)) and res and res[0]:
-            _ensure_balance_mode(client, target_mode)
+            _detect_balance_mode(client, refresh=False)
             return client
     return None
 
 
 def _fetch_balance_safe(
     client: Any,
-    target_mode: str,
+    active_mode: str,
     timeout_seconds: Optional[float] = None,
-) -> Any:
-    """Retrieve IQ Option balance with strict wall-clock timeout and safe reconnect on WS failure."""
-    global _last_error
+    allow_cache: bool = True,
+) -> Tuple[float, str]:
+    """Retrieve IQ Option balance for the active mode with short cache coalescing and timeout resilience.
+    Never tears down a healthy alive WebSocket session on a single transient read timeout.
+    Returns (balance_float, currency_code).
+    """
+    global _last_error, _last_balance_cache, _active_currency
     timeout = _BALANCE_TIMEOUT if timeout_seconds is None else timeout_seconds
+
+    if allow_cache and _BALANCE_CACHE_TTL_SECONDS > 0:
+        with _state_lock:
+            cached = _last_balance_cache
+        if (
+            cached is not None
+            and cached.get('mode') == active_mode
+            and (time.monotonic() - float(cached.get('ts', 0))) <= _BALANCE_CACHE_TTL_SECONDS
+            and _is_client_alive(client)
+        ):
+            return (float(cached['balance']), str(cached.get('currency') or _active_currency or 'USD'))
+
     has_low_level_api = hasattr(client, 'api') and hasattr(client.api, 'get_balances')
 
     if not has_low_level_api:
@@ -1807,13 +1966,16 @@ def _fetch_balance_safe(
         if parsed_bal is None:
             _last_error = 'Broker did not return a valid numeric account balance.'
             raise HTTPException(502, 'Broker did not return a valid numeric account balance.')
-        return parsed_bal
+        curr = str(getattr(client, 'currency', None) or _active_currency or 'USD').upper()
+        with _state_lock:
+            _last_balance_cache = {'balance': parsed_bal, 'currency': curr, 'mode': active_mode, 'ts': time.monotonic()}
+        return (parsed_bal, curr)
 
     last_exc: Optional[Exception] = None
     for attempt in range(2):
         try:
             if not _is_client_alive(client):
-                reconnected = _try_reconnect_session(client, target_mode)
+                reconnected = _try_reconnect_session(client, 'AUTO')
                 if reconnected is None:
                     raise ConnectionError('IQ Option WebSocket session is disconnected.')
                 client = reconnected
@@ -1829,29 +1991,44 @@ def _fetch_balance_safe(
                         raise RuntimeError('Invalid balances payload from broker.')
                     try:
                         import iqoptionapi.global_value as global_value
-                        target_id = getattr(global_value, 'balance_id', None)
+                        target_id = getattr(global_value, 'balance_id', None) or _active_balance_id
                     except Exception:
-                        target_id = None
-                    expected_type = 1 if target_mode == 'REAL' else 4
+                        target_id = _active_balance_id
+                    expected_type = 1 if active_mode == 'REAL' else 4
                     matched_amount = None
+                    matched_currency = _active_currency or 'USD'
                     found_entry = False
+                    # Match by active balance_id first, verifying type agrees with detected active_mode
                     for entry in msg_list:
                         if isinstance(entry, dict) and target_id is not None and entry.get('id') == target_id:
-                            matched_amount = entry.get('amount')
-                            found_entry = True
-                            break
+                            if entry.get('type') in (None, expected_type):
+                                matched_amount = entry.get('amount')
+                                if entry.get('currency'):
+                                    matched_currency = str(entry.get('currency')).upper()
+                                found_entry = True
+                                break
                     if not found_entry:
                         for entry in msg_list:
                             if isinstance(entry, dict) and entry.get('type') == expected_type:
                                 matched_amount = entry.get('amount')
+                                if entry.get('currency'):
+                                    matched_currency = str(entry.get('currency')).upper()
                                 found_entry = True
                                 break
                     if not found_entry:
-                        raise RuntimeError(f'Balance entry for mode {target_mode} not found.')
+                        raise RuntimeError(f'Balance entry for mode {active_mode} not found.')
                     parsed_amount = _parse_finite_float(matched_amount)
                     if parsed_amount is None:
                         raise RuntimeError('Broker returned missing or non-numeric balance amount.')
-                    return parsed_amount
+                    _active_currency = matched_currency
+                    with _state_lock:
+                        _last_balance_cache = {
+                            'balance': parsed_amount,
+                            'currency': matched_currency,
+                            'mode': active_mode,
+                            'ts': time.monotonic(),
+                        }
+                    return (parsed_amount, matched_currency)
                 if not _is_client_alive(client):
                     break
                 time.sleep(0.05)
@@ -1861,9 +2038,10 @@ def _fetch_balance_safe(
             last_exc = exc
             _last_error = _sanitize_error(f'get_balances failed: {type(exc).__name__}: {exc}')
 
-        if attempt == 0:
+        # Only reconnect if the WebSocket actually died; if still alive, retry read on the SAME healthy session
+        if attempt == 0 and not _is_client_alive(client):
             try:
-                reconnected = _try_reconnect_session(client, target_mode)
+                reconnected = _try_reconnect_session(client, 'AUTO')
                 if reconnected is None:
                     break
                 client = reconnected
@@ -1913,7 +2091,7 @@ def _fetch_candles_safe(
     clean_symbol: str,
     interval: int,
     count: int,
-    target_mode: str,
+    active_mode: str = 'AUTO',
     timeout_seconds: Optional[float] = None,
 ) -> list:
     global _last_error
@@ -1951,7 +2129,7 @@ def _fetch_candles_safe(
     for attempt in range(2):
         try:
             if not _is_client_alive(client):
-                reconnected = _try_reconnect_session(client, target_mode)
+                reconnected = _try_reconnect_session(client, 'AUTO')
                 if reconnected is None:
                     raise ConnectionError('IQ Option WebSocket session is disconnected.')
                 client = reconnected
@@ -1978,9 +2156,10 @@ def _fetch_candles_safe(
             last_exc = exc
             _last_error = _sanitize_error(f'getcandles({clean_symbol}) failed: {type(exc).__name__}: {exc}')
 
-        if attempt == 0:
+        # Only reconnect if the WebSocket actually died; preserve healthy sessions on transient read timeouts
+        if attempt == 0 and not _is_client_alive(client):
             try:
-                reconnected = _try_reconnect_session(client, target_mode)
+                reconnected = _try_reconnect_session(client, 'AUTO')
                 if reconnected is None:
                     break
                 client = reconnected
@@ -1997,15 +2176,227 @@ def _fetch_candles_safe(
     raise HTTPException(504, f'IQ Option upstream timed out returning candles for {clean_symbol}.')
 
 
+def _format_iso_utc(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    try:
+        t = float(ts)
+        if t > 1e11:
+            t = t / 1000.0
+        return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(t))
+    except Exception:
+        return None
+
+
+def _normalize_broker_position(raw: dict, default_mode: str, instrument_hint: str = 'binary') -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    pos_id = raw.get('id') or raw.get('external_id') or raw.get('order_id') or raw.get('position_id')
+    if pos_id is None:
+        return None
+    raw_event = raw.get('raw_event') if isinstance(raw.get('raw_event'), dict) else {}
+    symbol = str(
+        raw.get('active')
+        or raw.get('instrument_underlying')
+        or raw_event.get('active')
+        or raw.get('symbol')
+        or 'UNKNOWN'
+    ).strip().upper()
+    raw_dir = str(
+        raw.get('direction')
+        or raw_event.get('direction')
+        or raw.get('side')
+        or 'CALL'
+    ).strip().upper()
+    side = 'BUY' if raw_dir in ('CALL', 'BUY') else 'SELL'
+    stake = _parse_finite_float(
+        raw.get('invest')
+        if raw.get('invest') is not None
+        else (raw.get('amount') if raw.get('amount') is not None else raw.get('volume'))
+    ) or 0.0
+    open_price = _parse_finite_float(
+        raw.get('open_quote')
+        if raw.get('open_quote') is not None
+        else (raw.get('openPrice') if raw.get('openPrice') is not None else raw_event.get('value'))
+    ) or 0.0
+    curr_price = _parse_finite_float(
+        raw.get('current_quote')
+        if raw.get('current_quote') is not None
+        else raw.get('currentPrice')
+    )
+    pnl = _parse_finite_float(
+        raw.get('pnl_realized')
+        if raw.get('pnl_realized') is not None
+        else (raw.get('pnl') if raw.get('pnl') is not None else raw.get('profit'))
+    )
+    opened_at = raw.get('openedAt') or _format_iso_utc(_parse_finite_float(raw.get('open_time') or raw.get('created')))
+    expires_at = raw.get('expiresAt') or _format_iso_utc(_parse_finite_float(raw.get('close_time') or raw.get('expired')))
+    return {
+        'ticket': str(pos_id),
+        'symbol': symbol,
+        'side': side,
+        'volume': stake,
+        'openPrice': open_price,
+        'currentPrice': curr_price,
+        'profit': pnl,
+        'sl': None,
+        'tp': None,
+        'openedAt': opened_at,
+        'expiresAt': expires_at,
+        'instrumentType': str(raw.get('instrument_type') or raw.get('instrumentType') or instrument_hint),
+        'mode': str(raw.get('mode') or default_mode).upper(),
+        'canClose': True,
+        'comment': f"IQ Option {str(raw.get('instrumentType') or instrument_hint).upper()} ({default_mode})",
+    }
+
+
+def _check_order_outcome_safe(client: Any, order_id: str, tracked: Optional[dict] = None) -> dict:
+    """Inspect IQ Option order status / win-loss outcome with bounded non-blocking timeout."""
+    now_iso = _format_iso_utc(time.time()) or ''
+    instrument_type = (tracked or {}).get('instrumentType', 'binary')
+    numeric_id: Any = int(order_id) if str(order_id).isdigit() else order_id
+
+    # 1. Try digital position settlement check
+    if instrument_type == 'digital' and hasattr(client, 'check_win_digital_v2'):
+        try:
+            res = _run_with_timeout(lambda: client.check_win_digital_v2(numeric_id), 2.5, 'check_win_digital_v2')
+            if isinstance(res, (list, tuple)) and len(res) >= 2 and res[0]:
+                pnl = _parse_finite_float(res[1])
+                return {
+                    'found': True,
+                    'brokerOrderId': str(order_id),
+                    'status': 'CLOSED',
+                    'filledPrice': (tracked or {}).get('filledPrice'),
+                    'realizedPnl': pnl,
+                    'updatedAt': now_iso,
+                    'note': f'IQ Option digital trade settled (P&L: {pnl}).',
+                }
+        except Exception:
+            pass
+
+    # 2. Try binary/turbo async order or optioninfo_v2 lookup (non-blocking — avoids check_win_v3 infinite wait!)
+    if hasattr(client, 'get_async_order'):
+        try:
+            info = _run_with_timeout(lambda: client.get_async_order(numeric_id), 2.5, 'get_async_order')
+            if isinstance(info, dict):
+                pos_changed = info.get('position-changed') or info.get('option-closed')
+                if isinstance(pos_changed, dict):
+                    msg = pos_changed.get('msg') if isinstance(pos_changed.get('msg'), dict) else pos_changed
+                    status_raw = str(msg.get('status') or '').lower()
+                    pnl = _parse_finite_float(msg.get('pnl_realized') if msg.get('pnl_realized') is not None else msg.get('pnl'))
+                    close_profit = _parse_finite_float(msg.get('close_profit'))
+                    invest = _parse_finite_float(msg.get('invest')) or _parse_finite_float((tracked or {}).get('amount'))
+                    if pnl is None and close_profit is not None and invest is not None:
+                        pnl = round(close_profit - invest, 4)
+                    open_quote = _parse_finite_float(msg.get('open_quote')) or (tracked or {}).get('filledPrice')
+                    if status_raw == 'closed' or 'option-closed' in info or msg.get('close_time'):
+                        return {
+                            'found': True,
+                            'brokerOrderId': str(order_id),
+                            'status': 'CLOSED',
+                            'filledPrice': open_quote,
+                            'realizedPnl': pnl,
+                            'updatedAt': now_iso,
+                            'note': f'IQ Option trade settled (P&L: {pnl}).',
+                        }
+                    return {
+                        'found': True,
+                        'brokerOrderId': str(order_id),
+                        'status': 'FILLED',
+                        'filledPrice': open_quote,
+                        'realizedPnl': pnl,
+                        'updatedAt': now_iso,
+                        'note': 'IQ Option trade currently open.',
+                    }
+        except Exception:
+            pass
+
+    if hasattr(client, 'get_optioninfo_v2'):
+        try:
+            hist = _run_with_timeout(lambda: client.get_optioninfo_v2(25), 3.0, 'get_optioninfo_v2_reconcile')
+            closed_list = hist.get('msg', {}).get('closed_options', []) if isinstance(hist, dict) else []
+            for item in closed_list:
+                if not isinstance(item, dict):
+                    continue
+                item_ids = {str(item.get('id')), str(item.get('external_id'))}
+                if str(order_id) in item_ids:
+                    win_amount = _parse_finite_float(item.get('win_amount'))
+                    invest = _parse_finite_float(item.get('amount')) or _parse_finite_float((tracked or {}).get('amount')) or 0.0
+                    pnl = _parse_finite_float(item.get('pnl'))
+                    if pnl is None and win_amount is not None:
+                        pnl = round(win_amount - invest, 4)
+                    return {
+                        'found': True,
+                        'brokerOrderId': str(order_id),
+                        'status': 'CLOSED',
+                        'filledPrice': _parse_finite_float(item.get('value')) or (tracked or {}).get('filledPrice'),
+                        'realizedPnl': pnl,
+                        'updatedAt': now_iso,
+                        'note': f"IQ Option closed history match ({item.get('win') or 'settled'}).",
+                    }
+        except Exception:
+            pass
+
+    if tracked is not None:
+        return {
+            'found': True,
+            'brokerOrderId': str(order_id),
+            'status': tracked.get('status', 'FILLED'),
+            'filledPrice': tracked.get('filledPrice'),
+            'realizedPnl': tracked.get('realizedPnl'),
+            'updatedAt': now_iso,
+            'note': tracked.get('note') or 'Tracked active IQ Option order.',
+        }
+
+    return {
+        'found': False,
+        'brokerOrderId': str(order_id),
+        'status': 'UNKNOWN',
+        'filledPrice': None,
+        'realizedPnl': None,
+        'updatedAt': now_iso,
+        'note': f'Order {order_id} not found on current IQ Option session.',
+    }
+
+
+def _normalize_history_item(item: Any, default_mode: str) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    item_id = item.get('id') or item.get('external_id') or item.get('order_id')
+    symbol = str(item.get('active') or item.get('symbol') or item.get('instrument_underlying') or 'UNKNOWN').strip().upper()
+    raw_dir = str(item.get('direction') or item.get('side') or '').strip().upper()
+    direction = 'CALL' if raw_dir in ('CALL', 'BUY') else ('PUT' if raw_dir in ('PUT', 'SELL') else raw_dir or 'CALL')
+    amount = _parse_finite_float(item.get('amount') if item.get('amount') is not None else item.get('invest'))
+    win_amount = _parse_finite_float(item.get('win_amount'))
+    pnl = _parse_finite_float(item.get('pnl') if item.get('pnl') is not None else item.get('pnl_realized'))
+    if pnl is None and win_amount is not None and amount is not None:
+        pnl = round(win_amount - amount, 4)
+    outcome = str(item.get('win') or item.get('status') or ('win' if (pnl or 0) > 0 else 'loose' if (pnl or 0) < 0 else 'closed')).upper()
+    return {
+        'id': str(item_id) if item_id is not None else None,
+        'symbol': symbol,
+        'direction': direction,
+        'amount': amount,
+        'winAmount': win_amount,
+        'pnl': pnl,
+        'outcome': outcome,
+        'openPrice': _parse_finite_float(item.get('value') if item.get('value') is not None else item.get('open_quote')),
+        'closePrice': _parse_finite_float(item.get('close_value') if item.get('close_value') is not None else item.get('close_quote')),
+        'openedAt': item.get('openedAt') or _format_iso_utc(_parse_finite_float(item.get('created') or item.get('open_time'))),
+        'closedAt': item.get('closedAt') or _format_iso_utc(_parse_finite_float(item.get('expired') or item.get('close_time'))),
+        'mode': str(item.get('mode') or default_mode).upper(),
+    }
+
+
 @app.get('/health')
 async def health(
     mode: Optional[str] = Query(default=None),
     x_iq_mode: Optional[str] = Header(default=None),
 ):
-    """Non-blocking event-loop health endpoint; never blocks on threadpool or upstream WS I/O."""
+    """Non-blocking event-loop health endpoint; reports IQ Option's live detected active mode without mutating state."""
     target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
     connected = False
-    confirmed_mode = target_mode
+    confirmed_mode = 'UNVERIFIED'
     mode_verified = False
     lock_busy = False
     connect_in_flight = _inflight_connect is not None
@@ -2017,15 +2408,15 @@ async def health(
             if cur_client is not None:
                 connected = _is_client_alive(cur_client)
                 if connected:
-                    confirmed_mode, mode_verified = _peek_balance_mode_nonblocking(cur_client, target_mode)
+                    confirmed_mode, mode_verified = _peek_balance_mode_nonblocking(cur_client, 'AUTO')
         finally:
             _lock.release()
     else:
         lock_busy = True
         cur_client = _client
         connected = _is_client_alive(cur_client)
-        confirmed_mode = _confirmed_mode if connected else _requested_mode
-        mode_verified = bool(_mode_verified and confirmed_mode == target_mode) if connected else False
+        confirmed_mode = _confirmed_mode if connected else 'UNVERIFIED'
+        mode_verified = bool(_mode_verified) if connected else False
 
     busy = bool(lock_busy or connect_in_flight)
     active_op = 'connect' if connect_in_flight else (_busy_operation if lock_busy else None)
@@ -2037,10 +2428,12 @@ async def health(
         proxy_configured = False
         proxy_config_error = _sanitize_error(str(exc))
 
-    verified_connected = connected and (target_mode != 'REAL' or mode_verified)
+    mode_matches = True if target_mode == 'AUTO' else (confirmed_mode == target_mode)
+    verified_connected = connected and mode_verified and mode_matches
 
     return {
         'status': 'running',
+        'version': getattr(app, 'version', '0.5.0'),
         'serviceAvailable': True,
         'busy': busy,
         'connectInFlight': connect_in_flight,
@@ -2050,10 +2443,12 @@ async def health(
         'lastConnectDurationMs': _last_connect_duration_ms,
         'authenticated': bool(connected),
         'connected': verified_connected,
-        'mode': confirmed_mode,
+        'mode': confirmed_mode if connected else None,
+        'activeMode': confirmed_mode if connected else None,
         'requestedMode': target_mode,
         'accountType': confirmed_mode if connected else None,
         'modeVerified': mode_verified if connected else False,
+        'modeFollowsBroker': True,
         'activeWsUrl': _active_ws_url if connected else None,
         'activeWsViaProxy': _active_ws_via_proxy if connected else False,
         'proxyConfigured': proxy_configured,
@@ -2062,8 +2457,10 @@ async def health(
         'wsProxyEnabled': _is_ws_proxy_enabled(),
         'candleRetrievalReady': bool(verified_connected),
         'lastCandleCheck': _last_candle_check,
-        'orderExecutionSupported': False,
-        'realTradingEnabled': False,
+        'orderExecutionSupported': True,
+        'positionsSupported': True,
+        'closePositionSupported': True,
+        'realTradingEnabled': bool(connected and mode_verified and confirmed_mode == 'REAL'),
         'credentialsConfigured': bool(os.getenv('IQ_EMAIL') and os.getenv('IQ_PASSWORD')),
         'lastError': _last_error,
         'connectedAt': _connected_at,
@@ -2111,6 +2508,7 @@ async def network_check(
 
     return {
         'status': 'ok',
+        'version': getattr(app, 'version', '0.5.0'),
         'serviceAvailable': True,
         'timeoutSeconds': _WS_CONNECT_TIMEOUT,
         'activeWsUrl': _active_ws_url,
@@ -2134,15 +2532,16 @@ async def network_check(
         },
         'brokerSession': {
             'authenticated': alive_now,
-            'connected': alive_now and (_requested_mode != 'REAL' or _mode_verified),
+            'connected': alive_now and _mode_verified,
             'connectInFlight': _inflight_connect is not None,
             'busyOperation': 'connect' if _inflight_connect is not None else _busy_operation,
             'sessionGeneration': _session_generation,
             'lastConnectStage': _last_connect_stage,
             'lastConnectDurationMs': _last_connect_duration_ms,
-            'mode': _confirmed_mode if alive_now else _requested_mode,
+            'mode': _confirmed_mode if alive_now else None,
             'modeVerified': bool(_mode_verified) if alive_now else False,
-            'candleRetrievalReady': bool(alive_now and (_requested_mode != 'REAL' or _mode_verified)),
+            'modeFollowsBroker': True,
+            'candleRetrievalReady': bool(alive_now and _mode_verified),
             'lastCandleCheck': _last_candle_check,
             'lastError': _last_error,
         },
@@ -2151,8 +2550,8 @@ async def network_check(
         'proxyAuthEndpoint': proxy_probe,
         'proxyWsEndpoints': proxy_ws_probes,
         'lastConnectDiagnostics': _last_ws_diagnostics,
-        'orderExecutionSupported': False,
-        'realTradingEnabled': False,
+        'orderExecutionSupported': True,
+        'realTradingEnabled': bool(alive_now and _mode_verified and _confirmed_mode == 'REAL'),
     }
 
 
@@ -2164,96 +2563,85 @@ def connect_route(
     x_connector_token: Optional[str] = Header(default=None),
 ):
     _check_auth(x_connector_token)
-    global _requested_mode
-    target_mode = _resolve_target_mode(
-        explicit_mode=body.mode if body else None,
-        x_iq_mode=x_iq_mode,
-        query_mode=mode,
-    )
     client = connect(
         email=body.email if body else None,
         password=body.password if body else None,
-        target_mode=target_mode,
+        target_mode='AUTO',
     )
     with _bounded_lock(op_name='connect_verify'):
-        _requested_mode = target_mode
         is_connected = _is_client_alive(client)
-        if is_connected and _confirmed_mode == target_mode and _mode_verified:
-            confirmed_mode, mode_verified = _confirmed_mode, True
-        else:
-            confirmed_mode, mode_verified = _ensure_balance_mode(client, target_mode)
-
-        if target_mode == 'REAL' and not mode_verified:
-            return {
-                'connected': False,
-                'mode': confirmed_mode,
-                'requestedMode': 'REAL',
-                'accountType': confirmed_mode,
-                'modeVerified': False,
-                'orderExecutionSupported': False,
-                'realTradingEnabled': False,
-                'connectedAt': _connected_at,
-                'detail': 'IQ Option connector could not verify REAL account mode; refusing to mask PRACTICE as REAL.',
-            }
-
+        confirmed_mode, mode_verified = _detect_balance_mode(client, refresh=True)
         return {
             'connected': is_connected and mode_verified,
-            'mode': confirmed_mode,
-            'requestedMode': target_mode,
-            'accountType': confirmed_mode,
+            'mode': confirmed_mode if mode_verified else None,
+            'activeMode': confirmed_mode if mode_verified else None,
+            'requestedMode': _resolve_target_mode(
+                explicit_mode=body.mode if body else None,
+                x_iq_mode=x_iq_mode,
+                query_mode=mode,
+            ),
+            'accountType': confirmed_mode if mode_verified else None,
             'modeVerified': mode_verified,
-            'orderExecutionSupported': False,
-            'realTradingEnabled': False,
+            'modeFollowsBroker': True,
+            'orderExecutionSupported': True,
+            'positionsSupported': True,
+            'closePositionSupported': True,
+            'realTradingEnabled': bool(is_connected and mode_verified and confirmed_mode == 'REAL'),
             'connectedAt': _connected_at,
         }
 
 
 @app.get('/account')
 def account(
+    fresh: bool = Query(default=False),
     mode: Optional[str] = Query(default=None),
     x_iq_mode: Optional[str] = Header(default=None),
     x_connector_token: Optional[str] = Header(default=None),
 ):
     _check_auth(x_connector_token)
-    target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    client = connect(target_mode=target_mode)
+    client = connect(target_mode='AUTO')
     with _bounded_lock(op_name='account'):
-        confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
-        balance_val = _fetch_balance_safe(client, target_mode)
+        confirmed_mode, mode_verified = _require_verified_mode(client, 'AUTO', refresh=fresh)
+        balance_val, currency = _fetch_balance_safe(client, confirmed_mode, allow_cache=not fresh)
         return {
             'connected': True,
             'mode': confirmed_mode,
-            'requestedMode': target_mode,
+            'activeMode': confirmed_mode,
             'accountType': confirmed_mode,
             'modeVerified': mode_verified,
+            'modeFollowsBroker': True,
             'balance': balance_val,
-            'currency': 'Account currency (verify in IQ Option)',
-            'orderExecutionSupported': False,
-            'realTradingEnabled': False,
+            'currency': currency,
+            'orderExecutionSupported': True,
+            'positionsSupported': True,
+            'closePositionSupported': True,
+            'realTradingEnabled': confirmed_mode == 'REAL',
             'source': 'IQ_OPTION_UNOFFICIAL',
         }
 
 
 @app.get('/balance')
 def balance(
+    fresh: bool = Query(default=False),
     mode: Optional[str] = Query(default=None),
     x_iq_mode: Optional[str] = Header(default=None),
     x_connector_token: Optional[str] = Header(default=None),
 ):
     _check_auth(x_connector_token)
-    target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    client = connect(target_mode=target_mode)
+    client = connect(target_mode='AUTO')
     with _bounded_lock(op_name='balance'):
-        confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
-        balance_val = _fetch_balance_safe(client, target_mode)
+        confirmed_mode, mode_verified = _require_verified_mode(client, 'AUTO', refresh=fresh)
+        balance_val, currency = _fetch_balance_safe(client, confirmed_mode, allow_cache=not fresh)
         return {
             'balance': balance_val,
+            'currency': currency,
             'mode': confirmed_mode,
-            'requestedMode': target_mode,
+            'activeMode': confirmed_mode,
             'accountType': confirmed_mode,
             'modeVerified': mode_verified,
-            'orderExecutionSupported': False,
-            'realTradingEnabled': False,
+            'modeFollowsBroker': True,
+            'orderExecutionSupported': True,
+            'realTradingEnabled': confirmed_mode == 'REAL',
             'source': 'IQ_OPTION_UNOFFICIAL',
         }
 
@@ -2261,7 +2649,7 @@ def balance(
 @app.get('/assets')
 def assets(x_connector_token: Optional[str] = Header(default=None)):
     _check_auth(x_connector_token)
-    client = connect()
+    client = connect(target_mode='AUTO')
     with _bounded_lock(op_name='assets'):
         try:
             open_time = _run_with_timeout(client.get_all_open_time, _ASSETS_TIMEOUT, 'get_all_open_time')
@@ -2289,14 +2677,13 @@ def latest_price(
     x_connector_token: Optional[str] = Header(default=None),
 ):
     _check_auth(x_connector_token)
-    target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
     clean = symbol.strip().upper().replace('/', '')
     if not clean or len(clean) < 3 or len(clean) > 25:
         raise HTTPException(400, 'Invalid symbol format.')
-    client = connect(target_mode=target_mode)
+    client = connect(target_mode='AUTO')
     with _bounded_lock(op_name='price'):
-        confirmed_mode, _ = _require_verified_mode(client, target_mode)
-        rows = _fetch_candles_safe(client, clean, 60, 2, target_mode)
+        confirmed_mode, _ = _require_verified_mode(client, 'AUTO', refresh=False)
+        rows = _fetch_candles_safe(client, clean, 60, 2, confirmed_mode)
         if not isinstance(rows, list) or len(rows) == 0:
             raise HTTPException(502, f'Broker did not return valid candle price for {clean}.')
         normalized = [b for b in (_normalize_candle_bar(r) for r in rows) if b is not None]
@@ -2311,10 +2698,10 @@ def latest_price(
             'spread': None,
             'time': bar['time'],
             'mode': confirmed_mode,
-            'orderExecutionSupported': False,
-            'realTradingEnabled': False,
+            'orderExecutionSupported': True,
+            'realTradingEnabled': confirmed_mode == 'REAL',
             'source': 'IQ_OPTION_UNOFFICIAL',
-            'note': 'Reference close price from unofficial 1m candles (iqoptionapi); live bid/ask stream is not exposed.',
+            'note': f'Live 1m reference price from IQ Option ({confirmed_mode}).',
         }
 
 
@@ -2327,11 +2714,10 @@ def candles(
 ):
     global _last_candle_check
     _check_auth(x_connector_token)
-    target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    client = connect(target_mode=target_mode)
+    client = connect(target_mode='AUTO')
     with _bounded_lock(op_name='candles'):
-        confirmed_mode, _ = _require_verified_mode(client, target_mode)
-        rows = _fetch_candles_safe(client, query.symbol, query.interval, query.count, target_mode)
+        confirmed_mode, _ = _require_verified_mode(client, 'AUTO', refresh=False)
+        rows = _fetch_candles_safe(client, query.symbol, query.interval, query.count, confirmed_mode)
         normalized = [b for b in (_normalize_candle_bar(c) for c in rows) if b is not None]
         if not normalized:
             _last_candle_check = {
@@ -2354,67 +2740,383 @@ def candles(
             'interval': query.interval,
             'candles': normalized,
             'mode': confirmed_mode,
-            'orderExecutionSupported': False,
-            'realTradingEnabled': False,
+            'orderExecutionSupported': True,
+            'realTradingEnabled': confirmed_mode == 'REAL',
             'source': 'IQ_OPTION_UNOFFICIAL',
-            'note': 'Historical candles from unofficial WebSocket; verify latency before use.',
+            'note': f'Live candles from IQ Option ({confirmed_mode}).',
         }
+
+
+@app.post('/order')
+def place_order(
+    req: OrderRequest,
+    x_connector_token: Optional[str] = Header(default=None),
+):
+    """Execute an IQ Option trade strictly on the live active account mode verified directly from IQ Option.
+    Never silently changes the user's IQ Option account mode.
+    """
+    _check_auth(x_connector_token)
+    expected_mode = _normalize_mode(req.expectedMode) if req.expectedMode else 'AUTO'
+
+    # Idempotency check
+    if req.idempotencyKey:
+        with _state_lock:
+            existing_id = _idempotency_index.get(req.idempotencyKey)
+            existing = _tracked_orders.get(existing_id) if existing_id else None
+        if existing:
+            return {
+                'accepted': True,
+                'duplicatePrevented': True,
+                'brokerOrderId': existing['brokerOrderId'],
+                'status': existing['status'],
+                'mappedSymbol': existing['symbol'],
+                'direction': existing['direction'],
+                'amount': existing['amount'],
+                'expirySeconds': existing['expirySeconds'],
+                'instrumentType': existing['instrumentType'],
+                'mode': existing['mode'],
+                'accountType': existing['mode'],
+                'modeVerified': True,
+                'filledPrice': existing.get('filledPrice'),
+                'message': 'Duplicate order prevented via idempotency key.',
+                'submittedAt': existing['submittedAt'],
+            }
+
+    client = connect(target_mode='AUTO')
+    with _bounded_lock(op_name='place_order'):
+        # Mandatory fresh live mode verification before every single order (never silently calls change_balance)
+        confirmed_mode, mode_verified = _require_verified_mode(client, expected_mode, refresh=True)
+        action = 'call' if req.direction == 'CALL' else 'put'
+        duration_min = max(1, int(round(req.expirySeconds / 60.0)))
+        clean_symbol = req.symbol
+
+        # Fetch latest reference entry price (non-fatal if unavailable)
+        ref_price: Optional[float] = None
+        try:
+            rows = _fetch_candles_safe(client, clean_symbol, 60, 2, confirmed_mode, timeout_seconds=3.0)
+            norm = [b for b in (_normalize_candle_bar(r) for r in rows) if b is not None]
+            if norm:
+                ref_price = norm[-1]['close']
+        except Exception:
+            ref_price = None
+
+        order_id: Any = None
+        used_instrument = 'binary'
+        last_reason: Optional[str] = None
+
+        try:
+            if req.instrumentType in ('auto', 'binary') and hasattr(client, 'buy'):
+                res = _run_with_timeout(
+                    lambda: client.buy(float(req.amount), clean_symbol, action, duration_min),
+                    _ORDER_TIMEOUT,
+                    f'buy_{clean_symbol}',
+                )
+                if isinstance(res, (list, tuple)) and len(res) >= 2 and res[0]:
+                    order_id = res[1]
+                    used_instrument = 'binary'
+                else:
+                    last_reason = str(res[1]) if isinstance(res, (list, tuple)) and len(res) >= 2 else str(res)
+
+            if order_id is None and req.instrumentType in ('auto', 'digital') and hasattr(client, 'buy_digital_spot'):
+                res_dig = _run_with_timeout(
+                    lambda: client.buy_digital_spot(clean_symbol, float(req.amount), action, duration_min),
+                    _ORDER_TIMEOUT,
+                    f'buy_digital_{clean_symbol}',
+                )
+                if isinstance(res_dig, (list, tuple)) and len(res_dig) >= 2 and res_dig[0]:
+                    order_id = res_dig[1]
+                    used_instrument = 'digital'
+                elif not last_reason:
+                    last_reason = str(res_dig[1]) if isinstance(res_dig, (list, tuple)) and len(res_dig) >= 2 else str(res_dig)
+        except TimeoutError:
+            raise HTTPException(504, f'IQ Option timed out placing {req.direction} order on {clean_symbol}.') from None
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, _sanitize_error(f'IQ Option order placement failed ({type(exc).__name__}): {exc}')) from None
+
+        if order_id is None:
+            raise HTTPException(
+                409,
+                _sanitize_error(
+                    f'IQ Option rejected {req.direction} {clean_symbol} ({confirmed_mode}): {last_reason or "asset may be closed or payout unavailable."}'
+                ),
+            )
+
+        now_ts = time.time()
+        submitted_at = _format_iso_utc(now_ts) or ''
+        expires_at = _format_iso_utc(now_ts + duration_min * 60)
+        broker_order_id = str(order_id)
+
+        record = {
+            'brokerOrderId': broker_order_id,
+            'symbol': clean_symbol,
+            'direction': req.direction,
+            'side': 'BUY' if req.direction == 'CALL' else 'SELL',
+            'amount': float(req.amount),
+            'expirySeconds': duration_min * 60,
+            'instrumentType': used_instrument,
+            'mode': confirmed_mode,
+            'filledPrice': ref_price,
+            'realizedPnl': None,
+            'status': 'FILLED',
+            'submittedAt': submitted_at,
+            'openedAt': submitted_at,
+            'expiresAt': expires_at,
+            'expiresAtEpoch': now_ts + duration_min * 60,
+            'note': f'Opened {req.direction} {clean_symbol} (${req.amount:.2f}, {duration_min}m {used_instrument}) on verified IQ Option {confirmed_mode} account.',
+        }
+        with _state_lock:
+            _tracked_orders[broker_order_id] = record
+            if req.idempotencyKey:
+                _idempotency_index[req.idempotencyKey] = broker_order_id
+        _invalidate_balance_cache()
+
+        return {
+            'accepted': True,
+            'brokerOrderId': broker_order_id,
+            'status': 'FILLED',
+            'mappedSymbol': clean_symbol,
+            'direction': req.direction,
+            'amount': float(req.amount),
+            'expirySeconds': duration_min * 60,
+            'instrumentType': used_instrument,
+            'mode': confirmed_mode,
+            'accountType': confirmed_mode,
+            'modeVerified': mode_verified,
+            'filledPrice': ref_price,
+            'filledUnits': float(req.amount),
+            'rawStatus': 'OPEN',
+            'message': record['note'],
+            'submittedAt': submitted_at,
+        }
+
+
+@app.get('/positions')
+def positions(x_connector_token: Optional[str] = Header(default=None)):
+    """Retrieve active open IQ Option trades/positions on the verified active account."""
+    _check_auth(x_connector_token)
+    client = connect(target_mode='AUTO')
+    with _bounded_lock(op_name='positions'):
+        confirmed_mode, _ = _require_verified_mode(client, 'AUTO', refresh=False)
+        open_positions: Dict[str, dict] = {}
+
+        # 1. Poll broker open positions where iqoptionapi exposes them
+        if hasattr(client, 'get_positions'):
+            for inst in ('turbo-option', 'binary-option', 'digital-option'):
+                try:
+                    res = _run_with_timeout(lambda i=inst: client.get_positions(i), 2.5, f'get_positions_{inst}')
+                    raw_list = None
+                    if isinstance(res, (list, tuple)) and len(res) >= 2 and res[0] and isinstance(res[1], dict):
+                        raw_list = res[1].get('positions') or res[1].get('msg', {}).get('positions')
+                    elif isinstance(res, dict):
+                        raw_list = res.get('positions')
+                    elif isinstance(res, list):
+                        raw_list = res
+                    if isinstance(raw_list, list):
+                        for item in raw_list:
+                            if isinstance(item, dict) and str(item.get('status') or 'open').lower() in ('open', 'active', ''):
+                                norm = _normalize_broker_position(item, confirmed_mode, 'digital' if 'digital' in inst else 'binary')
+                                if norm:
+                                    open_positions[norm['ticket']] = norm
+                except Exception:
+                    continue
+
+        # 2. Merge still-active tracked orders and auto-reconcile any expired tracked orders
+        now_ts = time.time()
+        with _state_lock:
+            tracked_snapshot = list(_tracked_orders.values())
+        for rec in tracked_snapshot:
+            if rec.get('status') in ('CLOSED', 'CANCELLED', 'REJECTED'):
+                continue
+            oid = rec['brokerOrderId']
+            if now_ts >= float(rec.get('expiresAtEpoch', 0)):
+                outcome = _check_order_outcome_safe(client, oid, rec)
+                if outcome.get('status') == 'CLOSED':
+                    with _state_lock:
+                        if oid in _tracked_orders:
+                            _tracked_orders[oid]['status'] = 'CLOSED'
+                            _tracked_orders[oid]['realizedPnl'] = outcome.get('realizedPnl')
+                            _tracked_orders[oid]['note'] = outcome.get('note')
+                    _invalidate_balance_cache()
+                    continue
+            if oid not in open_positions and rec.get('mode') == confirmed_mode:
+                open_positions[oid] = {
+                    'ticket': oid,
+                    'symbol': rec['symbol'],
+                    'side': rec['side'],
+                    'volume': rec['amount'],
+                    'openPrice': rec.get('filledPrice') or 0.0,
+                    'currentPrice': None,
+                    'profit': rec.get('realizedPnl'),
+                    'sl': None,
+                    'tp': None,
+                    'openedAt': rec.get('openedAt'),
+                    'expiresAt': rec.get('expiresAt'),
+                    'instrumentType': rec.get('instrumentType', 'binary'),
+                    'mode': confirmed_mode,
+                    'canClose': True,
+                    'comment': rec.get('note'),
+                }
+
+        pos_list = list(open_positions.values())
+        return {
+            'supported': True,
+            'mode': confirmed_mode,
+            'accountType': confirmed_mode,
+            'positions': pos_list,
+            'count': len(pos_list),
+            'source': 'IQ_OPTION_UNOFFICIAL',
+            'note': f'Active IQ Option trades ({confirmed_mode}).',
+        }
+
+
+@app.get('/orders/{order_id}')
+def order_status(
+    order_id: str,
+    x_connector_token: Optional[str] = Header(default=None),
+):
+    _check_auth(x_connector_token)
+    client = connect(target_mode='AUTO')
+    with _bounded_lock(op_name='order_status'):
+        confirmed_mode, _ = _require_verified_mode(client, 'AUTO', refresh=False)
+        with _state_lock:
+            tracked = _tracked_orders.get(str(order_id))
+        outcome = _check_order_outcome_safe(client, str(order_id), tracked)
+        if outcome.get('status') == 'CLOSED' and tracked is not None:
+            with _state_lock:
+                if str(order_id) in _tracked_orders:
+                    _tracked_orders[str(order_id)]['status'] = 'CLOSED'
+                    _tracked_orders[str(order_id)]['realizedPnl'] = outcome.get('realizedPnl')
+                    _tracked_orders[str(order_id)]['note'] = outcome.get('note')
+            _invalidate_balance_cache()
+        outcome['mode'] = confirmed_mode
+        return outcome
+
+
+@app.post('/positions/{order_id}/close')
+@app.post('/orders/{order_id}/close')
+def close_position(
+    order_id: str,
+    x_connector_token: Optional[str] = Header(default=None),
+):
+    """Close / sell back an open IQ Option trade where supported by the broker API."""
+    _check_auth(x_connector_token)
+    client = connect(target_mode='AUTO')
+    with _bounded_lock(op_name='close_position'):
+        confirmed_mode, _ = _require_verified_mode(client, 'AUTO', refresh=True)
+        with _state_lock:
+            tracked = _tracked_orders.get(str(order_id))
+        instrument_type = (tracked or {}).get('instrumentType', 'binary')
+        numeric_id: Any = int(order_id) if str(order_id).isdigit() else order_id
+
+        closed = False
+        message = ''
+        try:
+            if instrument_type == 'digital' and hasattr(client, 'close_digital_option'):
+                res = _run_with_timeout(lambda: client.close_digital_option(numeric_id), _ORDER_TIMEOUT, 'close_digital_option')
+                closed = bool(res is True or (isinstance(res, (list, tuple)) and res and res[0]))
+                message = 'Digital option closed on IQ Option.' if closed else f'IQ Option could not close digital option {order_id}.'
+            elif hasattr(client, 'sell_option'):
+                res = _run_with_timeout(lambda: client.sell_option(numeric_id), _ORDER_TIMEOUT, 'sell_option')
+                if isinstance(res, dict):
+                    closed = bool(res.get('msg') or res.get('result') or res.get('status') == 'ok')
+                elif isinstance(res, (list, tuple)):
+                    closed = bool(res and res[0])
+                else:
+                    closed = bool(res)
+                message = 'Trade sold/closed early on IQ Option.' if closed else f'IQ Option sell_option rejected early close for {order_id} (may be expired or outside sellback window).'
+            else:
+                raise HTTPException(501, 'Installed iqoptionapi package does not expose sell_option/close_digital_option.')
+        except TimeoutError:
+            raise HTTPException(504, f'IQ Option timed out closing position {order_id}.') from None
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(502, _sanitize_error(f'Failed to close IQ Option position {order_id} ({type(exc).__name__}): {exc}')) from None
+
+        if closed:
+            outcome = _check_order_outcome_safe(client, str(order_id), tracked)
+            pnl = outcome.get('realizedPnl')
+            with _state_lock:
+                if str(order_id) in _tracked_orders:
+                    _tracked_orders[str(order_id)]['status'] = 'CLOSED'
+                    _tracked_orders[str(order_id)]['realizedPnl'] = pnl
+                    _tracked_orders[str(order_id)]['note'] = message
+            _invalidate_balance_cache()
+            return {
+                'closed': True,
+                'brokerOrderId': str(order_id),
+                'status': 'CLOSED',
+                'realizedPnl': pnl,
+                'mode': confirmed_mode,
+                'accountType': confirmed_mode,
+                'message': message,
+                'closedAt': _format_iso_utc(time.time()),
+            }
+
+        raise HTTPException(409, message or f'Unable to close IQ Option position {order_id}.')
 
 
 @app.get('/history')
 def history(
-    mode: Optional[str] = Query(default=None),
-    x_iq_mode: Optional[str] = Header(default=None),
     x_connector_token: Optional[str] = Header(default=None),
 ):
     _check_auth(x_connector_token)
-    target_mode = _resolve_target_mode(x_iq_mode=x_iq_mode, query_mode=mode)
-    client = connect(target_mode=target_mode)
+    client = connect(target_mode='AUTO')
     with _bounded_lock(op_name='history'):
-        confirmed_mode, mode_verified = _require_verified_mode(client, target_mode)
+        confirmed_mode, mode_verified = _require_verified_mode(client, 'AUTO', refresh=False)
+        normalized_trades: List[dict] = []
+        seen_ids = set()
+        note = f'Synchronized closed trade history from IQ Option ({confirmed_mode}).'
+        supported = False
+
         try:
             if hasattr(client, 'get_optioninfo_v2'):
-                data = _run_with_timeout(lambda: client.get_optioninfo_v2(20), _HISTORY_TIMEOUT, 'get_optioninfo_v2')
+                supported = True
+                data = _run_with_timeout(lambda: client.get_optioninfo_v2(30), _HISTORY_TIMEOUT, 'get_optioninfo_v2')
                 closed = data.get('msg', {}).get('closed_options', []) if isinstance(data, dict) else []
-                return {
-                    'supported': True,
-                    'mode': confirmed_mode,
-                    'modeVerified': mode_verified,
-                    'trades': closed,
-                    'source': 'IQ_OPTION_UNOFFICIAL',
-                }
-            return {
-                'supported': False,
-                'mode': confirmed_mode,
-                'modeVerified': mode_verified,
-                'trades': [],
-                'note': 'Installed iqoptionapi fork does not support get_optioninfo_v2.',
-            }
+                for item in closed:
+                    norm = _normalize_history_item(item, confirmed_mode)
+                    if norm:
+                        if norm.get('id'):
+                            seen_ids.add(norm['id'])
+                        normalized_trades.append(norm)
         except TimeoutError:
-            return {
-                'supported': False,
-                'mode': confirmed_mode,
-                'modeVerified': mode_verified,
-                'trades': [],
-                'note': 'Trade history retrieval timed out.',
-            }
+            note = 'IQ Option history retrieval timed out; returning cached session records.'
         except Exception as exc:
-            return {
-                'supported': False,
-                'mode': confirmed_mode,
-                'modeVerified': mode_verified,
-                'trades': [],
-                'note': f'Trade history retrieval failed ({type(exc).__name__}).',
-            }
+            note = _sanitize_error(f'IQ Option history retrieval warning ({type(exc).__name__}): {exc}')
 
+        # Include any settled tracked orders from the active session not yet present in closed_options
+        with _state_lock:
+            for rec in _tracked_orders.values():
+                if rec.get('status') == 'CLOSED' and rec['brokerOrderId'] not in seen_ids:
+                    normalized_trades.insert(0, {
+                        'id': rec['brokerOrderId'],
+                        'symbol': rec['symbol'],
+                        'direction': rec['direction'],
+                        'amount': rec['amount'],
+                        'winAmount': None,
+                        'pnl': rec.get('realizedPnl'),
+                        'outcome': 'WIN' if (rec.get('realizedPnl') or 0) > 0 else ('LOSS' if (rec.get('realizedPnl') or 0) < 0 else 'CLOSED'),
+                        'openPrice': rec.get('filledPrice'),
+                        'closePrice': None,
+                        'openedAt': rec.get('openedAt'),
+                        'closedAt': _format_iso_utc(time.time()),
+                        'mode': rec.get('mode', confirmed_mode),
+                    })
+                    supported = True
 
-@app.post('/order')
-def order_locked(x_connector_token: Optional[str] = Header(default=None)):
-    _check_auth(x_connector_token)
-    raise HTTPException(
-        423,
-        'IQ Option order execution is strictly locked (read-only unofficial connector).',
-    )
+        return {
+            'supported': supported,
+            'mode': confirmed_mode,
+            'activeMode': confirmed_mode,
+            'accountType': confirmed_mode,
+            'modeVerified': mode_verified,
+            'trades': normalized_trades,
+            'note': note,
+            'source': 'IQ_OPTION_UNOFFICIAL',
+        }
 
 
 @app.post('/disconnect')
@@ -2423,6 +3125,7 @@ def disconnect(x_connector_token: Optional[str] = Header(default=None)):
     global _requested_mode, _confirmed_mode
     with _bounded_lock(op_name='disconnect'):
         _invalidate_client(cancel_inflight=True)
-        _requested_mode = 'PRACTICE'
+        _requested_mode = 'AUTO'
         _confirmed_mode = 'PRACTICE'
     return {'connected': False}
+

@@ -92,6 +92,11 @@ interface BrokersViewProps {
   onFetchCandles: (accountId: string, symbol: string, intervalSeconds?: number, count?: number) => Promise<{ candles: Candle[]; source: string; note?: string }>;
   onFetchAssets: (accountId: string) => Promise<{ assets: BrokerAssetInfo[]; count: number; source: string }>;
   onFetchPositions: (accountId: string) => Promise<{ supported: boolean; positions: BrokerPosition[]; source: string; note?: string }>;
+  onClosePosition?: (
+    accountId: string,
+    ticket: string
+  ) => Promise<{ closed: boolean; ticket: string; mode?: string | null; realizedPnl?: number | null; message: string }>;
+  onCleanupStaleIqDuplicates?: () => Promise<{ removedIds: string[]; keptAccountId: string | null }>;
   onSyncHistory: (accountId: string) => Promise<{ supported: boolean; trades: Array<Record<string, unknown>>; note: string }>;
   onReconcileOrders: (accountId?: string) => Promise<{ updatedCount: number; orders: BrokerOrderRecord[] }>;
   onConnectIq: () => void;
@@ -124,9 +129,15 @@ interface BrokersViewProps {
 }
 
 function catalogStatusLabel(item: BrokerCatalogItem): { text: string; tone: string } {
-  if (item.status === 'INTEGRATED_READONLY') {
+  if (item.id === 'iq_option') {
+    if (item.capabilities?.orderExecutionSupported) {
+      return {
+        text: 'Auto-Follows IQ Option Mode · Trading Ready',
+        tone: 'border-emerald-300 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/35 text-emerald-800 dark:text-emerald-300',
+      };
+    }
     return {
-      text: 'Unofficial · Practice Read-Only',
+      text: 'IQ Option Connector · Standby',
       tone: 'border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/35 text-amber-800 dark:text-amber-300',
     };
   }
@@ -167,6 +178,8 @@ export function BrokerConnectionsView({
   onFetchCandles,
   onFetchAssets,
   onFetchPositions,
+  onClosePosition,
+  onCleanupStaleIqDuplicates,
   onSyncHistory,
   onReconcileOrders,
   onConnectIq,
@@ -224,6 +237,8 @@ export function BrokerConnectionsView({
   const [iqPassword, setIqPassword] = useState('');
   const [iqSuccessMsg, setIqSuccessMsg] = useState<string | null>(null);
   const [isIqLoggingIn, setIsIqLoggingIn] = useState(false);
+  const [closingPositionTicket, setClosingPositionTicket] = useState<string | null>(null);
+  const [cleaningDuplicates, setCleaningDuplicates] = useState(false);
 
   async function handleMt5DirectLogin(e: React.FormEvent) {
     e.preventDefault();
@@ -290,17 +305,37 @@ export function BrokerConnectionsView({
     e.preventDefault();
     setDiagError(null);
     setIqSuccessMsg(null);
-    if (!iqEmail.trim() || !iqPassword) {
+    const trimmedEmail = iqEmail.trim();
+    if (!trimmedEmail || !iqPassword) {
       setDiagError('Please enter both IQ Option Email and Password.');
       return;
     }
     setIsIqLoggingIn(true);
     try {
+      const normalizedEmail = trimmedEmail.toLowerCase();
+      const iqAccounts = accounts.filter((a) => a.brokerId === 'iq_option');
+      const existingMatch =
+        iqAccounts.find(
+          (a) =>
+            a.connected &&
+            (a.label.toLowerCase().includes(normalizedEmail) ||
+              (a.externalAccountId || '').toLowerCase() === normalizedEmail)
+        ) ||
+        iqAccounts.find((a) => a.isAuthoritative && a.label.toLowerCase().includes(normalizedEmail)) ||
+        iqAccounts.find(
+          (a) =>
+            a.label.toLowerCase().includes(normalizedEmail) ||
+            (a.externalAccountId || '').toLowerCase() === normalizedEmail
+        ) ||
+        iqAccounts.find((a) => a.connected) ||
+        iqAccounts.find((a) => a.isAuthoritative);
+
       const savedAccount = await onSaveAccount({
+        ...(existingMatch ? { accountId: existingMatch.id } : {}),
         brokerId: 'iq_option',
-        label: `IQ Option (${iqEmail.trim()})`,
+        label: existingMatch?.label || `IQ Option (${trimmedEmail})`,
         credentials: {
-          email: iqEmail.trim(),
+          email: trimmedEmail,
           apiSecret: iqPassword,
         },
       });
@@ -310,7 +345,7 @@ export function BrokerConnectionsView({
       }
 
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('IQ Option connector is offline. Your account has not been connected.')), 10000)
+        setTimeout(() => reject(new Error('IQ Option connector timed out after 30s. Check connector health or retry.')), 30000)
       );
 
       await Promise.race([
@@ -318,7 +353,7 @@ export function BrokerConnectionsView({
         timeoutPromise,
       ]);
 
-      setIqSuccessMsg('IQ Option authenticated and connected successfully.');
+      setIqSuccessMsg('IQ Option authenticated and connected. Account mode automatically follows your active IQ Option mode.');
       onRefresh();
     } catch (err) {
       setIqSuccessMsg(null);
@@ -332,10 +367,11 @@ export function BrokerConnectionsView({
         lower.includes('econnrefused') ||
         lower.includes('failed to fetch') ||
         lower.includes('timeout') ||
+        lower.includes('timed out') ||
         lower.includes('connector') ||
         lower.includes('gateway')
       ) {
-        setDiagError('IQ Option connector is offline / not configured. Your account has not been connected.');
+        setDiagError(msg);
       } else {
         setDiagError(msg);
       }
@@ -352,7 +388,7 @@ export function BrokerConnectionsView({
     setEditingAccountId(null);
     setNewBrokerId(brokerId);
     setNewEnvironment('demo');
-    setNewLabel(brokerId === 'mt5' ? 'MT5 MetaQuotes-Demo' : `${item?.name || brokerId} Demo`);
+    setNewLabel(brokerId === 'mt5' ? 'MT5 MetaQuotes-Demo' : `${item?.name || 'IQ Option'} Account`);
     setNewCreds(brokerId === 'mt5' ? { serverName: 'MetaQuotes-Demo' } : {});
     setShowAddForm(true);
   }
@@ -360,7 +396,7 @@ export function BrokerConnectionsView({
   function openCredentialUpdate(acct: ManagedBrokerAccountPublic) {
     setEditingAccountId(acct.id);
     setNewBrokerId(acct.brokerId);
-    setNewEnvironment(acct.brokerId === 'mt5' ? acct.environment : 'demo');
+    setNewEnvironment(acct.brokerId === 'mt5' ? acct.environment : acct.environment);
     setNewLabel(acct.label);
     setNewCreds(
       acct.brokerId === 'mt5'
@@ -380,8 +416,12 @@ export function BrokerConnectionsView({
       await onSaveAccount({
         accountId: editingAccountId || undefined,
         brokerId: newBrokerId,
-        label: newLabel.trim() || `${selectedCatalogItem?.name || newBrokerId} ${newBrokerId === 'mt5' && newEnvironment === 'real' ? 'Real' : 'Demo'}`,
-        environment: newBrokerId === 'mt5' ? newEnvironment : 'demo',
+        label:
+          newLabel.trim() ||
+          (newBrokerId === 'mt5'
+            ? `${selectedCatalogItem?.name || newBrokerId} ${newEnvironment === 'real' ? 'Real' : 'Demo'}`
+            : `${selectedCatalogItem?.name || 'IQ Option'} Account`),
+        ...(newBrokerId === 'mt5' ? { environment: newEnvironment } : {}),
         externalAccountId: newCreds.accountNumber?.trim() || undefined,
         credentials: newCreds,
       });
@@ -471,6 +511,40 @@ export function BrokerConnectionsView({
     }
   }
 
+  async function handleClosePositionClick(accountId: string, ticket: string) {
+    if (!onClosePosition) return;
+    setDiagError(null);
+    setClosingPositionTicket(ticket);
+    try {
+      await onClosePosition(accountId, ticket);
+      const res = await onFetchPositions(accountId);
+      setPositionsByAccount((prev) => ({ ...prev, [accountId]: res }));
+    } catch (err) {
+      setDiagError(err instanceof Error ? err.message : 'Unable to close open trade.');
+    } finally {
+      setClosingPositionTicket(null);
+    }
+  }
+
+  async function handleCleanupStaleDuplicatesClick() {
+    if (!onCleanupStaleIqDuplicates) return;
+    setDiagError(null);
+    setCleaningDuplicates(true);
+    try {
+      const res = await onCleanupStaleIqDuplicates();
+      if (res.removedIds.length > 0) {
+        setIqSuccessMsg(`Removed ${res.removedIds.length} stale duplicate IQ Option record(s). Active session preserved.`);
+      } else {
+        setIqSuccessMsg('No stale duplicate IQ Option records found.');
+      }
+      onRefresh();
+    } catch (err) {
+      setDiagError(err instanceof Error ? err.message : 'Unable to clean up stale IQ Option duplicates.');
+    } finally {
+      setCleaningDuplicates(false);
+    }
+  }
+
   async function handleRunHistorySync(accountId: string) {
     setDiagError(null);
     try {
@@ -507,7 +581,7 @@ export function BrokerConnectionsView({
         <div>
           <h2 className="text-xl font-semibold tracking-tight text-slate-900 dark:text-white">MT5 + IQ Option Broker Manager</h2>
           <p className="mt-0.5 text-sm text-slate-600 dark:text-slate-400">
-            Manage Demo or Real accounts for MetaTrader 5 (Official Python SDK Bridge) and Practice Read-Only accounts for IQ Option. Credentials stay encrypted on the server.
+            Manage MetaTrader 5 (Demo or Real) and IQ Option accounts (automatically follows your active PRACTICE or REAL mode inside IQ Option). Credentials stay encrypted on the server.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -544,12 +618,12 @@ export function BrokerConnectionsView({
                 : 'NovaTrade Paper Simulator (Default Safe Mode)'}
             </h3>
             <p className="mt-1 text-xs text-slate-600 dark:text-slate-400">
-              MT5 supports connected Demo or Real accounts with pre-flight `mt5.order_check()` and per-account risk limits; IQ Option stays read-only PRACTICE diagnostics.
+              Supports connected MT5 (Demo/Real) and IQ Option (auto-detected PRACTICE/REAL mode from IQ Option) with pre-flight validation, live mode verification, and per-account risk limits.
             </p>
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {activeAccount && activeAccount.brokerId === 'mt5' && activeAccount.connected && (
+          {activeAccount && (activeAccount.brokerId === 'mt5' || activeAccount.brokerId === 'iq_option') && activeAccount.connected && (
             <button
               type="button"
               disabled={busy || emergencyStop}
@@ -707,8 +781,8 @@ export function BrokerConnectionsView({
             <h3 className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-2">
               <Cable className="h-4 w-4 text-amber-600 dark:text-amber-400" /> IQ Option Login
             </h3>
-            <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
-              Practice Read-Only
+            <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">
+              Auto-Follows IQ Mode
             </span>
           </div>
 
@@ -820,7 +894,7 @@ export function BrokerConnectionsView({
               />
             </div>
             <div>
-              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Environment</label>
+              <label className="block text-xs font-medium text-slate-700 dark:text-slate-300 mb-1.5">Account Mode</label>
               {newBrokerId === 'mt5' ? (
                 <select
                   value={newEnvironment}
@@ -834,7 +908,7 @@ export function BrokerConnectionsView({
                 <input
                   type="text"
                   disabled
-                  value="PRACTICE / DEMO ONLY (Read-Only)"
+                  value="Auto-Detected from IQ Option (PRACTICE / REAL)"
                   className={`${INPUT_CLASS} opacity-75 cursor-not-allowed`}
                 />
               )}
@@ -879,7 +953,11 @@ export function BrokerConnectionsView({
               disabled={busy}
               className="min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 disabled:opacity-50 px-5 py-2 text-xs font-semibold text-white transition-colors"
             >
-              {editingAccountId ? 'Update Encrypted Account' : `Save ${newBrokerId === 'mt5' ? newEnvironment.toUpperCase() : 'Demo'} Account`}
+              {editingAccountId
+                ? 'Update Encrypted Account'
+                : newBrokerId === 'mt5'
+                  ? `Save ${newEnvironment.toUpperCase()} Account`
+                  : 'Save IQ Option Account'}
             </button>
           </div>
         </form>
@@ -887,12 +965,28 @@ export function BrokerConnectionsView({
 
       {/* User Multi-Account List */}
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-semibold text-slate-900 dark:text-white flex items-center gap-2">
             <Cable className="h-4 w-4 text-blue-600 dark:text-indigo-400" />
             Configured Accounts ({accounts.length})
           </h3>
-          <span className="text-xs text-slate-500 dark:text-slate-400">Supports multiple accounts per user</span>
+          <div className="flex flex-wrap items-center gap-2">
+            {onCleanupStaleIqDuplicates &&
+              accounts.filter((a) => a.brokerId === 'iq_option' && a.isStaleDuplicate).length > 0 && (
+                <button
+                  type="button"
+                  disabled={busy || cleaningDuplicates}
+                  onClick={handleCleanupStaleDuplicatesClick}
+                  className="min-h-9 inline-flex items-center gap-1.5 rounded-xl border border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/35 px-3 py-1.5 text-xs font-semibold text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 disabled:opacity-50 transition-colors"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  {cleaningDuplicates
+                    ? 'Cleaning Stale Duplicates...'
+                    : `Clean Up Stale IQ Duplicates (${accounts.filter((a) => a.brokerId === 'iq_option' && a.isStaleDuplicate).length})`}
+                </button>
+              )}
+            <span className="text-xs text-slate-500 dark:text-slate-400">Active sessions are protected</span>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
@@ -924,13 +1018,23 @@ export function BrokerConnectionsView({
                       <span className="text-sm font-semibold text-slate-900 dark:text-white">{acct.label}</span>
                       <span
                         className={`rounded-md px-2 py-0.5 text-[10px] font-semibold uppercase ${
-                          acct.environment === 'real'
+                          acct.environment === 'real' || acct.accountType === 'REAL'
                             ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'
                             : 'bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
                         }`}
                       >
-                        {acct.environment}
+                        {acct.accountType || acct.environment}
                       </span>
+                      {acct.isAuthoritative && (
+                        <span className="rounded-md bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300">
+                          Authoritative
+                        </span>
+                      )}
+                      {acct.isStaleDuplicate && (
+                        <span className="rounded-md bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+                          Stale Duplicate
+                        </span>
+                      )}
                       {isActiveTarget && (
                         <span className="rounded-md bg-blue-500/15 px-2 py-0.5 text-[11px] font-semibold text-blue-700 dark:text-indigo-300">
                           Active Target
@@ -938,8 +1042,11 @@ export function BrokerConnectionsView({
                       )}
                     </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-                      {acct.brokerName} · {acct.capabilities.isOfficialApi ? 'Official API' : 'Bridge / Unofficial'} ·{' '}
-                      {acct.accountType || acct.environment.toUpperCase()}
+                      {acct.brokerName} · ID: <span className="font-mono">{acct.id.slice(0, 14)}</span> ·{' '}
+                      {acct.brokerId === 'iq_option'
+                        ? `Auto-Detected: ${acct.accountType || acct.environment.toUpperCase()}`
+                        : `${acct.capabilities.isOfficialApi ? 'Official API' : 'Bridge'} · ${acct.accountType || acct.environment.toUpperCase()}`}
+                      {acct.lastSyncedAt ? ` · Synced ${new Date(acct.lastSyncedAt).toLocaleTimeString()}` : ''}
                     </p>
                   </div>
 
@@ -1033,7 +1140,11 @@ export function BrokerConnectionsView({
                       }}
                       className="min-h-10 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 disabled:opacity-40 px-3.5 py-1.5 text-xs font-semibold text-white transition-colors"
                     >
-                      {acct.environment === 'real' ? 'Connect Real' : 'Connect Demo'}
+                      {acct.brokerId === 'iq_option'
+                        ? 'Connect IQ Option'
+                        : acct.environment === 'real'
+                          ? 'Connect Real'
+                          : 'Connect Demo'}
                     </button>
                   ) : (
                     <button
@@ -1249,10 +1360,10 @@ export function BrokerConnectionsView({
                     >
                       Check Symbol
                     </button>
-                    {acct.brokerId === 'mt5' && (
+                    {acct.capabilities.orderExecutionSupported && (
                       <button
                         type="button"
-                        disabled={busy}
+                        disabled={busy || !acct.connected}
                         onClick={() => handleRunOrderValidation(acct)}
                         className="rounded-lg border border-blue-500/40 bg-blue-500/10 px-2.5 py-1 text-xs font-medium text-blue-700 dark:text-indigo-300 disabled:opacity-40"
                       >
@@ -1369,21 +1480,34 @@ export function BrokerConnectionsView({
                 {syncedPositions && (
                   <div className={`${SUBTLE_PANEL} p-3 text-xs text-slate-600 dark:text-slate-300 space-y-1.5`}>
                     <p className="font-medium text-slate-900 dark:text-white">
-                      Open MT5 Demo Positions ({syncedPositions.positions.length})
+                      Open {acct.brokerName} Positions ({syncedPositions.positions.length})
                     </p>
                     {syncedPositions.positions.length === 0 ? (
-                      <p className="text-[11px] text-slate-500">No open positions on connected MT5 demo account.</p>
+                      <p className="text-[11px] text-slate-500">No open positions on connected {acct.brokerName} account.</p>
                     ) : (
-                      <div className="space-y-1">
-                        {syncedPositions.positions.slice(0, 6).map((p) => (
-                          <div key={p.ticket} className="flex items-center justify-between font-mono text-[11px]">
+                      <div className="space-y-1.5">
+                        {syncedPositions.positions.slice(0, 8).map((p) => (
+                          <div key={p.ticket} className="flex items-center justify-between gap-2 font-mono text-[11px]">
                             <span>
-                              #{p.ticket} {p.symbol} {p.side} {p.volume}
+                              #{p.ticket} {p.symbol} {p.side} ${p.volume}
+                              {p.mode ? ` · ${p.mode}` : ''}
                             </span>
-                            <span className={(p.profit ?? 0) >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>
-                              {(p.profit ?? 0) >= 0 ? '+' : ''}
-                              {(p.profit ?? 0).toFixed(2)}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className={(p.profit ?? 0) >= 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'}>
+                                {(p.profit ?? 0) >= 0 ? '+' : ''}
+                                {(p.profit ?? 0).toFixed(2)}
+                              </span>
+                              {onClosePosition && acct.brokerId === 'iq_option' && p.canClose !== false && (
+                                <button
+                                  type="button"
+                                  disabled={busy || closingPositionTicket === p.ticket}
+                                  onClick={() => handleClosePositionClick(acct.id, p.ticket)}
+                                  className="rounded-md border border-red-300 dark:border-red-800/70 bg-red-50 dark:bg-red-950/40 px-2 py-0.5 text-[10px] font-sans font-semibold text-red-700 dark:text-red-300 hover:bg-red-100 dark:hover:bg-red-900/50 disabled:opacity-50"
+                                >
+                                  {closingPositionTicket === p.ticket ? 'Closing...' : 'Close'}
+                                </button>
+                              )}
+                            </div>
                           </div>
                         ))}
                       </div>
@@ -1475,12 +1599,12 @@ export function BrokerConnectionsView({
           <div>
             <p className="text-xs font-medium text-slate-500 dark:text-slate-400">Legacy Environment Connector · IQ Option</p>
             <h3 className="mt-1 text-base font-semibold text-slate-900 dark:text-white">
-              {broker?.connected ? 'Connected (PRACTICE Read-Only)' : 'Not Connected'}
+              {broker?.connected ? `Connected (${broker.accountType || 'PRACTICE'} — Auto-Detected)` : 'Not Connected'}
             </h3>
             <p className="mt-1 text-xs text-slate-600 dark:text-slate-400 max-w-2xl leading-relaxed">{broker?.message}</p>
           </div>
-          <span className="rounded-lg border border-amber-300 dark:border-amber-800/70 bg-amber-50 dark:bg-amber-950/40 px-3 py-1.5 text-xs font-medium text-amber-800 dark:text-amber-300 whitespace-nowrap">
-            Unofficial · Order Execution Locked
+          <span className="rounded-lg border border-emerald-300 dark:border-emerald-800/70 bg-emerald-50 dark:bg-emerald-950/40 px-3 py-1.5 text-xs font-medium text-emerald-800 dark:text-emerald-300 whitespace-nowrap">
+            Auto-Follows IQ Option Mode ({broker?.accountType || 'Standby'})
           </span>
         </div>
 
@@ -1504,7 +1628,7 @@ export function BrokerConnectionsView({
             </p>
           </div>
           <div>
-            <p className="text-[11px] text-slate-500">Practice Balance</p>
+            <p className="text-[11px] text-slate-500">Active Mode Balance</p>
             <p className="mt-1 text-xs font-mono tabular-nums font-semibold text-slate-900 dark:text-slate-200">
               {typeof broker?.balance === 'number' && Number.isFinite(broker.balance)
                 ? `${broker.balance.toFixed(2)} ${broker.currency || 'USD'}`
@@ -1515,7 +1639,9 @@ export function BrokerConnectionsView({
           </div>
           <div>
             <p className="text-[11px] text-slate-500">Order Execution</p>
-            <p className="mt-1 text-xs font-semibold text-red-600 dark:text-red-400">Locked (Read-Only)</p>
+            <p className="mt-1 text-xs font-semibold text-emerald-600 dark:text-emerald-400">
+              {broker?.orderExecutionSupported ? `Enabled (${broker.accountType || 'Auto'})` : 'Standby'}
+            </p>
           </div>
         </div>
 
@@ -1565,7 +1691,7 @@ export function BrokerConnectionsView({
             onClick={onConnectIq}
             className="min-h-11 rounded-xl bg-blue-600 hover:bg-blue-500 dark:bg-indigo-600 dark:hover:bg-indigo-500 disabled:opacity-40 px-4 py-2 text-xs font-semibold text-white whitespace-nowrap transition-colors"
           >
-            Connect Practice Session
+            Connect IQ Session
           </button>
           <button
             type="button"
