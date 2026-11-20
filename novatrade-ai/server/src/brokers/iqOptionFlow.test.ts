@@ -994,8 +994,31 @@ test('IQ Option cold-start gateway resilience: wakes sleeping Render service thr
     assert.equal(connectCalls, 1, 'POST /connect must execute cleanly once after service wakes');
     assert.equal(connectSawCold502, false, 'POST /connect must NOT be fired before /health confirms service is awake');
 
+    // Regression: 8+ consecutive fast HTTP 502 HTML responses during extended Render Free-tier cold start
+    // must NOT abort prematurely at attempt 6 — must continue polling within the wake budget until awake.
+    coldStart502Remaining = 9;
+    healthCalls = 0;
+    connectCalls = 0;
+    connectSawCold502 = false;
+    const extendedManager = new BrokerConnectionManager(new BrokerRegistry(), path.join(tmpDir, 'state-extended.json'));
+    const extendedAcct = await extendedManager.createOrUpdateAccount(userId, {
+      brokerId: 'iq_option',
+      label: 'IQ Option (extended@example.com)',
+      credentials: { email: 'extended@example.com', apiSecret: 'valid-secret' },
+    });
+    const extendedConnected = await extendedManager.connectAccount(userId, extendedAcct.id);
+    assert.equal(extendedConnected.connected, true);
+    assert.equal(extendedConnected.status, 'CONNECTED');
+    assert.equal(extendedConnected.accountType, 'PRACTICE');
+    assert.equal(extendedConnected.environment, 'demo');
+    assert.equal(extendedConnected.balance, 8123.45);
+    assert.equal(healthCalls, 10, 'Expected 9 HTTP 502 HTML cold-start health probes + 1 healthy wake response');
+    assert.equal(connectCalls, 1, 'POST /connect must execute cleanly once after extended cold-start wake');
+    assert.equal(connectSawCold502, false, 'POST /connect must NOT be fired before /health confirms service is awake');
+
     // Genuine persistent HTTP 502 HTML outage must still fail cleanly with GATEWAY OFFLINE
     coldStart502Remaining = 99;
+    process.env.IQ_CONNECTOR_WAKE_BUDGET_MS = '1200';
     // Create a fresh manager with empty lastReachableAt to test persistent outage
     const outageManager = new BrokerConnectionManager(new BrokerRegistry(), path.join(tmpDir, 'state-outage.json'));
     const outageAcct = await outageManager.createOrUpdateAccount(userId, {

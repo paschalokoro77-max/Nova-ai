@@ -345,7 +345,7 @@ export function BrokerConnectionsView({
       }
 
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('IQ Option connector timed out after 75s. Check connector health or retry.')), 75000)
+        setTimeout(() => reject(new Error('IQ Option connector timed out after 90s. Check connector health or retry.')), 90000)
       );
 
       await Promise.race([

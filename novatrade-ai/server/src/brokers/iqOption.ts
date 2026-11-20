@@ -190,11 +190,11 @@ export class IQOptionAdapter implements BrokerAdapter {
     const envBudget = Number(process.env.IQ_CONNECTOR_WAKE_BUDGET_MS);
     const envBackoff = Number(process.env.IQ_CONNECTOR_WAKE_BACKOFF_MS);
     const envHealthTimeout = Number(process.env.IQ_CONNECTOR_HEALTH_TIMEOUT_MS);
-    const budgetMs = Number.isFinite(envBudget) && envBudget >= 500 && envBudget <= 90000 ? envBudget : 50000;
+    const budgetMs = Number.isFinite(envBudget) && envBudget >= 500 && envBudget <= 90000 ? envBudget : 60000;
     const baseBackoffMs = Number.isFinite(envBackoff) && envBackoff >= 20 && envBackoff <= 10000 ? envBackoff : 1500;
     const healthTimeoutMs =
       Number.isFinite(envHealthTimeout) && envHealthTimeout >= 500 && envHealthTimeout <= 45000 ? envHealthTimeout : 20000;
-    return { budgetMs, baseBackoffMs, healthTimeoutMs, maxHealthAttempts: 6 };
+    return { budgetMs, baseBackoffMs, healthTimeoutMs, maxHealthAttempts: 20 };
   }
 
   private async ensureConnectorAwake(ctx?: BrokerAccountContext, force = false): Promise<void> {
@@ -266,7 +266,7 @@ export class IQOptionAdapter implements BrokerAdapter {
           if (res.status === 502 || res.status === 503 || res.status === 504) {
             this.lastReachableAt.delete(cfg.url);
             const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
-            const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+            const sleepMs = Math.min(4000, baseBackoffMs * attempt);
             if (attempt < maxAttempts && (!isHealth || remainingBudgetMs > 250)) {
               await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
               continue;
@@ -301,7 +301,7 @@ export class IQOptionAdapter implements BrokerAdapter {
               if ((res.status === 502 || res.status === 503 || res.status === 504) && attempt < maxAttempts) {
                 this.lastReachableAt.delete(cfg.url);
                 const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
-                const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+                const sleepMs = Math.min(4000, baseBackoffMs * attempt);
                 if (!isHealth || remainingBudgetMs > 250) {
                   await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
                   continue;
@@ -335,7 +335,7 @@ export class IQOptionAdapter implements BrokerAdapter {
               : res.status === 502 || res.status === 503 || res.status === 504;
           if (retryableStatus && attempt < maxAttempts) {
             const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
-            const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+            const sleepMs = Math.min(4000, baseBackoffMs * attempt);
             if (!isHealth || remainingBudgetMs > 250) {
               await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
               continue;
@@ -369,7 +369,7 @@ export class IQOptionAdapter implements BrokerAdapter {
         }
         this.lastReachableAt.delete(cfg.url);
         const remainingBudgetMs = isHealth ? wake.budgetMs - (Date.now() - startedAt) : Number.POSITIVE_INFINITY;
-        const sleepMs = Math.min(8000, baseBackoffMs * attempt);
+        const sleepMs = Math.min(4000, baseBackoffMs * attempt);
         if (attempt < maxAttempts && (!isHealth || remainingBudgetMs > 250)) {
           await new Promise((r) => setTimeout(r, isHealth ? Math.min(sleepMs, remainingBudgetMs) : sleepMs));
           continue;
